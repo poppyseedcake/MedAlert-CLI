@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>MedAlert — prototyp polskiego terminala</title>
+    <!--
+      THESIS: Compare three keyboard-first navigation structures; refuse a passive monitoring dashboard.
+      OWN-WORLD: A restrained terminal palette, hard separators, dense lists, and one amber focus color.
+      STORY: The user sees system health, finds one administrative task, completes it, and leaves.
+      FIRST VIEWPORT: A full 80x24-style terminal with state, navigation, detail, and a fixed key guide.
+      FORM: Three throwaway variants selected by ?variant=A|B|C. No production direction is selected.
+    -->
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="prototype-page">
+      <header class="prototype-header">
+        <div>
+          <p class="prototype-kicker">PROTOTYP — DANE PRZYKŁADOWE</p>
+          <h1>Polski interfejs terminalowy MedAlert</h1>
+        </div>
+        <p class="prototype-instruction">Zmień wariant klawiszami <kbd>←</kbd> <kbd>→</kbd></p>
+      </header>
+
+      <section class="terminal-frame" aria-label="Prototyp interfejsu terminalowego">
+        <div id="app"></div>
+        <div class="terminal-too-small" role="status">
+          <strong>Terminal jest za mały.</strong>
+          <span>MedAlert wymaga co najmniej 80 kolumn i 24 wierszy.</span>
+        </div>
+      </section>
+      <p id="announcer" class="visually-hidden" aria-live="polite"></p>
+    </main>
+
+    <nav class="variant-switcher" aria-label="Wariant prototypu">
+      <button id="previous-variant" type="button" aria-label="Poprzedni wariant">←</button>
+      <output id="variant-label">A — Centrum stanu</output>
+      <button id="next-variant" type="button" aria-label="Następny wariant">→</button>
+    </nav>
+
+    <script src="app.js"></script>
+  </body>
+</html>
