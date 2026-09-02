@@ -37,7 +37,7 @@ func Run(arguments []string, stdout, stderr io.Writer, getenv func(string) strin
 	case "version":
 		commit := buildinfo.SourceCommit()
 		if settings.output == "json" {
-			writeJSON(stdout, map[string]any{"schema_version": resultSchemaVersion, "command": "version", "data": map[string]any{"commit": commit}})
+			writeResult(stdout, "version", map[string]any{"commit": commit})
 		} else {
 			fmt.Fprintf(stdout, "medalert %s\n", commit)
 		}
@@ -48,7 +48,7 @@ func Run(arguments []string, stdout, stderr io.Writer, getenv func(string) strin
 			return reportStoreError(stderr, commandName, inspectErr, settings.output == "json")
 		}
 		if settings.output == "json" {
-			writeJSON(stdout, map[string]any{"schema_version": resultSchemaVersion, "command": "doctor", "data": status})
+			writeResult(stdout, "doctor", status)
 		} else if status.MigrationRequired {
 			fmt.Fprintf(stdout, "Database migration to schema %d is required.\n", status.RequiredVersion)
 		} else {
@@ -61,7 +61,7 @@ func Run(arguments []string, stdout, stderr io.Writer, getenv func(string) strin
 			return reportStoreError(stderr, commandName, initializeErr, settings.output == "json")
 		}
 		if settings.output == "json" {
-			writeJSON(stdout, map[string]any{"schema_version": resultSchemaVersion, "command": commandName, "data": status})
+			writeResult(stdout, commandName, status)
 		} else {
 			fmt.Fprintf(stdout, "Initialized database schema %d.\n", status.SchemaVersion)
 		}
@@ -112,13 +112,17 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 }
 
 func defaultDatabasePath(getenv func(string) string) string {
-	if dataHome := getenv("XDG_DATA_HOME"); dataHome != "" {
+	if dataHome := getenv("XDG_DATA_HOME"); filepath.IsAbs(dataHome) {
 		return filepath.Join(dataHome, "medalert", "medalert.db")
 	}
 	if home := getenv("HOME"); home != "" {
 		return filepath.Join(home, ".local", "share", "medalert", "medalert.db")
 	}
 	return ""
+}
+
+func writeResult(writer io.Writer, command string, data any) {
+	writeJSON(writer, map[string]any{"schema_version": resultSchemaVersion, "command": command, "data": data})
 }
 
 func reportStoreError(stderr io.Writer, command string, err error, jsonOutput bool) int {

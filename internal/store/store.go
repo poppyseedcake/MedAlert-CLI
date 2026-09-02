@@ -57,14 +57,11 @@ func Inspect(path string) (Status, error) {
 	if err != nil {
 		return status, err
 	}
-	if !info.Mode().IsRegular() {
-		return status, fmt.Errorf("database is not a regular file: %s", path)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return status, fmt.Errorf("database permissions are not private: %s has mode %04o", path, info.Mode().Perm())
+	if err := validateDatabaseFile(path, info); err != nil {
+		return status, err
 	}
 	status.Exists = true
-	database, err := openExisting(path)
+	database, err := openDatabase(path, true)
 	if err != nil {
 		return status, err
 	}
@@ -105,7 +102,7 @@ func Initialize(path string) (Status, error) {
 		return status, nil
 	}
 
-	database, err := openExisting(path)
+	database, err := openDatabase(path, false)
 	if err != nil {
 		return Status{}, err
 	}
@@ -147,11 +144,8 @@ func ensurePrivateDirectory(path string) error {
 func ensurePrivateDatabaseFile(path string) (bool, error) {
 	info, err := secureFileInfo(path)
 	if err == nil {
-		if !info.Mode().IsRegular() {
-			return true, fmt.Errorf("database is not a regular file: %s", path)
-		}
-		if info.Mode().Perm()&0o077 != 0 {
-			return true, fmt.Errorf("database permissions are not private: %s has mode %04o", path, info.Mode().Perm())
+		if err := validateDatabaseFile(path, info); err != nil {
+			return true, err
 		}
 		return true, nil
 	}
@@ -168,6 +162,16 @@ func ensurePrivateDatabaseFile(path string) (bool, error) {
 	return false, nil
 }
 
+func validateDatabaseFile(path string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("database is not a regular file: %s", path)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("database permissions are not private: %s has mode %04o", path, info.Mode().Perm())
+	}
+	return nil
+}
+
 func secureFileInfo(path string) (os.FileInfo, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -179,8 +183,12 @@ func secureFileInfo(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
-func openExisting(path string) (*sql.DB, error) {
-	location := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=rw"}
+func openDatabase(path string, readOnly bool) (*sql.DB, error) {
+	mode := "rw"
+	if readOnly {
+		mode = "ro"
+	}
+	location := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=" + mode}
 	database, err := sql.Open("sqlite", location.String())
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -189,6 +197,9 @@ func openExisting(path string) (*sql.DB, error) {
 	if err := database.Ping(); err != nil {
 		database.Close()
 		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if readOnly {
+		return database, nil
 	}
 	if _, err := database.Exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON"); err != nil {
 		database.Close()
