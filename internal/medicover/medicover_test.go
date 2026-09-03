@@ -870,3 +870,108 @@ func readTestFile(path string) ([]byte, error) {
 	}
 	return nil, fmt.Errorf("cannot find %s", path)
 }
+
+func TestAuthorizeTSUsesMilliseconds(t *testing.T) {
+	fake := newFake(t)
+	client := medicover.NewClient(fake.clientConfig())
+	if _, err := client.Authenticate(context.Background(), medicover.AuthRequest{
+		Username: "user-no-mfa@example.com",
+		Password: "pass-no-mfa-123",
+	}); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	fake.mu.Lock()
+	ts := fake.lastAuthorizeQuery.Get("ts")
+	fake.mu.Unlock()
+	if len(ts) < 13 {
+		t.Fatalf("ts = %q, want Unix milliseconds (13+ digits)", ts)
+	}
+}
+
+func TestIntermediateAuthorizeCallbackIsFollowed(t *testing.T) {
+	// A login POST that intermediates through /connect/authorize/callback
+	// must still yield a code instead of protocol_changed.
+	var baseURL, redirectURI string
+	pending := map[string]string{}
+	codes := map[string]string{}
+	var mu sync.Mutex
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":                 baseURL,
+			"authorization_endpoint": baseURL + "/connect/authorize",
+			"token_endpoint":         baseURL + "/connect/token",
+		})
+	})
+	mux.HandleFunc("/connect/authorize", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		mu.Lock()
+		pending[query.Get("state")] = query.Get("code_challenge")
+		mu.Unlock()
+		http.Redirect(w, r, "/Account/Login?ReturnUrl="+url.QueryEscape("/connect/authorize?"+r.URL.RawQuery), http.StatusFound)
+	})
+	mux.HandleFunc("/Account/Login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, `<html><body><form method="post" action="/Account/Login">`+
+				`<input type="hidden" name="__RequestVerificationToken" value="t" />`+
+				`<input type="hidden" name="Input.ReturnUrl" value="`+r.URL.Query().Get("ReturnUrl")+`" />`+
+				`<input type="text" name="Input.Username" /><input type="password" name="Input.Password" /></form></body></html>`)
+			return
+		}
+		_ = r.ParseForm()
+		state := ""
+		if parsed, err := url.Parse(r.PostForm.Get("Input.ReturnUrl")); err == nil {
+			state = parsed.Query().Get("state")
+		}
+		// Intermediate step instead of a direct callback redirect.
+		http.Redirect(w, r, "/connect/authorize/callback?state="+url.QueryEscape(state), http.StatusFound)
+	})
+	mux.HandleFunc("/connect/authorize/callback", func(w http.ResponseWriter, r *http.Request) {
+		state := r.URL.Query().Get("state")
+		mu.Lock()
+		_ = pending[state]
+		code := "code-intermediate"
+		codes[code] = state
+		mu.Unlock()
+		http.Redirect(w, r, redirectURI+"?code="+url.QueryEscape(code)+"&state="+url.QueryEscape(state), http.StatusFound)
+	})
+	mux.HandleFunc("/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		code := r.PostForm.Get("code")
+		verifier := r.PostForm.Get("code_verifier")
+		mu.Lock()
+		state, ok := codes[code]
+		challenge := pending[state]
+		mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+			return
+		}
+		sum := sha256.Sum256([]byte(verifier))
+		if base64.RawURLEncoding.EncodeToString(sum[:]) != challenge {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "access-1", "refresh_token": "refresh-1", "expires_in": 300})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	baseURL = server.URL
+	redirectURI = server.URL + "/signin-oidc"
+	client := medicover.NewClient(medicover.Config{Issuer: baseURL, ClientID: "web", RedirectURI: redirectURI})
+	result, err := client.Authenticate(context.Background(), medicover.AuthRequest{
+		Username: "user-no-mfa@example.com",
+		Password: "pass-no-mfa-123",
+	})
+	if err != nil {
+		t.Fatalf("login via intermediate callback: %v", err)
+	}
+	if result.AccessToken == "" {
+		t.Fatal("empty access token")
+	}
+}

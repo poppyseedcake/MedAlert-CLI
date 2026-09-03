@@ -168,10 +168,167 @@ func parseFirstForm(body, pageURL string) (string, url.Values, error) {
 		}
 		values.Add(name, value)
 	}
+	// The current login form carries required fields outside <input>:
+	// Input.LoginType comes from a <select> and the submit button carries
+	// Input.Button. Preserve them so the login POST is complete.
+	for name, value := range findSelectValues(formBody) {
+		if values.Get(name) == "" {
+			values.Set(name, value)
+		}
+	}
+	for name, value := range findButtonValues(formBody) {
+		if values.Get(name) == "" {
+			values.Set(name, value)
+		}
+	}
 	if len(values) == 0 {
 		return "", nil, protocolChanged("empty login form")
 	}
 	return action, values, nil
+}
+
+func findSelectValues(formBody string) map[string]string {
+	out := map[string]string{}
+	lowered := strings.ToLower(formBody)
+	cursor := 0
+	for {
+		start := strings.Index(lowered[cursor:], "<select")
+		if start < 0 {
+			return out
+		}
+		start += cursor
+		tagEnd := strings.Index(formBody[start:], ">")
+		if tagEnd < 0 {
+			return out
+		}
+		tagEnd += start
+		attrs := parseAttributes(formBody[start : tagEnd+1])
+		name, ok := lookupAttr(attrs, "name")
+		if !ok || strings.TrimSpace(name) == "" {
+			cursor = tagEnd + 1
+			continue
+		}
+		name = html.UnescapeString(strings.TrimSpace(name))
+		rest := formBody[tagEnd+1:]
+		end := strings.Index(strings.ToLower(rest), "</select>")
+		var inner string
+		if end < 0 {
+			inner = rest
+			cursor = len(formBody)
+		} else {
+			inner = rest[:end]
+			cursor = tagEnd + 1 + end + len("</select>")
+		}
+		if existing := out[name]; existing != "" {
+			continue
+		}
+		out[name] = firstSelectedOptionValue(inner)
+		if cursor >= len(formBody) {
+			return out
+		}
+	}
+}
+
+func firstSelectedOptionValue(inner string) string {
+	lowered := strings.ToLower(inner)
+	cursor := 0
+	firstValue := ""
+	firstText := ""
+	for {
+		start := strings.Index(lowered[cursor:], "<option")
+		if start < 0 {
+			if firstValue != "" {
+				return firstValue
+			}
+			return strings.TrimSpace(firstText)
+		}
+		start += cursor
+		tagEnd := strings.Index(inner[start:], ">")
+		if tagEnd < 0 {
+			return firstValue
+		}
+		tagEnd += start
+		attrs := parseAttributes(inner[start : tagEnd+1])
+		var value string
+		hasValue := false
+		if raw, ok := lookupAttr(attrs, "value"); ok {
+			value, hasValue = html.UnescapeString(raw), true
+		}
+		rest := inner[tagEnd+1:]
+		end := strings.Index(strings.ToLower(rest), "</option>")
+		var text string
+		if end < 0 {
+			text = strings.TrimSpace(rest)
+			cursor = len(inner)
+		} else {
+			text = strings.TrimSpace(rest[:end])
+			cursor = tagEnd + 1 + end + len("</option>")
+		}
+		if firstValue == "" && hasValue {
+			firstValue = value
+		}
+		if firstText == "" {
+			firstText = text
+		}
+		if hasAttr(attrs, "selected") {
+			if hasValue {
+				return value
+			}
+			return html.UnescapeString(text)
+		}
+		if cursor >= len(inner) {
+			if firstValue != "" {
+				return firstValue
+			}
+			return html.UnescapeString(firstText)
+		}
+	}
+}
+
+func findButtonValues(formBody string) map[string]string {
+	out := map[string]string{}
+	lowered := strings.ToLower(formBody)
+	cursor := 0
+	for {
+		start := strings.Index(lowered[cursor:], "<button")
+		if start < 0 {
+			return out
+		}
+		start += cursor
+		tagEnd := strings.Index(formBody[start:], ">")
+		if tagEnd < 0 {
+			return out
+		}
+		tagEnd += start
+		attrs := parseAttributes(formBody[start : tagEnd+1])
+		name, ok := lookupAttr(attrs, "name")
+		if !ok || strings.TrimSpace(name) == "" {
+			cursor = tagEnd + 1
+			continue
+		}
+		name = html.UnescapeString(strings.TrimSpace(name))
+		if _, exists := out[name]; exists {
+			cursor = tagEnd + 1
+			continue
+		}
+		if raw, ok := lookupAttr(attrs, "value"); ok {
+			out[name] = html.UnescapeString(raw)
+			cursor = tagEnd + 1
+			continue
+		}
+		rest := formBody[tagEnd+1:]
+		end := strings.Index(strings.ToLower(rest), "</button>")
+		if end < 0 {
+			out[name] = ""
+			cursor = len(formBody)
+		} else {
+			out[name] = html.UnescapeString(strings.TrimSpace(rest[:end]))
+			cursor = tagEnd + 1 + end + len("</button>")
+		}
+		if cursor >= len(formBody) {
+			return out
+		}
+	}
 }
 
 func firstFormSection(body string) (formTag, formBody string) {

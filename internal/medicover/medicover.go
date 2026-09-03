@@ -511,6 +511,16 @@ func (c *Client) fullLogin(ctx context.Context, authorizeEndpoint, tokenEndpoint
 	if isMFARedirect(loginResponse.location) {
 		return c.handleMFA(ctx, tokenEndpoint, loginResponse, cookies, session, state, verifier, req.MFACode.Expose())
 	}
+	// Medicover can intermediate through /connect/authorize/callback before
+	// reaching the registered callback. Follow one allowed redirect chain
+	// instead of failing a valid login as a protocol change.
+	if strings.TrimSpace(loginResponse.location) != "" && !loginResponse.isHTML {
+		if result, followed, err := c.followPostRedirect(ctx, tokenEndpoint, loginResponse.location, cookies, session, state, verifier); err != nil {
+			return AuthResult{}, err
+		} else if followed {
+			return result, nil
+		}
+	}
 	// A repeated login form means the credentials were rejected. Any other
 	// page shape is a protocol change, never an invalid-password error.
 	if loginResponse.isHTML {
@@ -520,6 +530,42 @@ func (c *Client) fullLogin(ctx context.Context, authorizeEndpoint, tokenEndpoint
 		return AuthResult{}, protocolChanged("unexpected login response")
 	}
 	return AuthResult{}, protocolChanged("unexpected login response")
+}
+
+// followPostRedirect GETs an intermediate redirect left by a login or MFA
+// POST (for example /connect/authorize/callback) and exchanges the code when
+// the chain reaches the registered callback.
+func (c *Client) followPostRedirect(ctx context.Context, tokenEndpoint, location string, cookies *cookieStore, session *SessionState, state, verifier string) (AuthResult, bool, error) {
+	page, err := c.getPage(ctx, location, cookies)
+	if err != nil {
+		return AuthResult{}, false, err
+	}
+	if page.redirectedToCode {
+		if err := validateState(page.codeState, state); err != nil {
+			return AuthResult{}, false, err
+		}
+		if err := validateIssuerParam(page.codeIssuer, c.cfg.Issuer); err != nil {
+			return AuthResult{}, false, err
+		}
+		tokens, err := c.exchangeCode(ctx, tokenEndpoint, page.code, verifier)
+		if err != nil {
+			return AuthResult{}, false, err
+		}
+		return AuthResult{
+			AccessToken: tokens.AccessToken,
+			ExpiresAt:   tokens.ExpiresAt,
+			Session: &SessionState{
+				DeviceID:     session.DeviceID,
+				Cookies:      cookies.persist(),
+				RefreshToken: firstNonEmpty(tokens.RefreshToken, strings.TrimSpace(session.RefreshToken)),
+				UpdatedAt:    c.cfg.Clock().UTC().Format(time.RFC3339Nano),
+			},
+		}, true, nil
+	}
+	if page.isHTML && hasPasswordField(page.body) {
+		return AuthResult{}, false, invalidCredentials("invalid username or password")
+	}
+	return AuthResult{}, false, nil
 }
 
 func (c *Client) handleMFA(ctx context.Context, tokenEndpoint string, loginResponse *formResponse, cookies *cookieStore, session *SessionState, state, verifier, mfaCode string) (AuthResult, error) {
@@ -602,6 +648,14 @@ func (c *Client) handleMFA(ctx context.Context, tokenEndpoint string, loginRespo
 			MFAUsed: true,
 		}, nil
 	}
+	if strings.TrimSpace(submitResponse.location) != "" && !submitResponse.isHTML {
+		if result, followed, err := c.followPostRedirect(ctx, tokenEndpoint, submitResponse.location, cookies, session, state, verifier); err != nil {
+			return AuthResult{}, err
+		} else if followed {
+			result.MFAUsed = true
+			return result, nil
+		}
+	}
 	if submitResponse.isHTML {
 		if hasMFAField(submitResponse.body) || hasPasswordField(submitResponse.body) {
 			return AuthResult{}, invalidCredentials("invalid multi-factor code")
@@ -648,7 +702,11 @@ func buildAuthorizeURL(authorizeEndpoint string, cfg Config, deviceID, state, ch
 	values.Set("device_id", deviceID)
 	values.Set("device_name", "Chrome")
 	values.Set("app_version", currentAppVersion)
-	values.Set("ts", fmt.Sprintf("%d", time.Now().Unix()))
+	clock := cfg.Clock
+	if clock == nil {
+		clock = time.Now
+	}
+	values.Set("ts", fmt.Sprintf("%d", clock().UnixMilli()))
 	separator := "?"
 	if strings.Contains(authorizeEndpoint, "?") {
 		separator = "&"

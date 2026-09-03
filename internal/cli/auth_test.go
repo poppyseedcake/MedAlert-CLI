@@ -417,3 +417,49 @@ func TestAuthRejectsIrrelevantFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestLoginReusesSessionWithoutPasswordPrompt(t *testing.T) {
+	fake, cleanup := newMinimalFake(t)
+	defer cleanup()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	sessionDir := filepath.Join(root, "data")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.MkdirAll(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	getenv := testAuthGetenv(root, database, sessionDir, fake.baseURL)
+	passwordFile := writeSecretFile(t, secretDir, "pw", "plain-pass")
+	createFileAccount(t, getenv, database, "alice", "plain-user@example.com", passwordFile)
+
+	// First login establishes a trusted session.
+	var firstOut, firstErr bytes.Buffer
+	if code := RunWithIO([]string{"account", "login", "--database", database, "--session-dir", sessionDir, "--medicover-base-url", fake.baseURL, "--account", "alice", "--non-interactive"}, os.Stdin, &firstOut, &firstErr, getenv); code != 0 {
+		t.Fatalf("first login: %d %q", code, firstErr.String())
+	}
+	// Switch the account to prompt-based secrets and drop the password file.
+	// Reuse must succeed without prompting even in non-interactive mode.
+	storage, err := store.Open(mustInitDB(t, database))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := store.PasswordSourcePrompt
+	if _, err := storage.UpdateAccount("alice", store.AccountUpdate{PasswordSource: &prompt, PasswordRef: strPtrUnused("")}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	storage.Close()
+	_ = os.Remove(passwordFile)
+	var stdout, stderr bytes.Buffer
+	if code := RunWithIO([]string{"account", "login", "--database", database, "--session-dir", sessionDir, "--medicover-base-url", fake.baseURL, "--account", "alice", "--non-interactive"}, os.Stdin, &stdout, &stderr, getenv); code != 0 {
+		t.Fatalf("reuse login without password: %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Reused trusted session") {
+		t.Fatalf("stdout = %q, want reuse", stdout.String())
+	}
+}
+
+func strPtrUnused(value string) *string { return &value }

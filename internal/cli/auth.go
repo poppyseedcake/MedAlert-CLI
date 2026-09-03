@@ -39,8 +39,12 @@ func sessionStoreFor(settings options) session.Store {
 
 func medicoverClientFor(settings options) *medicover.Client {
 	cfg := medicover.Config{}
-	if strings.TrimSpace(settings.medicoverBaseURL) != "" {
-		cfg.Issuer = strings.TrimSpace(settings.medicoverBaseURL)
+	if baseURL := strings.TrimSpace(settings.medicoverBaseURL); baseURL != "" {
+		cfg.Issuer = baseURL
+		// Test and Docker overrides point the OIDC issuer at a local server.
+		// The registered callback must live on the same server, otherwise
+		// exact callback matching rejects the fake code redirect.
+		cfg.RedirectURI = strings.TrimSuffix(baseURL, "/") + "/signin-oidc"
 	}
 	return medicover.NewClient(cfg)
 }
@@ -74,18 +78,6 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 
-	// Resolve the password through the account's configured secret source.
-	// check/watch never prompt; only login may prompt when interactive.
-	nonInteractive := isNonInteractive(settings, stdin)
-	password, err := secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, stdin, stderr, nonInteractive)
-	if err != nil {
-		return reportSecretError(stderr, command, err, jsonOutput)
-	}
-	// Drop the raw password reference as soon as the request is built; the
-	// value never reaches logs, errors, JSON, or SQLite.
-	passwordSecret := medicover.Secret(password)
-	password = ""
-
 	storeBackend := sessionStoreFor(settings)
 	var saved *medicover.SessionState
 	if loaded, loadErr := storeBackend.Load(id); loadErr == nil {
@@ -112,6 +104,58 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 		}
 		mfaCode = strings.TrimSpace(value)
 	}
+
+	// Try trusted-session reuse before touching the password. A prompt-based
+	// account or an unavailable Secret Service must not block reuse when the
+	// saved session is still valid.
+	if saved != nil {
+		if reused, reuseErr := client.Authenticate(ctx, medicover.AuthRequest{Session: saved}); reuseErr == nil {
+			if saveErr := storeBackend.Save(id, reused.Session); saveErr != nil {
+				if errors.Is(saveErr, session.ErrUnsafe) {
+					writeError(stderr, command, "invalid_arguments", saveErr.Error(), jsonOutput)
+					return 2
+				}
+				writeError(stderr, command, "temporary_failure", "cannot save session state", jsonOutput)
+				return 4
+			}
+			mfaCode = ""
+			if jsonOutput {
+				writeResult(stdout, command, map[string]any{
+					"account":    id,
+					"reused":     true,
+					"mfa_used":   reused.MFAUsed,
+					"expires_at": reused.ExpiresAt.UTC().Format(time.RFC3339),
+				})
+				return 0
+			}
+			fmt.Fprintf(stdout, "Reused trusted session for account %s.\n", id)
+			return 0
+		} else {
+			var medicoverErr *medicover.Error
+			if errors.As(reuseErr, &medicoverErr) {
+				switch medicoverErr.Code {
+				case medicover.CodeAuthRequired, medicover.CodeInvalidCredentials, medicover.CodeMFARequired:
+					// Fall through to a full password login.
+				default:
+					return reportMedicoverError(stderr, command, reuseErr, jsonOutput)
+				}
+			} else if !errors.Is(reuseErr, secrets.ErrMissingInput) {
+				return reportMedicoverError(stderr, command, reuseErr, jsonOutput)
+			}
+		}
+	}
+
+	// Resolve the password through the account's configured secret source.
+	// check/watch never prompt; only login may prompt when interactive.
+	nonInteractive := isNonInteractive(settings, stdin)
+	password, err := secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, stdin, stderr, nonInteractive)
+	if err != nil {
+		return reportSecretError(stderr, command, err, jsonOutput)
+	}
+	// Drop the raw password reference as soon as the request is built; the
+	// value never reaches logs, errors, JSON, or SQLite.
+	passwordSecret := medicover.Secret(password)
+	password = ""
 
 	result, err := client.Authenticate(ctx, medicover.AuthRequest{
 		Username: medicover.Secret(account.Username),
@@ -185,9 +229,12 @@ func accountLogout(command string, settings options, stdout, stderr io.Writer, j
 		return 4
 	}
 	if settings.forgetSecret {
-		// Best effort: the session is already gone and the database never
-		// held a secret value.
-		_ = secrets.DeletePassword(id)
+		// DeletePassword already ignores missing entries; any other error
+		// means the password may still exist and must be reported.
+		if err := secrets.DeletePassword(id); err != nil {
+			writeError(stderr, command, "temporary_failure", "cannot remove saved password", jsonOutput)
+			return 4
+		}
 	}
 	if jsonOutput {
 		writeResult(stdout, command, map[string]any{"logged_out": id})

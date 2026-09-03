@@ -2,6 +2,7 @@ package medicover
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -14,11 +15,11 @@ type cookieStore struct {
 }
 
 func (s *cookieStore) headerFor(requestURL string) string {
-	// The caller resolves domain and path matching loosely: persisted
-	// cookies carry their original domain/path, and the fake Medicover
-	// server accepts any cookie whose name matches. Production matching
-	// stays inside this adapter and never leaks cookie values to logs.
 	if len(s.cookies) == 0 {
+		return ""
+	}
+	target, err := parseRequestURL(requestURL)
+	if err != nil {
 		return ""
 	}
 	var parts []string
@@ -29,9 +30,64 @@ func (s *cookieStore) headerFor(requestURL string) string {
 		if isExpiredCookie(stored, s.now) {
 			continue
 		}
+		if stored.Secure && target.scheme != "https" && !isLocalHost(target.host) {
+			continue
+		}
+		if !domainMatches(target.host, stored.Domain) {
+			continue
+		}
+		if !pathMatches(target.path, stored.Path) {
+			continue
+		}
 		parts = append(parts, stored.Name+"="+stored.Value)
 	}
 	return strings.Join(parts, "; ")
+}
+
+type requestTarget struct {
+	scheme string
+	host   string
+	path   string
+}
+
+func parseRequestURL(raw string) (requestTarget, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return requestTarget{}, err
+	}
+	path := parsed.Path
+	if path == "" {
+		path = "/"
+	}
+	return requestTarget{scheme: parsed.Scheme, host: parsed.Host, path: path}, nil
+}
+
+func domainMatches(requestHost, cookieDomain string) bool {
+	trimmed := strings.TrimSpace(cookieDomain)
+	if trimmed == "" {
+		return true
+	}
+	trimmed = strings.TrimPrefix(strings.ToLower(trimmed), ".")
+	host := strings.ToLower(requestHost)
+	hostOnly, _, _ := strings.Cut(host, ":")
+	if hostOnly == trimmed {
+		return true
+	}
+	return strings.HasSuffix(hostOnly, "."+trimmed)
+}
+
+func pathMatches(requestPath, cookiePath string) bool {
+	trimmed := strings.TrimSpace(cookiePath)
+	if trimmed == "" {
+		return true
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
+	}
+	if requestPath == "" {
+		requestPath = "/"
+	}
+	return strings.HasPrefix(requestPath, trimmed)
 }
 
 func isExpiredCookie(cookie StoredCookie, now time.Time) bool {
@@ -50,9 +106,26 @@ func isExpiredCookie(cookie StoredCookie, now time.Time) bool {
 func (s *cookieStore) addFromResponse(response *http.Response) {
 	for _, header := range response.Header["Set-Cookie"] {
 		if parsed := parseSetCookie(header); parsed != nil {
+			// A past expiry deletes the cookie even when the directive
+			// carries a non-empty value (for example
+			// `Session=keep; Max-Age=0`).
+			if isExpiredCookie(*parsed, s.now) {
+				s.deleteByName(parsed.Name)
+				continue
+			}
 			s.upsert(*parsed)
 		}
 	}
+}
+
+func (s *cookieStore) deleteByName(name string) {
+	kept := s.cookies[:0]
+	for _, existing := range s.cookies {
+		if existing.Name != name {
+			kept = append(kept, existing)
+		}
+	}
+	s.cookies = kept
 }
 
 func (s *cookieStore) upsert(cookie StoredCookie) {
@@ -62,13 +135,7 @@ func (s *cookieStore) upsert(cookie StoredCookie) {
 	// alone: a deletion must clear the cookie even when the directive omits
 	// the original domain or path attributes.
 	if strings.TrimSpace(cookie.Value) == "" {
-		kept := s.cookies[:0]
-		for _, existing := range s.cookies {
-			if existing.Name != cookie.Name {
-				kept = append(kept, existing)
-			}
-		}
-		s.cookies = kept
+		s.deleteByName(cookie.Name)
 		return
 	}
 	for index, existing := range s.cookies {
@@ -133,6 +200,14 @@ func parseSetCookie(header string) *StoredCookie {
 			cookie.Expires = val
 		case "max-age":
 			if duration := parseMaxAge(val); duration != nil {
+				// A non-positive Max-Age deletes the cookie even when the
+				// directive carries a value. Normalize to an empty value
+				// so upsert removes the entry regardless of clock skew
+				// between the server, time.Now, and the injected test
+				// clock.
+				if *duration <= 0 {
+					cookie.Value = ""
+				}
 				cookie.Expires = time.Now().Add(*duration).UTC().Format(time.RFC3339Nano)
 			}
 		case "secure":

@@ -143,13 +143,28 @@ func (c *Client) postForm(ctx context.Context, action string, values url.Values,
 	if strings.TrimSpace(action) == "" {
 		return nil, protocolChanged("missing form action")
 	}
-	parsed, err := url.Parse(action)
+	// Resolve relative actions against the page that served the form, then
+	// require the target host to be an approved origin. This prevents a
+	// server-supplied action from sending credentials to an untrusted host.
+	resolvedAction := action
+	if strings.TrimSpace(referer) != "" {
+		resolvedAction = resolveURL(referer, action)
+	}
+	parsed, err := url.Parse(resolvedAction)
 	if err != nil {
 		return nil, protocolChanged("invalid form action")
 	}
 	if parsed.Scheme != "" && parsed.Scheme != "https" && !isLocalHost(parsed.Host) {
 		return nil, protocolChanged("insecure form action")
 	}
+	baseForActionCheck := referer
+	if strings.TrimSpace(baseForActionCheck) == "" {
+		baseForActionCheck = c.cfg.Issuer
+	}
+	if err := c.checkRedirectAllowed(baseForActionCheck, resolvedAction); err != nil {
+		return nil, err
+	}
+	action = resolvedAction
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, action, strings.NewReader(values.Encode()))
 	if err != nil {
 		return nil, temporary("cannot build form request")
@@ -175,9 +190,15 @@ func (c *Client) postForm(ctx context.Context, action string, values url.Values,
 			return nil, protocolChanged("missing redirect location")
 		}
 		next := resolveURL(action, location)
+		// Validate every redirect target before acting on it. The MFA
+		// check alone is not sufficient: an untrusted URL containing
+		// "/mfa" must never receive cookies or the MFA code.
+		if err := c.checkRedirectAllowed(action, next); err != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 8*1024))
+			return nil, err
+		}
 		// The callback URL carries the code; MFA and login redirects are
-		// validated by the caller. Only same-origin and approved hosts are
-		// followed from here.
+		// validated by the caller.
 		if _, _, _, ok := codeFromLocation(next, c.cfg.RedirectURI); ok {
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 8*1024))
 			return &formResponse{location: next, status: status}, nil
@@ -185,10 +206,6 @@ func (c *Client) postForm(ctx context.Context, action string, values url.Values,
 		if isMFARedirect(next) {
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 8*1024))
 			return &formResponse{location: next, status: status}, nil
-		}
-		if err := c.checkRedirectAllowed(action, next); err != nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 8*1024))
-			return nil, err
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 8*1024))
 		return &formResponse{location: next, status: status}, nil
@@ -263,7 +280,9 @@ func looksLikeHTML(body string) bool {
 
 // codeFromLocation extracts an OIDC code when location points at the
 // registered callback. Query and fragment are both accepted because the
-// server declares query response mode but tests may use either.
+// server declares query response mode but tests may use either. The scheme,
+// host (including port), and path must match the registered callback
+// exactly; a matching path on another host is not sufficient.
 func codeFromLocation(location, redirectURI string) (code, state, issuer string, ok bool) {
 	if strings.TrimSpace(location) == "" {
 		return "", "", "", false
@@ -276,12 +295,10 @@ func codeFromLocation(location, redirectURI string) (code, state, issuer string,
 	if err != nil {
 		return "", "", "", false
 	}
-	if !strings.EqualFold(locationURL.Scheme+"://"+locationURL.Host+locationURL.Path, callbackURL.Scheme+"://"+callbackURL.Host+callbackURL.Path) {
-		// Accept any URL whose path matches the callback path on an allowed
-		// host (covers fake servers that use 127.0.0.1 with random ports).
-		if locationURL.Path != callbackURL.Path {
-			return "", "", "", false
-		}
+	if !strings.EqualFold(locationURL.Scheme, callbackURL.Scheme) ||
+		!strings.EqualFold(locationURL.Host, callbackURL.Host) ||
+		locationURL.Path != callbackURL.Path {
+		return "", "", "", false
 	}
 	values := locationURL.Query()
 	if values.Get("code") == "" && locationURL.Fragment != "" {

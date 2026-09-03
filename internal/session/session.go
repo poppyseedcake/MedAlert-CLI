@@ -140,6 +140,12 @@ func (s FileStore) Load(accountID string) (*medicover.SessionState, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := openDirNoFollow(filepath.Join(s.Dir, "sessions")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("session for account %q: %w", accountID, ErrNotFound)
+		}
+		return nil, fmt.Errorf("read session for account %q: %w", accountID, err)
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -199,6 +205,9 @@ func (s FileStore) Save(accountID string, state *medicover.SessionState) error {
 	if err := ensurePrivateDir(sessions); err != nil {
 		return err
 	}
+	if err := openDirNoFollow(sessions); err != nil {
+		return fmt.Errorf("create session directory: %w", err)
+	}
 	path, err := s.sessionPath(accountID)
 	if err != nil {
 		return err
@@ -247,6 +256,14 @@ func (s FileStore) Save(accountID string, state *medicover.SessionState) error {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return fmt.Errorf("save session for account %q: %w", accountID, ErrUnsafe)
 	}
+	// Verify the renamed file is a private regular file, not a symlink left
+	// by a replacement between the directory check and the rename.
+	if info, err := os.Lstat(path); err != nil {
+		return fmt.Errorf("save session for account %q: %w", accountID, ErrUnsafe)
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		_ = os.Remove(path)
+		return fmt.Errorf("save session for account %q: %w: session file was replaced", accountID, ErrUnsafe)
+	}
 	return nil
 }
 
@@ -254,6 +271,13 @@ func (s FileStore) Delete(accountID string) error {
 	path, err := s.sessionPath(accountID)
 	if err != nil {
 		return err
+	}
+	if err := openDirNoFollow(filepath.Join(s.Dir, "sessions")); err != nil {
+		// A missing sessions directory means there is nothing to delete.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("remove session for account %q: %w", accountID, err)
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -272,6 +296,33 @@ func (s FileStore) Delete(accountID string) error {
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove session for account %q: %w", accountID, ErrUnsafe)
+	}
+	return nil
+}
+
+// openDirNoFollow verifies path is a real directory without following a
+// trailing symlink. It closes the descriptor immediately; callers re-check
+// the final file with O_NOFOLLOW, so this only narrows the replacement
+// window for the sessions directory itself.
+func openDirNoFollow(path string) error {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return os.ErrNotExist
+		}
+		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
+			return ErrUnsafe
+		}
+		return ErrUnsafe
+	}
+	file := os.NewFile(uintptr(fd), path)
+	info, err := file.Stat()
+	closeErr := file.Close()
+	if err != nil || closeErr != nil {
+		return ErrUnsafe
+	}
+	if !info.IsDir() {
+		return ErrUnsafe
 	}
 	return nil
 }
