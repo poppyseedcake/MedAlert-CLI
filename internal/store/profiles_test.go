@@ -306,3 +306,92 @@ func TestNormalizeSearchType(t *testing.T) {
 		t.Fatal("bad search type passed")
 	}
 }
+
+func TestNormalizeIDListRejectsEmptyElements(t *testing.T) {
+	for _, bad := range []string{",", ",,", "204,", ",204", "204,,205", "204, ,205", "10,11,"} {
+		if got, err := store.NormalizeIDList(bad); err == nil {
+			t.Errorf("normalize passed for %q = %q, want invalid_arguments", bad, got)
+		}
+	}
+}
+
+func TestValidateProfileRejectsMalformedIDLists(t *testing.T) {
+	base := validProfile("malformed", "alice")
+	for _, mutate := range []func(*store.Profile){
+		func(p *store.Profile) { p.RegionIDs = "204,,205" },
+		func(p *store.Profile) { p.SpecialtyIDs = ",132" },
+		func(p *store.Profile) { p.ClinicIDs = "10," },
+		func(p *store.Profile) { p.DoctorIDs = "," },
+	} {
+		profile := base
+		mutate(&profile)
+		if err := store.ValidateProfile(profile); err == nil {
+			t.Errorf("validation passed for %#v", profile)
+		}
+	}
+}
+
+func TestUpdatePreservesEnabledAndUntouchedFields(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateProfile(validProfile("stable", "alice")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.SetProfileEnabled("stable", false); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	clinic := "10,11"
+	if _, err := storage.UpdateProfile("stable", store.ProfileUpdate{ClinicIDs: &clinic}); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	shown, err := storage.GetProfile("stable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shown.Enabled {
+		t.Fatal("edit re-enabled a disabled profile")
+	}
+	if shown.ClinicIDs != "10,11" || shown.RegionIDs != "204" {
+		t.Fatalf("shown = %#v", shown)
+	}
+}
+
+func TestConcurrentUpdateAndDisableDoNotLoseState(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateProfile(validProfile("racing", "alice")); err != nil {
+		t.Fatal(err)
+	}
+	for range 20 {
+		if _, err := storage.SetProfileEnabled("racing", true); err != nil {
+			t.Fatal(err)
+		}
+		empty := ""
+		if _, err := storage.UpdateProfile("racing", store.ProfileUpdate{ClinicIDs: &empty}); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 2)
+		go func() {
+			clinic := "10"
+			_, err := storage.UpdateProfile("racing", store.ProfileUpdate{ClinicIDs: &clinic})
+			done <- err
+		}()
+		go func() {
+			_, err := storage.SetProfileEnabled("racing", false)
+			done <- err
+		}()
+		for range 2 {
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		}
+		shown, err := storage.GetProfile("racing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if shown.ClinicIDs != "10" {
+			t.Fatalf("concurrent disable lost clinic edit: %#v", shown)
+		}
+		if shown.Enabled {
+			t.Fatalf("concurrent edit lost disable: %#v", shown)
+		}
+	}
+}

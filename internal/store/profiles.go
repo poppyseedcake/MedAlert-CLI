@@ -175,52 +175,99 @@ func (s *Store) GetProfile(id string) (Profile, error) {
 // UpdateProfile changes search criteria while keeping the profile identity,
 // its account, and its enabled state. Use SetProfileEnabled to pause or
 // resume observation.
+//
+// The update is applied as a partial row write: only the supplied columns
+// plus updated_at are stored. Untouched criteria and the enabled flag keep
+// their database values, so a concurrent edit of other fields or a
+// concurrent enable/disable is not silently undone.
 func (s *Store) UpdateProfile(id string, update ProfileUpdate) (Profile, error) {
 	current, err := s.GetProfile(id)
 	if err != nil {
 		return Profile{}, err
 	}
+	validated := current
 	if update.RegionIDs != nil {
-		current.RegionIDs = *update.RegionIDs
+		validated.RegionIDs = *update.RegionIDs
 	}
 	if update.SpecialtyIDs != nil {
-		current.SpecialtyIDs = *update.SpecialtyIDs
+		validated.SpecialtyIDs = *update.SpecialtyIDs
 	}
 	if update.ClinicIDs != nil {
-		current.ClinicIDs = *update.ClinicIDs
+		validated.ClinicIDs = *update.ClinicIDs
 	}
 	if update.DoctorIDs != nil {
-		current.DoctorIDs = *update.DoctorIDs
+		validated.DoctorIDs = *update.DoctorIDs
 	}
 	if update.LanguageIDs != nil {
-		current.LanguageIDs = *update.LanguageIDs
+		validated.LanguageIDs = *update.LanguageIDs
 	}
 	if update.VisitType != nil {
-		current.VisitType = *update.VisitType
+		validated.VisitType = *update.VisitType
 	}
 	if update.SearchType != nil {
-		current.SearchType = *update.SearchType
+		validated.SearchType = *update.SearchType
 	}
 	if update.StartDate != nil {
-		current.StartDate = *update.StartDate
+		validated.StartDate = *update.StartDate
 	}
 	if update.EndDate != nil {
-		current.EndDate = *update.EndDate
+		validated.EndDate = *update.EndDate
 	}
 	if update.CheckIntervalMinutes != nil {
-		current.CheckIntervalMinutes = *update.CheckIntervalMinutes
+		validated.CheckIntervalMinutes = *update.CheckIntervalMinutes
 	}
-	if err := ValidateProfile(current); err != nil {
+	if err := ValidateProfile(validated); err != nil {
 		return Profile{}, err
 	}
-	current.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	enabled := 0
-	if current.Enabled {
-		enabled = 1
+	sets := make([]string, 0, 11)
+	args := make([]any, 0, 12)
+	if update.RegionIDs != nil {
+		sets = append(sets, "region_ids = ?")
+		args = append(args, validated.RegionIDs)
 	}
+	if update.SpecialtyIDs != nil {
+		sets = append(sets, "specialty_ids = ?")
+		args = append(args, validated.SpecialtyIDs)
+	}
+	if update.ClinicIDs != nil {
+		sets = append(sets, "clinic_ids = ?")
+		args = append(args, validated.ClinicIDs)
+	}
+	if update.DoctorIDs != nil {
+		sets = append(sets, "doctor_ids = ?")
+		args = append(args, validated.DoctorIDs)
+	}
+	if update.LanguageIDs != nil {
+		sets = append(sets, "language_ids = ?")
+		args = append(args, validated.LanguageIDs)
+	}
+	if update.VisitType != nil {
+		sets = append(sets, "visit_type = ?")
+		args = append(args, validated.VisitType)
+	}
+	if update.SearchType != nil {
+		sets = append(sets, "search_type = ?")
+		args = append(args, validated.SearchType)
+	}
+	if update.StartDate != nil {
+		sets = append(sets, "start_date = ?")
+		args = append(args, validated.StartDate)
+	}
+	if update.EndDate != nil {
+		sets = append(sets, "end_date = ?")
+		args = append(args, validated.EndDate)
+	}
+	if update.CheckIntervalMinutes != nil {
+		sets = append(sets, "check_interval_minutes = ?")
+		args = append(args, validated.CheckIntervalMinutes)
+	}
+	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	sets = append(sets, "updated_at = ?")
+	args = append(args, updatedAt)
+	args = append(args, id)
 	result, err := s.db.Exec(
-		`UPDATE profiles SET region_ids = ?, specialty_ids = ?, clinic_ids = ?, doctor_ids = ?, language_ids = ?, visit_type = ?, search_type = ?, start_date = ?, end_date = ?, check_interval_minutes = ?, enabled = ?, updated_at = ? WHERE id = ?`,
-		current.RegionIDs, current.SpecialtyIDs, current.ClinicIDs, current.DoctorIDs, current.LanguageIDs, current.VisitType, current.SearchType, current.StartDate, current.EndDate, current.CheckIntervalMinutes, enabled, current.UpdatedAt, id,
+		fmt.Sprintf(`UPDATE profiles SET %s WHERE id = ?`, strings.Join(sets, ", ")),
+		args...,
 	)
 	if err != nil {
 		return Profile{}, fmt.Errorf("edit profile: %w", err)
@@ -232,7 +279,11 @@ func (s *Store) UpdateProfile(id string, update ProfileUpdate) (Profile, error) 
 	if affected == 0 {
 		return Profile{}, fmt.Errorf("%w: %s", ErrProfileNotFound, id)
 	}
-	return current, nil
+	fresh, err := s.GetProfile(id)
+	if err != nil {
+		return Profile{}, err
+	}
+	return fresh, nil
 }
 
 // SetProfileEnabled pauses (false) or resumes (true) observation without
@@ -371,7 +422,7 @@ func NormalizeIDList(raw string) (string, error) {
 	for _, part := range parts {
 		item := strings.TrimSpace(part)
 		if item == "" {
-			continue
+			return "", fmt.Errorf("invalid id list %q", raw)
 		}
 		if strings.Contains(item, " ") || strings.Contains(item, "\t") {
 			return "", fmt.Errorf("invalid id list %q", raw)
