@@ -27,6 +27,10 @@ type options struct {
 	passwordFile     string
 	passwordPrompt   bool
 	noStoredPassword bool
+	mfaCodeFile      string
+	medicoverBaseURL string
+	sessionDir       string
+	forgetSecret     bool
 }
 
 type errorBody struct {
@@ -107,6 +111,16 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 		return 0
 	case "account create", "account list", "account show", "account edit", "account delete":
 		return runAccount(commandName, settings, stdin, stdout, stderr)
+	case "account login", "account authenticate", "account logout", "account status":
+		// Resolve session directory defaults from the environment before
+		// selecting the session backend.
+		if settings.sessionDir == "" {
+			settings.sessionDir = strings.TrimSpace(getenv("MEDALERT_SESSION_DIR"))
+		}
+		if settings.medicoverBaseURL == "" {
+			settings.medicoverBaseURL = strings.TrimSpace(getenv("MEDALERT_MEDICOVER_BASE_URL"))
+		}
+		return runAuth(commandName, settings, stdin, stdout, stderr)
 	default:
 		writeError(stderr, commandName, "invalid_arguments", "a supported command is required", settings.output == "json")
 		return 2
@@ -124,13 +138,19 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 	if isEnvTrue(getenv("MEDALERT_NON_INTERACTIVE")) {
 		settings.nonInteractive = true
 	}
+	if sessionDir := strings.TrimSpace(getenv("MEDALERT_SESSION_DIR")); sessionDir != "" {
+		settings.sessionDir = sessionDir
+	}
+	if baseURL := strings.TrimSpace(getenv("MEDALERT_MEDICOVER_BASE_URL")); baseURL != "" {
+		settings.medicoverBaseURL = baseURL
+	}
 	var raw []string
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
 		switch argument {
 		case "--version":
 			settings.versionRequested = true
-		case "--output", "--database", "--account", "--username", "--user", "--password-file":
+		case "--output", "--database", "--account", "--username", "--user", "--password-file", "--mfa-code-file", "--medicover-base-url", "--session-dir":
 			if index+1 >= len(arguments) {
 				return settings, fmt.Errorf("%s needs a value", argument)
 			}
@@ -156,11 +176,28 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 					return settings, fmt.Errorf("--password-file needs a non-empty value")
 				}
 				settings.passwordFile = value
+			case "--mfa-code-file":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("--mfa-code-file needs a non-empty value")
+				}
+				settings.mfaCodeFile = value
+			case "--medicover-base-url":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("--medicover-base-url needs a non-empty value")
+				}
+				settings.medicoverBaseURL = value
+			case "--session-dir":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("--session-dir needs a non-empty value")
+				}
+				settings.sessionDir = value
 			}
 		case "--password-prompt":
 			settings.passwordPrompt = true
 		case "--no-stored-password":
 			settings.noStoredPassword = true
+		case "--forget-secret":
+			settings.forgetSecret = true
 		case "--non-interactive":
 			settings.nonInteractive = true
 		default:
@@ -182,11 +219,13 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 
 // checkCommandFlags rejects account-specific flags for commands that do not
 // consume them, so typos and copy-paste errors fail instead of being silently
-// ignored. --database, --output, and --non-interactive remain global.
+// ignored. --database, --output, --non-interactive, --medicover-base-url, and
+// --session-dir remain global.
 func checkCommandFlags(command string, settings options) error {
 	hasAccountID := settings.accountID != ""
 	hasUsername := settings.username != ""
 	hasPasswordFile := settings.passwordFile != ""
+	hasMFACodeFile := settings.mfaCodeFile != ""
 	switch command {
 	case "version", "doctor", "database initialize":
 		switch {
@@ -200,6 +239,10 @@ func checkCommandFlags(command string, settings options) error {
 			return fmt.Errorf("--password-prompt is not supported for %s", command)
 		case settings.noStoredPassword:
 			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
 		}
 	case "account list":
 		switch {
@@ -213,6 +256,10 @@ func checkCommandFlags(command string, settings options) error {
 			return fmt.Errorf("--password-prompt is not supported for account list")
 		case settings.noStoredPassword:
 			return fmt.Errorf("--no-stored-password is not supported for account list")
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for account list")
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for account list")
 		}
 	case "account show", "account delete":
 		switch {
@@ -224,6 +271,58 @@ func checkCommandFlags(command string, settings options) error {
 			return fmt.Errorf("--password-prompt is not supported for %s", command)
 		case settings.noStoredPassword:
 			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		}
+	case "account create", "account edit":
+		switch {
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		}
+	case "account login", "account authenticate":
+		switch {
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		}
+	case "account logout":
+		switch {
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		}
+	case "account status":
+		switch {
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
 		}
 	}
 	return nil
@@ -237,6 +336,10 @@ func splitCommand(raw []string) ([]string, []string) {
 		{"account", "show"},
 		{"account", "edit"},
 		{"account", "delete"},
+		{"account", "login"},
+		{"account", "authenticate"},
+		{"account", "logout"},
+		{"account", "status"},
 		{"version"},
 		{"doctor"},
 	}
