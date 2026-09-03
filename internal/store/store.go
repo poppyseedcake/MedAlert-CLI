@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion = 2
+	CurrentSchemaVersion = 3
 	backupLimit          = 3
 )
 
@@ -340,6 +340,19 @@ func migrate(database *sql.DB) (err error) {
 		for _, statement := range statements {
 			if _, err = connection.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("apply schema migration 2: %w", err)
+			}
+		}
+	}
+	if fromVersion < 3 {
+		statements := []string{
+			"CREATE TABLE profiles (id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, region_ids TEXT NOT NULL, specialty_ids TEXT NOT NULL, clinic_ids TEXT NOT NULL DEFAULT '', doctor_ids TEXT NOT NULL DEFAULT '', language_ids TEXT NOT NULL DEFAULT '', visit_type TEXT NOT NULL DEFAULT '', search_type TEXT NOT NULL DEFAULT 'Standard', start_date TEXT NOT NULL DEFAULT '', end_date TEXT NOT NULL DEFAULT '', check_interval_minutes INTEGER NOT NULL CHECK(check_interval_minutes BETWEEN 1 AND 43200), enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL) STRICT",
+			"CREATE INDEX IF NOT EXISTS idx_profiles_account ON profiles(account_id)",
+			"INSERT INTO schema_migrations (version, applied_at) VALUES (3, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+			"PRAGMA user_version = 3",
+		}
+		for _, statement := range statements {
+			if _, err = connection.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply schema migration 3: %w", err)
 			}
 		}
 	}

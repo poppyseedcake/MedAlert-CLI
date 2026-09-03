@@ -31,6 +31,27 @@ type options struct {
 	medicoverBaseURL string
 	sessionDir       string
 	forgetSecret     bool
+	// Observation Profile criteria. checkIntervalRaw stays a string so the
+	// CLI can tell "flag missing" apart from "flag is 0" (invalid).
+	profileID        string
+	region           string
+	specialty        string
+	clinic           string
+	doctor           string
+	language         string
+	visitType        string
+	searchType       string
+	startDate        string
+	endDate          string
+	checkIntervalRaw string
+	profileDisabled  bool
+	clearClinic      bool
+	clearDoctor      bool
+	clearLanguage    bool
+	clearVisitType   bool
+	clearSearchType  bool
+	clearStartDate   bool
+	clearEndDate     bool
 }
 
 type errorBody struct {
@@ -111,6 +132,8 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 		return 0
 	case "account create", "account list", "account show", "account edit", "account delete":
 		return runAccount(commandName, settings, stdin, stdout, stderr)
+	case "profile create", "profile list", "profile show", "profile edit", "profile enable", "profile disable", "profile delete":
+		return runProfile(commandName, settings, stdout, stderr)
 	case "account login", "account authenticate", "account logout", "account status":
 		// Resolve session directory defaults from the environment before
 		// selecting the session backend.
@@ -150,7 +173,12 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 		switch argument {
 		case "--version":
 			settings.versionRequested = true
-		case "--output", "--database", "--account", "--username", "--user", "--password-file", "--mfa-code-file", "--medicover-base-url", "--session-dir":
+		case "--output", "--database", "--account", "--username", "--user", "--password-file", "--mfa-code-file", "--medicover-base-url", "--session-dir",
+			"--profile", "--region", "--specialty", "--specialties", "--clinic", "--clinics", "--doctor", "--doctors",
+			"--language", "--languages", "--doctor-language", "--doctor-languages", "--doctor-language-ids",
+			"--visit-type", "--visit_type", "--search-type", "--search_type", "--slot-search-type",
+			"--start-date", "--date", "--from-date", "--end-date", "--enddate", "--to-date",
+			"--check-interval-minutes", "--check-interval", "--interval-minutes", "--interval":
 			if index+1 >= len(arguments) {
 				return settings, fmt.Errorf("%s needs a value", argument)
 			}
@@ -191,9 +219,72 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 					return settings, fmt.Errorf("--session-dir needs a non-empty value")
 				}
 				settings.sessionDir = value
+			case "--profile":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("--profile needs a non-empty value")
+				}
+				settings.profileID = value
+			case "--region", "--specialty", "--specialties", "--clinic", "--clinics", "--doctor", "--doctors",
+				"--language", "--languages", "--doctor-language", "--doctor-languages", "--doctor-language-ids":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				switch argument {
+				case "--region":
+					settings.region = value
+				case "--specialty", "--specialties":
+					settings.specialty = value
+				case "--clinic", "--clinics":
+					settings.clinic = value
+				case "--doctor", "--doctors":
+					settings.doctor = value
+				case "--language", "--languages", "--doctor-language", "--doctor-languages", "--doctor-language-ids":
+					settings.language = value
+				}
+			case "--visit-type", "--visit_type":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.visitType = value
+			case "--search-type", "--search_type", "--slot-search-type":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.searchType = value
+			case "--start-date", "--date", "--from-date":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.startDate = value
+			case "--end-date", "--enddate", "--to-date":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.endDate = value
+			case "--check-interval-minutes", "--check-interval", "--interval-minutes", "--interval":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.checkIntervalRaw = value
 			}
 		case "--password-prompt":
 			settings.passwordPrompt = true
+		case "--disabled":
+			settings.profileDisabled = true
+		case "--clear-clinic":
+			settings.clearClinic = true
+		case "--clear-doctor":
+			settings.clearDoctor = true
+		case "--clear-language":
+			settings.clearLanguage = true
+		case "--clear-visit-type":
+			settings.clearVisitType = true
+		case "--clear-search-type":
+			settings.clearSearchType = true
+		case "--clear-start-date":
+			settings.clearStartDate = true
+		case "--clear-end-date":
+			settings.clearEndDate = true
 		case "--no-stored-password":
 			settings.noStoredPassword = true
 		case "--forget-secret":
@@ -226,6 +317,9 @@ func checkCommandFlags(command string, settings options) error {
 	hasUsername := settings.username != ""
 	hasPasswordFile := settings.passwordFile != ""
 	hasMFACodeFile := settings.mfaCodeFile != ""
+	if err := checkProfileFlagsForNonProfileCommands(command, settings); err != nil {
+		return err
+	}
 	switch command {
 	case "version", "doctor", "database initialize":
 		switch {
@@ -324,6 +418,209 @@ func checkCommandFlags(command string, settings options) error {
 		case settings.forgetSecret:
 			return fmt.Errorf("--forget-secret is not supported for %s", command)
 		}
+	case "profile create":
+		switch {
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		case settings.clearClinic:
+			return fmt.Errorf("--clear-clinic is not supported for %s", command)
+		case settings.clearDoctor:
+			return fmt.Errorf("--clear-doctor is not supported for %s", command)
+		case settings.clearLanguage:
+			return fmt.Errorf("--clear-language is not supported for %s", command)
+		case settings.clearVisitType:
+			return fmt.Errorf("--clear-visit-type is not supported for %s", command)
+		case settings.clearSearchType:
+			return fmt.Errorf("--clear-search-type is not supported for %s", command)
+		case settings.clearStartDate:
+			return fmt.Errorf("--clear-start-date is not supported for %s", command)
+		case settings.clearEndDate:
+			return fmt.Errorf("--clear-end-date is not supported for %s", command)
+		}
+	case "profile list":
+		switch {
+		case settings.profileID != "":
+			return fmt.Errorf("--profile is not supported for %s", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		case settings.region != "":
+			return fmt.Errorf("--region is not supported for %s", command)
+		case settings.specialty != "":
+			return fmt.Errorf("--specialty is not supported for %s", command)
+		case settings.clinic != "":
+			return fmt.Errorf("--clinic is not supported for %s", command)
+		case settings.doctor != "":
+			return fmt.Errorf("--doctor is not supported for %s", command)
+		case settings.language != "":
+			return fmt.Errorf("--language is not supported for %s", command)
+		case settings.visitType != "":
+			return fmt.Errorf("--visit-type is not supported for %s", command)
+		case settings.searchType != "":
+			return fmt.Errorf("--search-type is not supported for %s", command)
+		case settings.startDate != "":
+			return fmt.Errorf("--start-date is not supported for %s", command)
+		case settings.endDate != "":
+			return fmt.Errorf("--end-date is not supported for %s", command)
+		case settings.checkIntervalRaw != "":
+			return fmt.Errorf("--check-interval-minutes is not supported for %s", command)
+		case settings.profileDisabled:
+			return fmt.Errorf("--disabled is not supported for %s", command)
+		case settings.clearClinic:
+			return fmt.Errorf("--clear-clinic is not supported for %s", command)
+		case settings.clearDoctor:
+			return fmt.Errorf("--clear-doctor is not supported for %s", command)
+		case settings.clearLanguage:
+			return fmt.Errorf("--clear-language is not supported for %s", command)
+		case settings.clearVisitType:
+			return fmt.Errorf("--clear-visit-type is not supported for %s", command)
+		case settings.clearSearchType:
+			return fmt.Errorf("--clear-search-type is not supported for %s", command)
+		case settings.clearStartDate:
+			return fmt.Errorf("--clear-start-date is not supported for %s", command)
+		case settings.clearEndDate:
+			return fmt.Errorf("--clear-end-date is not supported for %s", command)
+		}
+	case "profile show", "profile enable", "profile disable", "profile delete":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for %s", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		case settings.region != "":
+			return fmt.Errorf("--region is not supported for %s", command)
+		case settings.specialty != "":
+			return fmt.Errorf("--specialty is not supported for %s", command)
+		case settings.clinic != "":
+			return fmt.Errorf("--clinic is not supported for %s", command)
+		case settings.doctor != "":
+			return fmt.Errorf("--doctor is not supported for %s", command)
+		case settings.language != "":
+			return fmt.Errorf("--language is not supported for %s", command)
+		case settings.visitType != "":
+			return fmt.Errorf("--visit-type is not supported for %s", command)
+		case settings.searchType != "":
+			return fmt.Errorf("--search-type is not supported for %s", command)
+		case settings.startDate != "":
+			return fmt.Errorf("--start-date is not supported for %s", command)
+		case settings.endDate != "":
+			return fmt.Errorf("--end-date is not supported for %s", command)
+		case settings.checkIntervalRaw != "":
+			return fmt.Errorf("--check-interval-minutes is not supported for %s", command)
+		case settings.profileDisabled:
+			return fmt.Errorf("--disabled is not supported for %s", command)
+		case settings.clearClinic:
+			return fmt.Errorf("--clear-clinic is not supported for %s", command)
+		case settings.clearDoctor:
+			return fmt.Errorf("--clear-doctor is not supported for %s", command)
+		case settings.clearLanguage:
+			return fmt.Errorf("--clear-language is not supported for %s", command)
+		case settings.clearVisitType:
+			return fmt.Errorf("--clear-visit-type is not supported for %s", command)
+		case settings.clearSearchType:
+			return fmt.Errorf("--clear-search-type is not supported for %s", command)
+		case settings.clearStartDate:
+			return fmt.Errorf("--clear-start-date is not supported for %s", command)
+		case settings.clearEndDate:
+			return fmt.Errorf("--clear-end-date is not supported for %s", command)
+		}
+	case "profile edit":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for %s (the account of a profile never changes; delete and recreate to move it)", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		case settings.profileDisabled:
+			return fmt.Errorf("--disabled is not supported for %s (use profile enable and profile disable)", command)
+		}
+	}
+	return nil
+}
+
+// checkProfileFlagsForNonProfileCommands rejects --profile and profile
+// criteria flags for commands that do not consume them.
+func checkProfileFlagsForNonProfileCommands(command string, settings options) error {
+	if strings.HasPrefix(command, "profile ") {
+		return nil
+	}
+	switch {
+	case settings.profileID != "":
+		return fmt.Errorf("--profile is not supported for %s", command)
+	case settings.region != "":
+		return fmt.Errorf("--region is not supported for %s", command)
+	case settings.specialty != "":
+		return fmt.Errorf("--specialty is not supported for %s", command)
+	case settings.clinic != "":
+		return fmt.Errorf("--clinic is not supported for %s", command)
+	case settings.doctor != "":
+		return fmt.Errorf("--doctor is not supported for %s", command)
+	case settings.language != "":
+		return fmt.Errorf("--language is not supported for %s", command)
+	case settings.visitType != "":
+		return fmt.Errorf("--visit-type is not supported for %s", command)
+	case settings.searchType != "":
+		return fmt.Errorf("--search-type is not supported for %s", command)
+	case settings.startDate != "":
+		return fmt.Errorf("--start-date is not supported for %s", command)
+	case settings.endDate != "":
+		return fmt.Errorf("--end-date is not supported for %s", command)
+	case settings.checkIntervalRaw != "":
+		return fmt.Errorf("--check-interval-minutes is not supported for %s", command)
+	case settings.profileDisabled:
+		return fmt.Errorf("--disabled is not supported for %s", command)
+	case settings.clearClinic:
+		return fmt.Errorf("--clear-clinic is not supported for %s", command)
+	case settings.clearDoctor:
+		return fmt.Errorf("--clear-doctor is not supported for %s", command)
+	case settings.clearLanguage:
+		return fmt.Errorf("--clear-language is not supported for %s", command)
+	case settings.clearVisitType:
+		return fmt.Errorf("--clear-visit-type is not supported for %s", command)
+	case settings.clearSearchType:
+		return fmt.Errorf("--clear-search-type is not supported for %s", command)
+	case settings.clearStartDate:
+		return fmt.Errorf("--clear-start-date is not supported for %s", command)
+	case settings.clearEndDate:
+		return fmt.Errorf("--clear-end-date is not supported for %s", command)
 	}
 	return nil
 }
@@ -340,6 +637,13 @@ func splitCommand(raw []string) ([]string, []string) {
 		{"account", "authenticate"},
 		{"account", "logout"},
 		{"account", "status"},
+		{"profile", "create"},
+		{"profile", "list"},
+		{"profile", "show"},
+		{"profile", "edit"},
+		{"profile", "enable"},
+		{"profile", "disable"},
+		{"profile", "delete"},
 		{"version"},
 		{"doctor"},
 	}
@@ -407,6 +711,22 @@ func reportAccountError(stderr io.Writer, command string, err error, jsonOutput 
 	case errors.Is(err, store.ErrAccountNotFound):
 		code = "account_not_found"
 	case errors.Is(err, store.ErrAccountInvalid):
+		code = "invalid_arguments"
+	}
+	writeError(stderr, command, code, err.Error(), jsonOutput)
+	return 2
+}
+
+func reportProfileError(stderr io.Writer, command string, err error, jsonOutput bool) int {
+	code := "database_error"
+	switch {
+	case errors.Is(err, store.ErrProfileExists):
+		code = "profile_exists"
+	case errors.Is(err, store.ErrProfileNotFound):
+		code = "profile_not_found"
+	case errors.Is(err, store.ErrAccountNotFound):
+		code = "account_not_found"
+	case errors.Is(err, store.ErrProfileInvalid):
 		code = "invalid_arguments"
 	}
 	writeError(stderr, command, code, err.Error(), jsonOutput)
