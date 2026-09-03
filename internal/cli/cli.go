@@ -44,6 +44,10 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 		return 2
 	}
 	commandName := strings.Join(settings.command, " ")
+	if err := checkCommandFlags(commandName, settings); err != nil {
+		writeError(stderr, commandName, "invalid_arguments", err.Error(), settings.output == "json")
+		return 2
+	}
 	switch commandName {
 	case "version":
 		commit := buildinfo.SourceCommit()
@@ -150,6 +154,55 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 		return settings, errors.New("database path is empty")
 	}
 	return settings, nil
+}
+
+// checkCommandFlags rejects account-specific flags for commands that do not
+// consume them, so typos and copy-paste errors fail instead of being silently
+// ignored. --database, --output, and --non-interactive remain global.
+func checkCommandFlags(command string, settings options) error {
+	hasAccountID := settings.accountID != ""
+	hasUsername := settings.username != ""
+	hasPasswordFile := settings.passwordFile != ""
+	switch command {
+	case "version", "doctor", "database initialize":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for %s", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		}
+	case "account list":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for account list")
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for account list")
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for account list")
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for account list")
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for account list")
+		}
+	case "account show", "account delete":
+		switch {
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		}
+	}
+	return nil
 }
 
 func splitCommand(raw []string) ([]string, []string) {

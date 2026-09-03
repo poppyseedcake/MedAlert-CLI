@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/zalando/go-keyring"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -113,20 +114,29 @@ func secretKind(err error) error {
 }
 
 // ReadSecretFile reads a mounted secret file. It rejects symbolic links,
-// non-regular files, and files readable by group or others.
+// non-regular files, and files readable by group or others. The file is
+// opened with O_NOFOLLOW and then validated and read through the same open
+// descriptor, so a path replacement between the checks and the read cannot
+// substitute unchecked content.
 func ReadSecretFile(path string) (string, error) {
 	if strings.TrimSpace(path) == "" || strings.ContainsRune(path, '\x00') {
 		return "", fmt.Errorf("read secret file: %w", ErrSecretNotFound)
 	}
-	info, err := os.Lstat(path)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, unix.ENOENT) {
 			return "", fmt.Errorf("read secret file %q: %w", path, ErrSecretNotFound)
+		}
+		if errors.Is(err, unix.ELOOP) {
+			return "", fmt.Errorf("read secret file %q: %w: symbolic links are not permitted", path, ErrSecretUnsafe)
 		}
 		return "", fmt.Errorf("read secret file %q: %w", path, ErrSecretUnsafe)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("read secret file %q: %w: symbolic links are not permitted", path, ErrSecretUnsafe)
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("read secret file %q: %w", path, ErrSecretUnsafe)
 	}
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("read secret file %q: %w: not a regular file", path, ErrSecretUnsafe)
@@ -137,11 +147,12 @@ func ReadSecretFile(path string) (string, error) {
 	if info.Size() <= 0 || info.Size() > maxSecretBytes {
 		return "", fmt.Errorf("read secret file %q: secret is empty or too large", path)
 	}
-	contents, err := os.ReadFile(path)
+	contents, err := io.ReadAll(io.LimitReader(file, maxSecretBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("read secret file %q: %w", path, ErrSecretUnsafe)
 	}
-	value := strings.TrimRight(string(contents), "\r\n")
+	value := strings.TrimSuffix(string(contents), "\n")
+	value = strings.TrimSuffix(value, "\r")
 	// Clear the raw buffer reference as soon as possible; strings are immutable
 	// so this only drops the extra copy, but it documents the intent.
 	for i := range contents {

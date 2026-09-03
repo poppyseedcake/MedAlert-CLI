@@ -110,21 +110,22 @@ func accountCreate(command string, settings options, stdin *os.File, stdout, std
 		writeError(stderr, command, "invalid_arguments", "use only one of --password-file, --password-prompt, --no-stored-password", jsonOutput)
 		return 2
 	}
-	source, ref, secretErr := prepareNewSecret(id, settings, stdin, stderr)
-	if secretErr != nil {
-		return reportSecretError(stderr, command, secretErr, jsonOutput)
-	}
 	storage, err := ensureStore(settings.database)
 	if err != nil {
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
-	// Fail fast on duplicates before touching Secret Service twice.
+	// Check for duplicates before prompting or saving anything: a failed
+	// create must not replace the existing account's Secret Service entry.
 	if _, err := storage.GetAccount(id); err == nil {
 		writeError(stderr, command, "account_exists", fmt.Sprintf("account %q already exists", id), jsonOutput)
 		return 2
 	} else if !errors.Is(err, store.ErrAccountNotFound) && !errors.Is(err, store.ErrAccountInvalid) {
 		return reportStoreError(stderr, command, err, jsonOutput)
+	}
+	source, ref, secretErr := prepareNewSecret(id, settings, stdin, stderr)
+	if secretErr != nil {
+		return reportSecretError(stderr, command, secretErr, jsonOutput)
 	}
 	created, err := storage.CreateAccount(store.Account{
 		ID:             id,

@@ -458,3 +458,54 @@ func TestAccountNonInteractiveRejectsMissingInput(t *testing.T) {
 		t.Fatalf("json missing = %#v", jsonResult)
 	}
 }
+
+func TestAccountDuplicateCreateChecksExistenceBeforeSecrets(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	valid := writeProcessSecretFile(t, secretDir, "valid", "valid-secret")
+	openPath := filepath.Join(secretDir, "open")
+	if err := os.WriteFile(openPath, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	created := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "dup", "--username", "u@example.com", "--password-file", valid)
+	if created.exitCode != 0 {
+		t.Fatalf("create = %#v", created)
+	}
+	// The id already exists and the replacement file is unsafe: existence must
+	// win so the command reports account_exists without touching secrets.
+	again := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "dup", "--username", "other@example.com", "--password-file", openPath, "--output", "json")
+	if again.exitCode != 2 || !strings.Contains(again.stderr, `"code":"account_exists"`) {
+		t.Fatalf("duplicate result = %#v", again)
+	}
+	assertProcessQueryValue(t, databasePath, "SELECT username FROM accounts WHERE id = 'dup'", "u@example.com")
+}
+
+func TestAccountRejectsIrrelevantFlags(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	valid := writeProcessSecretFile(t, secretDir, "valid", "valid-secret")
+
+	for _, args := range [][]string{
+		{"doctor", "--database", databasePath, "--account", "alice"},
+		{"version", "--username", "u@example.com"},
+		{"database", "initialize", "--database", databasePath, "--password-prompt"},
+		{"account", "list", "--database", databasePath, "--account", "alice"},
+		{"account", "list", "--database", databasePath, "--username", "u@example.com"},
+		{"account", "show", "--database", databasePath, "--account", "alice", "--username", "u@example.com"},
+		{"account", "delete", "--database", databasePath, "--account", "alice", "--password-file", valid},
+	} {
+		result := run(t, nil, args...)
+		if result.exitCode != 2 || result.stdout != "" || !strings.Contains(result.stderr, "not supported") {
+			t.Fatalf("args %v result = %#v", args, result)
+		}
+	}
+}

@@ -33,6 +33,34 @@ func TestSecretFileRoundTripAndRedaction(t *testing.T) {
 	}
 }
 
+func TestSecretFileStripsSingleTrailingNewline(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ raw, want string }{
+		{"password\n", "password"},
+		{"password\r\n", "password"},
+		{"password\n\n", "password\n"},
+		{"password\n\n\n", "password\n\n"},
+		{"password", "password"},
+	} {
+		path := filepath.Join(dir, "pw")
+		if err := os.WriteFile(path, []byte(tc.raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := secrets.ReadSecretFile(path)
+		if err != nil {
+			t.Fatalf("read %q: %v", tc.raw, err)
+		}
+		if got != tc.want {
+			t.Fatalf("read %q = %q, want %q", tc.raw, got, tc.want)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 func errStringForFile(path, _ string) string {
 	_, err := secrets.ReadSecretFile(filepath.Join(filepath.Dir(path), "missing"))
 	if err == nil {
