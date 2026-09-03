@@ -16,9 +16,17 @@ import (
 const resultSchemaVersion = 1
 
 type options struct {
-	command  []string
-	database string
-	output   string
+	command          []string
+	positionals      []string
+	database         string
+	output           string
+	nonInteractive   bool
+	versionRequested bool
+	accountID        string
+	username         string
+	passwordFile     string
+	passwordPrompt   bool
+	noStoredPassword bool
 }
 
 type errorBody struct {
@@ -27,14 +35,37 @@ type errorBody struct {
 }
 
 func Run(arguments []string, stdout, stderr io.Writer, getenv func(string) string) int {
+	return RunWithIO(arguments, os.Stdin, stdout, stderr, getenv)
+}
+
+func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, getenv func(string) string) int {
 	settings, err := parse(arguments, getenv)
 	if err != nil {
 		writeError(stderr, "command", "invalid_arguments", err.Error(), wantsJSON(arguments, getenv))
 		return 2
 	}
+	// --version takes precedence over any command: print the version and exit
+	// instead of treating the flag as a positional account id or similar.
+	if settings.versionRequested {
+		commit := buildinfo.SourceCommit()
+		if settings.output == "json" {
+			writeResult(stdout, "version", map[string]any{"commit": commit})
+		} else {
+			fmt.Fprintf(stdout, "medalert %s\n", commit)
+		}
+		return 0
+	}
 	commandName := strings.Join(settings.command, " ")
+	if err := checkCommandFlags(commandName, settings); err != nil {
+		writeError(stderr, commandName, "invalid_arguments", err.Error(), settings.output == "json")
+		return 2
+	}
 	switch commandName {
 	case "version":
+		if len(settings.positionals) > 0 {
+			writeError(stderr, commandName, "invalid_arguments", "too many arguments for version", settings.output == "json")
+			return 2
+		}
 		commit := buildinfo.SourceCommit()
 		if settings.output == "json" {
 			writeResult(stdout, "version", map[string]any{"commit": commit})
@@ -43,6 +74,10 @@ func Run(arguments []string, stdout, stderr io.Writer, getenv func(string) strin
 		}
 		return 0
 	case "doctor":
+		if len(settings.positionals) > 0 {
+			writeError(stderr, commandName, "invalid_arguments", "too many arguments for doctor", settings.output == "json")
+			return 2
+		}
 		status, inspectErr := store.Inspect(settings.database)
 		if inspectErr != nil {
 			return reportStoreError(stderr, commandName, inspectErr, settings.output == "json")
@@ -56,6 +91,10 @@ func Run(arguments []string, stdout, stderr io.Writer, getenv func(string) strin
 		}
 		return 0
 	case "database initialize":
+		if len(settings.positionals) > 0 {
+			writeError(stderr, commandName, "invalid_arguments", "too many arguments for database initialize", settings.output == "json")
+			return 2
+		}
 		status, initializeErr := store.Initialize(settings.database)
 		if initializeErr != nil {
 			return reportStoreError(stderr, commandName, initializeErr, settings.output == "json")
@@ -66,6 +105,8 @@ func Run(arguments []string, stdout, stderr io.Writer, getenv func(string) strin
 			fmt.Fprintf(stdout, "Initialized database schema %d.\n", status.SchemaVersion)
 		}
 		return 0
+	case "account create", "account list", "account show", "account edit", "account delete":
+		return runAccount(commandName, settings, stdin, stdout, stderr)
 	default:
 		writeError(stderr, commandName, "invalid_arguments", "a supported command is required", settings.output == "json")
 		return 2
@@ -80,28 +121,56 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 	if environmentDatabase := getenv("MEDALERT_DATABASE"); environmentDatabase != "" {
 		settings.database = environmentDatabase
 	}
+	if isEnvTrue(getenv("MEDALERT_NON_INTERACTIVE")) {
+		settings.nonInteractive = true
+	}
+	var raw []string
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
 		switch argument {
 		case "--version":
-			settings.command = []string{"version"}
-		case "--output", "--database":
+			settings.versionRequested = true
+		case "--output", "--database", "--account", "--username", "--user", "--password-file":
 			if index+1 >= len(arguments) {
 				return settings, fmt.Errorf("%s needs a value", argument)
 			}
 			index++
-			if argument == "--output" {
-				settings.output = arguments[index]
-			} else {
-				settings.database = arguments[index]
+			value := arguments[index]
+			switch argument {
+			case "--output":
+				settings.output = value
+			case "--database":
+				settings.database = value
+			case "--account":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("--account needs a non-empty value")
+				}
+				settings.accountID = value
+			case "--username", "--user":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.username = value
+			case "--password-file":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("--password-file needs a non-empty value")
+				}
+				settings.passwordFile = value
 			}
+		case "--password-prompt":
+			settings.passwordPrompt = true
+		case "--no-stored-password":
+			settings.noStoredPassword = true
+		case "--non-interactive":
+			settings.nonInteractive = true
 		default:
 			if strings.HasPrefix(argument, "-") {
 				return settings, fmt.Errorf("unknown flag: %s", argument)
 			}
-			settings.command = append(settings.command, argument)
+			raw = append(raw, argument)
 		}
 	}
+	settings.command, settings.positionals = splitCommand(raw)
 	if settings.output != "text" && settings.output != "json" {
 		return settings, fmt.Errorf("output must be text or json")
 	}
@@ -109,6 +178,90 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 		return settings, errors.New("database path is empty")
 	}
 	return settings, nil
+}
+
+// checkCommandFlags rejects account-specific flags for commands that do not
+// consume them, so typos and copy-paste errors fail instead of being silently
+// ignored. --database, --output, and --non-interactive remain global.
+func checkCommandFlags(command string, settings options) error {
+	hasAccountID := settings.accountID != ""
+	hasUsername := settings.username != ""
+	hasPasswordFile := settings.passwordFile != ""
+	switch command {
+	case "version", "doctor", "database initialize":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for %s", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		}
+	case "account list":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for account list")
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for account list")
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for account list")
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for account list")
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for account list")
+		}
+	case "account show", "account delete":
+		switch {
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		}
+	}
+	return nil
+}
+
+func splitCommand(raw []string) ([]string, []string) {
+	candidates := [][]string{
+		{"database", "initialize"},
+		{"account", "create"},
+		{"account", "list"},
+		{"account", "show"},
+		{"account", "edit"},
+		{"account", "delete"},
+		{"version"},
+		{"doctor"},
+	}
+	for _, candidate := range candidates {
+		if len(raw) >= len(candidate) {
+			matched := true
+			for i, word := range candidate {
+				if raw[i] != word {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return candidate, raw[len(candidate):]
+			}
+		}
+	}
+	// Unknown command: keep at most two words as the command name so errors stay readable.
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if len(raw) == 1 {
+		return raw, nil
+	}
+	return raw[:2], raw[2:]
 }
 
 func defaultDatabasePath(getenv func(string) string) string {
@@ -121,6 +274,15 @@ func defaultDatabasePath(getenv func(string) string) string {
 	return ""
 }
 
+func isEnvTrue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func writeResult(writer io.Writer, command string, data any) {
 	writeJSON(writer, map[string]any{"schema_version": resultSchemaVersion, "command": command, "data": data})
 }
@@ -129,6 +291,20 @@ func reportStoreError(stderr io.Writer, command string, err error, jsonOutput bo
 	code := "database_error"
 	if store.IsUnsupportedSchema(err) {
 		code = "unsupported_schema"
+	}
+	writeError(stderr, command, code, err.Error(), jsonOutput)
+	return 2
+}
+
+func reportAccountError(stderr io.Writer, command string, err error, jsonOutput bool) int {
+	code := "database_error"
+	switch {
+	case errors.Is(err, store.ErrAccountExists):
+		code = "account_exists"
+	case errors.Is(err, store.ErrAccountNotFound):
+		code = "account_not_found"
+	case errors.Is(err, store.ErrAccountInvalid):
+		code = "invalid_arguments"
 	}
 	writeError(stderr, command, code, err.Error(), jsonOutput)
 	return 2

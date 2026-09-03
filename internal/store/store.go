@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion = 1
+	CurrentSchemaVersion = 2
 	backupLimit          = 3
 )
 
@@ -328,6 +328,18 @@ func migrate(database *sql.DB) (err error) {
 		for _, statement := range statements {
 			if _, err = connection.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("apply schema migration 1: %w", err)
+			}
+		}
+	}
+	if fromVersion < 2 {
+		statements := []string{
+			"CREATE TABLE accounts (id TEXT PRIMARY KEY, username TEXT NOT NULL, password_source TEXT NOT NULL CHECK(password_source IN ('secret-service','file','prompt')), password_ref TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL) STRICT",
+			"INSERT INTO schema_migrations (version, applied_at) VALUES (2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+			"PRAGMA user_version = 2",
+		}
+		for _, statement := range statements {
+			if _, err = connection.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply schema migration 2: %w", err)
 			}
 		}
 	}

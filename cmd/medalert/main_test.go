@@ -69,7 +69,7 @@ func TestDatabaseInitializeUsesXDGLocationAndPrivatePermissions(t *testing.T) {
 	if result.exitCode != 0 || result.stderr != "" {
 		t.Fatalf("result = %#v", result)
 	}
-	if result.stdout != "Initialized database schema 1.\n" {
+	if result.stdout != "Initialized database schema 2.\n" {
 		t.Fatalf("stdout = %q", result.stdout)
 	}
 	assertProcessFileMode(t, filepath.Join(dataHome, "medalert"), 0o700)
@@ -177,7 +177,7 @@ func TestDoctorReportsRequiredMigrationWithoutChangingDatabase(t *testing.T) {
 	if _, err := os.Stat(databasePath); !os.IsNotExist(err) {
 		t.Fatalf("database exists after doctor: %v", err)
 	}
-	if !strings.Contains(result.stdout, `"required_schema_version":1`) || !strings.Contains(result.stdout, `"migration_required":true`) {
+	if !strings.Contains(result.stdout, `"required_schema_version":2`) || !strings.Contains(result.stdout, `"migration_required":true`) {
 		t.Fatalf("stdout = %q", result.stdout)
 	}
 }
@@ -189,7 +189,7 @@ func TestNewerSchemaReturnsConfigurationErrorWithoutChangingDatabase(t *testing.
 	if initialize.exitCode != 0 {
 		t.Fatalf("initialize = %#v", initialize)
 	}
-	setUserVersion(t, databasePath, 2)
+	setUserVersion(t, databasePath, 3)
 	before, err := os.ReadFile(databasePath)
 	if err != nil {
 		t.Fatal(err)
@@ -305,5 +305,246 @@ func setUserVersion(t *testing.T, path string, version int) {
 	defer database.Close()
 	if _, err := database.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func writeProcessSecretFile(t *testing.T, dir, name, value string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(value+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestAccountManageMultipleAccountsWithTextAndJSON(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	markerOne := "MARKER-ACCOUNT-ONE-" + t.Name() + "-unique"
+	markerTwo := "MARKER-ACCOUNT-TWO-unique"
+	fileOne := writeProcessSecretFile(t, secretDir, "one", markerOne)
+	fileTwo := writeProcessSecretFile(t, secretDir, "two", markerTwo)
+
+	createOne := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "alice", "--username", "alice@example.com", "--password-file", fileOne)
+	if createOne.exitCode != 0 || createOne.stderr != "" {
+		t.Fatalf("create alice = %#v", createOne)
+	}
+	createTwo := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "bob", "--username", "bob@example.com", "--password-file", fileTwo, "--output", "json")
+	if createTwo.exitCode != 0 || createTwo.stderr != "" {
+		t.Fatalf("create bob = %#v", createTwo)
+	}
+	if !strings.Contains(createTwo.stdout, `"command":"account create"`) || !strings.Contains(createTwo.stdout, `"schema_version":1`) {
+		t.Fatalf("bob json = %q", createTwo.stdout)
+	}
+
+	listText := run(t, nil, "account", "list", "--database", databasePath)
+	if listText.exitCode != 0 {
+		t.Fatalf("list = %#v", listText)
+	}
+	if !strings.Contains(listText.stdout, "alice") || !strings.Contains(listText.stdout, "bob") {
+		t.Fatalf("list stdout = %q", listText.stdout)
+	}
+
+	listJSON := run(t, nil, "account", "list", "--database", databasePath, "--output", "json")
+	if listJSON.exitCode != 0 {
+		t.Fatalf("list json = %#v", listJSON)
+	}
+	var listEnvelope struct {
+		SchemaVersion int    `json:"schema_version"`
+		Command       string `json:"command"`
+		Data          struct {
+			Accounts []struct {
+				ID             string `json:"id"`
+				Username       string `json:"username"`
+				PasswordSource string `json:"password_source"`
+				PasswordRef    string `json:"password_ref"`
+			} `json:"accounts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(listJSON.stdout), &listEnvelope); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if listEnvelope.SchemaVersion != 1 || listEnvelope.Command != "account list" || len(listEnvelope.Data.Accounts) != 2 {
+		t.Fatalf("list envelope = %#v", listEnvelope)
+	}
+
+	show := run(t, nil, "account", "show", "--database", databasePath, "--account", "alice", "--output", "json")
+	if show.exitCode != 0 {
+		t.Fatalf("show = %#v", show)
+	}
+
+	edit := run(t, nil, "account", "edit", "--database", databasePath, "--non-interactive", "--account", "alice", "--username", "alice2@example.com")
+	if edit.exitCode != 0 || edit.stderr != "" {
+		t.Fatalf("edit = %#v", edit)
+	}
+	assertProcessQueryValue(t, databasePath, "SELECT username FROM accounts WHERE id = 'alice'", "alice2@example.com")
+
+	deleted := run(t, nil, "account", "delete", "--database", databasePath, "--account", "bob")
+	if deleted.exitCode != 0 {
+		t.Fatalf("delete = %#v", deleted)
+	}
+	afterDelete := run(t, nil, "account", "list", "--database", databasePath, "--output", "json")
+	if !strings.Contains(afterDelete.stdout, "alice") || strings.Contains(afterDelete.stdout, `"id":"bob"`) {
+		t.Fatalf("after delete = %q", afterDelete.stdout)
+	}
+
+	// Secret values must never appear in outputs, errors, or the database file.
+	for _, output := range []string{createOne.stdout, createOne.stderr, createTwo.stdout, createTwo.stderr, listText.stdout, listText.stderr, listJSON.stdout, show.stdout, edit.stdout, edit.stderr, deleted.stdout, afterDelete.stdout} {
+		if strings.Contains(output, markerOne) || strings.Contains(output, markerTwo) {
+			t.Fatalf("output leaks secret: %q", output)
+		}
+	}
+	raw, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), markerOne) || strings.Contains(string(raw), markerTwo) {
+		t.Fatal("database file contains secret value")
+	}
+	assertProcessQueryValue(t, databasePath, "SELECT password_source FROM accounts WHERE id = 'alice'", "file")
+	assertProcessQueryValue(t, databasePath, "SELECT password_ref FROM accounts WHERE id = 'alice'", fileOne)
+}
+
+func TestAccountRejectsUnsafeSecretFiles(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	openPath := filepath.Join(secretDir, "open")
+	if err := os.WriteFile(openPath, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := "MARKER-UNSAFE-unique"
+	result := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "unsafe", "--username", "u@example.com", "--password-file", openPath)
+	if result.exitCode != 2 || result.stdout != "" {
+		t.Fatalf("unsafe result = %#v", result)
+	}
+	if strings.Contains(result.stderr, marker) {
+		t.Fatal("error leaks secret")
+	}
+
+	target := filepath.Join(secretDir, "target")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(secretDir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	linkResult := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "linked", "--username", "u@example.com", "--password-file", link)
+	if linkResult.exitCode != 2 {
+		t.Fatalf("symlink result = %#v", linkResult)
+	}
+}
+
+func TestAccountNonInteractiveRejectsMissingInput(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	result := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "nopass", "--username", "u@example.com")
+	if result.exitCode != 2 || result.stdout != "" || result.stderr == "" {
+		t.Fatalf("missing input result = %#v", result)
+	}
+	if !strings.Contains(strings.ToLower(result.stderr), "missing") {
+		t.Fatalf("stderr = %q, want missing input", result.stderr)
+	}
+	jsonResult := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--output", "json", "--account", "nopass2", "--username", "u@example.com")
+	if jsonResult.exitCode != 2 || !strings.Contains(jsonResult.stderr, `"code":"missing_input"`) {
+		t.Fatalf("json missing = %#v", jsonResult)
+	}
+}
+
+func TestAccountDuplicateCreateChecksExistenceBeforeSecrets(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	valid := writeProcessSecretFile(t, secretDir, "valid", "valid-secret")
+	openPath := filepath.Join(secretDir, "open")
+	if err := os.WriteFile(openPath, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	created := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "dup", "--username", "u@example.com", "--password-file", valid)
+	if created.exitCode != 0 {
+		t.Fatalf("create = %#v", created)
+	}
+	// The id already exists and the replacement file is unsafe: existence must
+	// win so the command reports account_exists without touching secrets.
+	again := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "dup", "--username", "other@example.com", "--password-file", openPath, "--output", "json")
+	if again.exitCode != 2 || !strings.Contains(again.stderr, `"code":"account_exists"`) {
+		t.Fatalf("duplicate result = %#v", again)
+	}
+	assertProcessQueryValue(t, databasePath, "SELECT username FROM accounts WHERE id = 'dup'", "u@example.com")
+}
+
+func TestAccountRejectsIrrelevantFlags(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	valid := writeProcessSecretFile(t, secretDir, "valid", "valid-secret")
+
+	for _, args := range [][]string{
+		{"doctor", "--database", databasePath, "--account", "alice"},
+		{"version", "--username", "u@example.com"},
+		{"database", "initialize", "--database", databasePath, "--password-prompt"},
+		{"account", "list", "--database", databasePath, "--account", "alice"},
+		{"account", "list", "--database", databasePath, "--username", "u@example.com"},
+		{"account", "show", "--database", databasePath, "--account", "alice", "--username", "u@example.com"},
+		{"account", "delete", "--database", databasePath, "--account", "alice", "--password-file", valid},
+	} {
+		result := run(t, nil, args...)
+		if result.exitCode != 2 || result.stdout != "" || !strings.Contains(result.stderr, "not supported") {
+			t.Fatalf("args %v result = %#v", args, result)
+		}
+	}
+}
+
+func TestVersionDoctorInitializeRejectExtraArguments(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+
+	extra := run(t, nil, "version", "extra")
+	if extra.exitCode != 2 || extra.stdout != "" || !strings.Contains(extra.stderr, "too many arguments") {
+		t.Fatalf("version extra = %#v", extra)
+	}
+
+	doctor := run(t, nil, "doctor", "--database", databasePath, "extra")
+	if doctor.exitCode != 2 || doctor.stdout != "" || !strings.Contains(doctor.stderr, "too many arguments") {
+		t.Fatalf("doctor extra = %#v", doctor)
+	}
+
+	initialize := run(t, nil, "database", "initialize", "--database", databasePath, "extra")
+	if initialize.exitCode != 2 || initialize.stdout != "" || !strings.Contains(initialize.stderr, "too many arguments") {
+		t.Fatalf("initialize extra = %#v", initialize)
+	}
+	if _, err := os.Stat(databasePath); !os.IsNotExist(err) {
+		t.Fatalf("rejected initialize created a database: %v", err)
+	}
+}
+
+func TestVersionFlagAfterCommandShowsVersion(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+
+	version := run(t, nil, "account", "create", "--database", databasePath,
+		"--username", "u@example.com", "--no-stored-password", "--version")
+	if version.exitCode != 0 || version.stderr != "" || !strings.HasPrefix(version.stdout, "medalert ") {
+		t.Fatalf("flag result = %#v", version)
+	}
+
+	listed := run(t, nil, "account", "list", "--database", databasePath)
+	if listed.exitCode != 0 || !strings.Contains(listed.stdout, "No accounts found.") {
+		t.Fatalf("list = %#v; the --version invocation must not create an account", listed)
 	}
 }
