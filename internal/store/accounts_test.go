@@ -135,8 +135,8 @@ func TestMigrateV1ToV2KeepsData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if status.SchemaVersion != 2 {
-		t.Fatalf("schema = %d, want 2", status.SchemaVersion)
+	if status.SchemaVersion != store.CurrentSchemaVersion {
+		t.Fatalf("schema = %d, want %d", status.SchemaVersion, store.CurrentSchemaVersion)
 	}
 	storage, err := store.Open(databasePath)
 	if err != nil {
