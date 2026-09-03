@@ -12,16 +12,22 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/poppyseedcake/MedAlert/internal/store"
 )
 
 type durableCheckFake struct {
-	mu            sync.Mutex
-	baseURL       string
-	redirectURI   string
-	slots         []map[string]any
-	searchFailure bool
-	pending       map[string]string
-	codes         map[string]string
+	mu             sync.Mutex
+	baseURL        string
+	redirectURI    string
+	slots          []map[string]any
+	searchFailure  bool
+	pending        map[string]string
+	codes          map[string]string
+	authRequests   int
+	searchRequests int
+	afterToken     func() error
+	afterTokenErr  error
 }
 
 func newDurableCheckFake(t *testing.T) (*durableCheckFake, func()) {
@@ -43,6 +49,7 @@ func newDurableCheckFake(t *testing.T) (*durableCheckFake, func()) {
 		query := r.URL.Query()
 		state := query.Get("state")
 		fake.mu.Lock()
+		fake.authRequests++
 		fake.pending[state] = query.Get("code_challenge")
 		fake.mu.Unlock()
 		if _, err := r.Cookie("MedicoverTrusted"); err == nil {
@@ -86,11 +93,21 @@ func newDurableCheckFake(t *testing.T) (*durableCheckFake, func()) {
 		fake.mu.Lock()
 		state, ok := fake.codes[code]
 		challenge := fake.pending[state]
+		afterToken := fake.afterToken
 		fake.mu.Unlock()
 		if !ok || base64.RawURLEncoding.EncodeToString(mustSHA256(verifier)) != challenge {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
 			return
+		}
+		if afterToken != nil {
+			if callbackErr := afterToken(); callbackErr != nil {
+				fake.mu.Lock()
+				fake.afterTokenErr = callbackErr
+				fake.mu.Unlock()
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -102,6 +119,7 @@ func newDurableCheckFake(t *testing.T) (*durableCheckFake, func()) {
 	searchHandler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fake.mu.Lock()
+		fake.searchRequests++
 		failure := fake.searchFailure
 		slots := append([]map[string]any(nil), fake.slots...)
 		fake.mu.Unlock()
@@ -151,6 +169,24 @@ func (f *durableCheckFake) failSearch() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.searchFailure = true
+}
+
+func (f *durableCheckFake) authRequestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.authRequests
+}
+
+func (f *durableCheckFake) searchRequestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.searchRequests
+}
+
+func (f *durableCheckFake) setAfterToken(callback func() error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterToken = callback
 }
 
 func durableSlot(booking string) map[string]any {
@@ -267,6 +303,104 @@ func TestDryCheckDoesNotSaveObservationState(t *testing.T) {
 	}
 	assertProcessQueryValue(t, database, "SELECT count(*) FROM observation_runs", "0")
 	assertProcessQueryValue(t, database, "SELECT count(*) FROM availability_episodes", "0")
+}
+
+func TestDurableCheckRejectsDisabledProfileBeforeAuthentication(t *testing.T) {
+	fake, cleanup := newDurableCheckFake(t)
+	defer cleanup()
+	root := t.TempDir()
+	_, environment := createDurableCheckFixture(t, fake, root)
+
+	disabled := run(t, environment, "profile", "disable", "--profile", "morning")
+	if disabled.exitCode != 0 || disabled.stderr != "" {
+		t.Fatalf("disable profile = %#v", disabled)
+	}
+
+	result := run(t, environment, "check", "--profile", "morning", "--output", "json", "--non-interactive")
+	if result.exitCode != 2 || result.stdout != "" || !strings.Contains(result.stderr, `"code":"profile_disabled"`) {
+		t.Fatalf("disabled check = %#v", result)
+	}
+	if count := fake.authRequestCount(); count != 0 {
+		t.Fatalf("authentication requests = %d, want 0", count)
+	}
+}
+
+func TestDurableCheckRejectsProfileRecreatedForAnotherAccount(t *testing.T) {
+	fake, cleanup := newDurableCheckFake(t)
+	defer cleanup()
+	root := t.TempDir()
+	database, environment := createDurableCheckFixture(t, fake, root)
+	otherAccount := run(t, environment, "account", "create", "--account", "other", "--username", "other@example.com", "--no-stored-password", "--non-interactive")
+	if otherAccount.exitCode != 0 || otherAccount.stderr != "" {
+		t.Fatalf("create other account = %#v", otherAccount)
+	}
+
+	fake.setAfterToken(func() error {
+		storage, err := store.Open(database)
+		if err != nil {
+			return err
+		}
+		defer storage.Close()
+		if err := storage.DeleteProfile("morning"); err != nil {
+			return err
+		}
+		_, err = storage.CreateProfile(store.Profile{
+			ID:                   "morning",
+			AccountID:            "other",
+			RegionIDs:            "205",
+			SpecialtyIDs:         "133",
+			CheckIntervalMinutes: 30,
+			Enabled:              true,
+			SearchType:           store.SearchTypeStandard,
+		})
+		return err
+	})
+
+	result := run(t, environment, "check", "--profile", "morning", "--output", "json", "--non-interactive")
+	if result.exitCode != 6 || result.stdout != "" || !strings.Contains(result.stderr, `"code":"stale_result"`) {
+		t.Fatalf("recreated-profile check = %#v", result)
+	}
+	if fake.searchRequestCount() != 0 {
+		t.Fatalf("search requests = %d, want 0", fake.searchRequestCount())
+	}
+	fake.mu.Lock()
+	callbackErr := fake.afterTokenErr
+	fake.mu.Unlock()
+	if callbackErr != nil {
+		t.Fatalf("recreate profile: %v", callbackErr)
+	}
+}
+
+func TestDurableCheckRejectsAccountChangedBeforeSearch(t *testing.T) {
+	fake, cleanup := newDurableCheckFake(t)
+	defer cleanup()
+	root := t.TempDir()
+	database, environment := createDurableCheckFixture(t, fake, root)
+
+	fake.setAfterToken(func() error {
+		storage, err := store.Open(database)
+		if err != nil {
+			return err
+		}
+		defer storage.Close()
+		username := "changed@example.com"
+		_, err = storage.UpdateAccount("patient", store.AccountUpdate{Username: &username})
+		return err
+	})
+
+	result := run(t, environment, "check", "--profile", "morning", "--output", "json", "--non-interactive")
+	if result.exitCode != 6 || result.stdout != "" || !strings.Contains(result.stderr, `"code":"stale_result"`) {
+		t.Fatalf("changed-account check = %#v", result)
+	}
+	if fake.searchRequestCount() != 0 {
+		t.Fatalf("search requests = %d, want 0", fake.searchRequestCount())
+	}
+	fake.mu.Lock()
+	callbackErr := fake.afterTokenErr
+	fake.mu.Unlock()
+	if callbackErr != nil {
+		t.Fatalf("change account: %v", callbackErr)
+	}
 }
 
 func TestDurableCheckReconcilesAcrossProcessesAndKeepsStateOnFailure(t *testing.T) {

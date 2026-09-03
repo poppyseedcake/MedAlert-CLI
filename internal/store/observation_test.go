@@ -266,6 +266,38 @@ func TestObservationEndsPassedEpisodesAndSkipsPastSlots(t *testing.T) {
 	}
 }
 
+func TestObservationUsesPortalTimezoneForLocalSlotTime(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateProfile(validProfile("portal-time", "alice")); err != nil {
+		t.Fatal(err)
+	}
+	location, err := time.LoadLocation("Europe/Warsaw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 10, 10, 30, 0, 0, location)
+	run, err := storage.BeginObservationRun("portal-time", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := storage.ReconcileObservationRun(run.ID, []store.ObservationSlot{
+		observationSlot("booking-local", "slot-local", "booking-local", "2026-09-10T10:00:00"),
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.NewEpisodes) != 0 {
+		t.Fatalf("new episodes = %#v, want no episode for a passed local slot", result.NewEpisodes)
+	}
+	episodes, err := storage.ListAvailabilityEpisodes("portal-time")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(episodes) != 0 {
+		t.Fatalf("episodes = %#v, want none", episodes)
+	}
+}
+
 func TestObservationAllowsOnlyOneActiveRunPerProfile(t *testing.T) {
 	storage, _ := openProfileStore(t)
 	if _, err := storage.CreateProfile(validProfile("serialized", "alice")); err != nil {

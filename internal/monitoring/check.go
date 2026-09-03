@@ -21,7 +21,7 @@ type CheckResult struct {
 
 // Check runs one observation search and reconciles its result. A search error
 // records the run outcome but never changes availability episodes.
-func Check(ctx context.Context, storage *store.Store, profile store.Profile, client *medicover.Client, accessToken string, now time.Time) (CheckResult, error) {
+func Check(ctx context.Context, storage *store.Store, profile store.Profile, account store.Account, client *medicover.Client, accessToken string, now time.Time) (CheckResult, error) {
 	run, err := storage.BeginObservationRun(profile.ID, now)
 	if err != nil {
 		return CheckResult{}, err
@@ -34,7 +34,14 @@ func Check(ctx context.Context, storage *store.Store, profile store.Profile, cli
 	if err != nil {
 		return CheckResult{}, recordFailedRun(storage, run, err, now)
 	}
-	if currentProfile.UpdatedAt != run.ProfileUpdatedAt || !currentProfile.Enabled {
+	currentAccount, err := storage.GetAccount(account.ID)
+	if err != nil {
+		return CheckResult{}, recordFailedRun(storage, run, fmt.Errorf("%w: account changed before the search started", store.ErrObservationRunStale), now)
+	}
+	if currentProfile.AccountID != account.ID ||
+		currentProfile.UpdatedAt != profile.UpdatedAt ||
+		currentAccount.UpdatedAt != account.UpdatedAt ||
+		!currentProfile.Enabled {
 		return CheckResult{}, recordFailedRun(storage, run, fmt.Errorf("%w: profile changed before the search started", store.ErrObservationRunStale), now)
 	}
 	profile = currentProfile

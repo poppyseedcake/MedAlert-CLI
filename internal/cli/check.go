@@ -39,6 +39,9 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 	if err != nil {
 		return reportProfileError(stderr, command, err, jsonOutput)
 	}
+	if !settings.dry && !profile.Enabled {
+		return reportCheckError(stderr, command, fmt.Errorf("%w: %s", store.ErrProfileDisabled, profile.ID), jsonOutput)
+	}
 	account, err := storage.GetAccount(profile.AccountID)
 	if err != nil {
 		return reportAccountError(stderr, command, err, jsonOutput)
@@ -86,7 +89,7 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 		}
 		return 0
 	}
-	result, err := monitoring.Check(ctx, storage, profile, client, auth.AccessToken, time.Now().UTC())
+	result, err := monitoring.Check(ctx, storage, profile, account, client, auth.AccessToken, time.Now().UTC())
 	if err != nil {
 		return reportCheckError(stderr, command, err, jsonOutput)
 	}

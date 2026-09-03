@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	_ "time/tzdata"
 )
 
 const (
@@ -21,7 +22,10 @@ const (
 	ObservationRunStale       = "stale"
 
 	observationRunLease = 15 * time.Minute
+	portalLocationName  = "Europe/Warsaw"
 )
+
+var portalLocation = mustLoadPortalLocation()
 
 var (
 	// ErrObservationRunActive is returned when another process is checking
@@ -512,11 +516,19 @@ func slotHasPassed(raw string, now time.Time) bool {
 		return false
 	}
 	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.999999999", "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
-		if parsed, err := time.Parse(layout, value); err == nil {
+		if parsed, err := time.ParseInLocation(layout, value, portalLocation); err == nil {
 			return !parsed.After(now)
 		}
 	}
 	return false
+}
+
+func mustLoadPortalLocation() *time.Location {
+	location, err := time.LoadLocation(portalLocationName)
+	if err != nil {
+		panic(fmt.Sprintf("load portal time zone %q: %v", portalLocationName, err))
+	}
+	return location
 }
 
 func observationTime(value time.Time) time.Time {
