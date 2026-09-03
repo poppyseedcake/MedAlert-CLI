@@ -327,6 +327,9 @@ func checkCommandFlags(command string, settings options) error {
 	if settings.dry && command != "check" {
 		return fmt.Errorf("--dry is not supported for %s", command)
 	}
+	if command == "check" {
+		return checkDrySearchFlags(settings)
+	}
 	hasAccountID := settings.accountID != ""
 	hasUsername := settings.username != ""
 	hasPasswordFile := settings.passwordFile != ""
@@ -586,6 +589,66 @@ func checkCommandFlags(command string, settings options) error {
 		case settings.profileDisabled:
 			return fmt.Errorf("--disabled is not supported for %s (use profile enable and profile disable)", command)
 		}
+	}
+	return nil
+}
+
+func checkDrySearchFlags(settings options) error {
+	unsupported := ""
+	switch {
+	case settings.accountID != "":
+		unsupported = "--account"
+	case settings.username != "":
+		unsupported = "--username"
+	case settings.passwordFile != "":
+		unsupported = "--password-file"
+	case settings.passwordPrompt:
+		unsupported = "--password-prompt"
+	case settings.noStoredPassword:
+		unsupported = "--no-stored-password"
+	case settings.mfaCodeFile != "":
+		unsupported = "--mfa-code-file"
+	case settings.forgetSecret:
+		unsupported = "--forget-secret"
+	case settings.region != "":
+		unsupported = "--region"
+	case settings.specialty != "":
+		unsupported = "--specialty"
+	case settings.clinic != "":
+		unsupported = "--clinic"
+	case settings.doctor != "":
+		unsupported = "--doctor"
+	case settings.language != "":
+		unsupported = "--language"
+	case settings.visitType != "":
+		unsupported = "--visit-type"
+	case settings.searchType != "":
+		unsupported = "--search-type"
+	case settings.startDate != "":
+		unsupported = "--start-date"
+	case settings.endDate != "":
+		unsupported = "--end-date"
+	case settings.checkIntervalRaw != "":
+		unsupported = "--check-interval"
+	case settings.profileDisabled:
+		unsupported = "--disabled"
+	case settings.clearClinic:
+		unsupported = "--clear-clinic"
+	case settings.clearDoctor:
+		unsupported = "--clear-doctor"
+	case settings.clearLanguage:
+		unsupported = "--clear-language"
+	case settings.clearVisitType:
+		unsupported = "--clear-visit-type"
+	case settings.clearSearchType:
+		unsupported = "--clear-search-type"
+	case settings.clearStartDate:
+		unsupported = "--clear-start-date"
+	case settings.clearEndDate:
+		unsupported = "--clear-end-date"
+	}
+	if unsupported != "" {
+		return fmt.Errorf("%s is not supported for check", unsupported)
 	}
 	return nil
 }
