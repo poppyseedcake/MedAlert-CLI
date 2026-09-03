@@ -52,6 +52,7 @@ type options struct {
 	clearSearchType  bool
 	clearStartDate   bool
 	clearEndDate     bool
+	dry              bool
 }
 
 type errorBody struct {
@@ -144,6 +145,14 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 			settings.medicoverBaseURL = strings.TrimSpace(getenv("MEDALERT_MEDICOVER_BASE_URL"))
 		}
 		return runAuth(commandName, settings, stdin, stdout, stderr)
+	case "check":
+		if settings.sessionDir == "" {
+			settings.sessionDir = strings.TrimSpace(getenv("MEDALERT_SESSION_DIR"))
+		}
+		if settings.medicoverBaseURL == "" {
+			settings.medicoverBaseURL = strings.TrimSpace(getenv("MEDALERT_MEDICOVER_BASE_URL"))
+		}
+		return runCheck(commandName, settings, stdin, stdout, stderr)
 	default:
 		writeError(stderr, commandName, "invalid_arguments", "a supported command is required", settings.output == "json")
 		return 2
@@ -291,6 +300,8 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 			settings.forgetSecret = true
 		case "--non-interactive":
 			settings.nonInteractive = true
+		case "--dry":
+			settings.dry = true
 		default:
 			if strings.HasPrefix(argument, "-") {
 				return settings, fmt.Errorf("unknown flag: %s", argument)
@@ -579,7 +590,7 @@ func checkCommandFlags(command string, settings options) error {
 // checkProfileFlagsForNonProfileCommands rejects --profile and profile
 // criteria flags for commands that do not consume them.
 func checkProfileFlagsForNonProfileCommands(command string, settings options) error {
-	if strings.HasPrefix(command, "profile ") {
+	if strings.HasPrefix(command, "profile ") || command == "check" {
 		return nil
 	}
 	switch {
@@ -644,6 +655,7 @@ func splitCommand(raw []string) ([]string, []string) {
 		{"profile", "enable"},
 		{"profile", "disable"},
 		{"profile", "delete"},
+		{"check"},
 		{"version"},
 		{"doctor"},
 	}

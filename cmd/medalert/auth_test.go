@@ -170,10 +170,57 @@ func newAuthFake(t *testing.T) (*authFake, func()) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "access-1", "refresh_token": refresh, "expires_in": 300})
 	})
+	mux.HandleFunc("/appointments/api/v2/search-appointments/filters/initial-filters", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"regions":[]}`))
+	})
+	mux.HandleFunc("/appointments/api/v2/search-appointments/filters", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"clinics":[]}`))
+	})
+	mux.HandleFunc("/appointments/api/v2/search-appointments/slots", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[{"bookingString":"safe-booking","appointmentDate":"2026-09-12T09:00:00","doctor":null,"clinic":{"name":"Clinic A"},"specialty":{"name":"Cardiology"},"visitType":"Center"}],"totalPages":1}`))
+	})
 	server := httptest.NewServer(mux)
 	fake.baseURL = server.URL
 	fake.redirectURI = server.URL + "/signin-oidc"
 	return fake, server.Close
+}
+
+func TestDryCheckViaExecutableDoesNotChangeDatabase(t *testing.T) {
+	fake, cleanup := newAuthFake(t)
+	defer cleanup()
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	sessionDir := filepath.Join(root, "data")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	passwordFile := writeProcessSecretFile(t, secretDir, "password", "plain-pass")
+	env := []string{"MEDALERT_MEDICOVER_BASE_URL=" + fake.baseURL, "MEDALERT_SESSION_DIR=" + sessionDir}
+	if got := run(t, env, "account", "create", "--database", databasePath, "--non-interactive", "--account", "alice", "--username", "plain-user@example.com", "--password-file", passwordFile); got.exitCode != 0 {
+		t.Fatal(got)
+	}
+	if got := run(t, env, "profile", "create", "--database", databasePath, "--non-interactive", "--profile", "cardio", "--account", "alice", "--region", "204", "--specialty", "132", "--clinic", "10", "--doctor", "20", "--language", "4", "--visit-type", "Center", "--search-type", "Standard", "--start-date", "2026-09-01", "--end-date", "2026-09-30", "--check-interval-minutes", "30"); got.exitCode != 0 {
+		t.Fatal(got)
+	}
+	before, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := run(t, env, "check", "--dry", "--database", databasePath, "--non-interactive", "--profile", "cardio", "--output", "json")
+	if got.exitCode != 0 || got.stderr != "" || !strings.Contains(got.stdout, `"complete":true`) || !strings.Contains(got.stdout, `"booking_string":"safe-booking"`) {
+		t.Fatalf("result=%#v", got)
+	}
+	after, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("dry check changed the database")
+	}
 }
 
 func hasAuthCookie(r *http.Request) bool {

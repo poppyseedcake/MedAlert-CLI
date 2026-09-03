@@ -28,12 +28,13 @@ const (
 	defaultClientID    = "web"
 	defaultRedirectURI = "https://online24.medicover.pl/signin-oidc"
 	defaultScope       = "openid offline_access profile"
+	defaultAPIBaseURL  = "https://api-gateway-online24.medicover.pl"
 	// currentAppVersion is the Medicover web application version observed in
 	// research. It lives only inside this adapter and is never part of the
 	// domain model.
 	currentAppVersion = "3.37.0-beta.1.6"
 
-	maxRedirects     = 10
+	maxRedirects      = 10
 	requestTimeout    = 15 * time.Second
 	renewBeforeExpiry = 30 * time.Second
 )
@@ -47,6 +48,10 @@ const (
 	CodeTemporary          = "temporary_failure"
 	CodeRateLimited        = "rate_limited"
 	CodeMFARequired        = "mfa_required"
+	CodeCancelled          = "cancelled"
+	CodePartial            = "partial_result"
+	CodeConflicting        = "conflicting_result"
+	CodeStale              = "stale_result"
 )
 
 // Error is the only error type that crosses the Medicover seam. Message is
@@ -60,7 +65,9 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
-func IsAuthRequired(err error) bool { return errorCode(err) == CodeAuthRequired || errorCode(err) == CodeMFARequired }
+func IsAuthRequired(err error) bool {
+	return errorCode(err) == CodeAuthRequired || errorCode(err) == CodeMFARequired
+}
 
 func IsProtocolChanged(err error) bool { return errorCode(err) == CodeProtocolChanged }
 
@@ -169,6 +176,7 @@ type Config struct {
 	HTTPClient        *http.Client
 	Clock             func() time.Time
 	Rand              io.Reader
+	APIBaseURL        string
 }
 
 func (c *Config) withDefaults() Config {
@@ -190,6 +198,9 @@ func (c *Config) withDefaults() Config {
 	}
 	if cfg.Rand == nil {
 		cfg.Rand = rand.Reader
+	}
+	if cfg.APIBaseURL == "" {
+		cfg.APIBaseURL = defaultAPIBaseURL
 	}
 	return cfg
 }
