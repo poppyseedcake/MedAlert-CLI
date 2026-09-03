@@ -145,6 +145,28 @@ func TestDatabaseInitializeFailureLeavesPriorDatabaseUsable(t *testing.T) {
 	assertProcessQueryValue(t, databasePath, "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'application_metadata'", "0")
 }
 
+func TestConcurrentDatabaseInitializeUsesCurrentSchemaAfterLock(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	createProcessDatabase(t, databasePath, 0, "CREATE TABLE existing (payload BLOB); INSERT INTO existing VALUES (zeroblob(16777216));")
+
+	start := make(chan struct{})
+	results := make(chan processResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			results <- run(t, nil, "database", "initialize", "--database", databasePath)
+		}()
+	}
+	close(start)
+	for range 2 {
+		result := <-results
+		if result.exitCode != 0 || result.stderr != "" {
+			t.Errorf("concurrent result = %#v", result)
+		}
+	}
+}
+
 func TestDoctorReportsRequiredMigrationWithoutChangingDatabase(t *testing.T) {
 	root := t.TempDir()
 	databasePath := filepath.Join(root, "missing.db")

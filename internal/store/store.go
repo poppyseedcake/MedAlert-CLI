@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/poppyseedcake/MedAlert/internal/buildinfo"
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
 
@@ -94,6 +95,14 @@ func Initialize(path string) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
+	lockFile, err := lockInitialization(path)
+	if err != nil {
+		return Status{}, err
+	}
+	defer func() {
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+	}()
 	status, err := Inspect(path)
 	if err != nil {
 		return Status{}, err
@@ -111,17 +120,31 @@ func Initialize(path string) (Status, error) {
 		if err := createBackup(database, backupDirectory, status.SchemaVersion); err != nil {
 			return Status{}, err
 		}
+	}
+	if err := migrate(database); err != nil {
+		return Status{}, err
+	}
+	if existed {
 		if err := pruneBackups(backupDirectory); err != nil {
 			return Status{}, err
 		}
-	}
-	if err := migrate(database, status.SchemaVersion); err != nil {
-		return Status{}, err
 	}
 	status.Exists = true
 	status.SchemaVersion = CurrentSchemaVersion
 	status.MigrationRequired = false
 	return status, nil
+}
+
+func lockInitialization(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open database initialization lock: %w", err)
+	}
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock database initialization: %w", err)
+	}
+	return file, nil
 }
 
 func ensurePrivateDirectory(path string) error {
@@ -273,7 +296,7 @@ func pruneBackups(directory string) error {
 	return nil
 }
 
-func migrate(database *sql.DB, fromVersion int) (err error) {
+func migrate(database *sql.DB) (err error) {
 	ctx := context.Background()
 	connection, err := database.Conn(ctx)
 	if err != nil {
@@ -288,6 +311,13 @@ func migrate(database *sql.DB, fromVersion int) (err error) {
 			_, _ = connection.ExecContext(ctx, "ROLLBACK")
 		}
 	}()
+	var fromVersion int
+	if err = connection.QueryRowContext(ctx, "PRAGMA user_version").Scan(&fromVersion); err != nil {
+		return fmt.Errorf("read locked database schema version: %w", err)
+	}
+	if fromVersion > CurrentSchemaVersion {
+		return &UnsupportedSchemaError{Found: fromVersion, Supported: CurrentSchemaVersion}
+	}
 	if fromVersion < 1 {
 		statements := []string{
 			"CREATE TABLE application_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT",

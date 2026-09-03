@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	_ "modernc.org/sqlite"
@@ -92,6 +93,65 @@ func TestInitializeRollsBackFailedMigration(t *testing.T) {
 		t.Fatalf("schema version = %d, want 0", version)
 	}
 	assertQueryValue(t, databasePath, "SELECT count(*) FROM schema_migrations", "0")
+}
+
+func TestFailedMigrationDoesNotPruneExistingBackups(t *testing.T) {
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "medalert.db")
+	createDatabase(t, databasePath, 0, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at TEXT NOT NULL,
+			required_value TEXT NOT NULL
+		);
+	`)
+	backupDirectory := filepath.Join(root, "backups")
+	if err := os.Mkdir(backupDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var existingBackups []string
+	for index := range 3 {
+		path := filepath.Join(backupDirectory, fmt.Sprintf("medalert-schema-0-existing-%d.sqlite3", index))
+		if err := os.WriteFile(path, []byte("existing"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		modified := time.Now().Add(time.Duration(index-4) * time.Hour)
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+		existingBackups = append(existingBackups, path)
+	}
+
+	if _, err := store.Initialize(databasePath); err == nil {
+		t.Fatal("initialize succeeded, want migration error")
+	}
+	for _, path := range existingBackups {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("existing backup was removed: %s: %v", path, err)
+		}
+	}
+}
+
+func TestConcurrentInitializeUsesCurrentSchemaAfterLock(t *testing.T) {
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "medalert.db")
+	createDatabase(t, databasePath, 0, "CREATE TABLE existing (payload BLOB); INSERT INTO existing VALUES (zeroblob(16777216));")
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, err := store.Initialize(databasePath)
+			results <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Errorf("concurrent initialize: %v", err)
+		}
+	}
 }
 
 func TestInspectRejectsNewerSchemaWithoutChangingDatabase(t *testing.T) {
