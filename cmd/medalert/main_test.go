@@ -509,3 +509,42 @@ func TestAccountRejectsIrrelevantFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestVersionDoctorInitializeRejectExtraArguments(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+
+	extra := run(t, nil, "version", "extra")
+	if extra.exitCode != 2 || extra.stdout != "" || !strings.Contains(extra.stderr, "too many arguments") {
+		t.Fatalf("version extra = %#v", extra)
+	}
+
+	doctor := run(t, nil, "doctor", "--database", databasePath, "extra")
+	if doctor.exitCode != 2 || doctor.stdout != "" || !strings.Contains(doctor.stderr, "too many arguments") {
+		t.Fatalf("doctor extra = %#v", doctor)
+	}
+
+	initialize := run(t, nil, "database", "initialize", "--database", databasePath, "extra")
+	if initialize.exitCode != 2 || initialize.stdout != "" || !strings.Contains(initialize.stderr, "too many arguments") {
+		t.Fatalf("initialize extra = %#v", initialize)
+	}
+	if _, err := os.Stat(databasePath); !os.IsNotExist(err) {
+		t.Fatalf("rejected initialize created a database: %v", err)
+	}
+}
+
+func TestVersionFlagAfterCommandShowsVersion(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+
+	version := run(t, nil, "account", "create", "--database", databasePath,
+		"--username", "u@example.com", "--no-stored-password", "--version")
+	if version.exitCode != 0 || version.stderr != "" || !strings.HasPrefix(version.stdout, "medalert ") {
+		t.Fatalf("flag result = %#v", version)
+	}
+
+	listed := run(t, nil, "account", "list", "--database", databasePath)
+	if listed.exitCode != 0 || !strings.Contains(listed.stdout, "No accounts found.") {
+		t.Fatalf("list = %#v; the --version invocation must not create an account", listed)
+	}
+}

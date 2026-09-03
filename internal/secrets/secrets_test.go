@@ -8,6 +8,7 @@ import (
 
 	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/zalando/go-keyring"
+	"golang.org/x/sys/unix"
 )
 
 func TestSecretFileRoundTripAndRedaction(t *testing.T) {
@@ -91,6 +92,24 @@ func TestSecretFileRejectsUnsafePermissionsAndSymlinks(t *testing.T) {
 	}
 	if _, err := secrets.ReadSecretFile(link); err == nil {
 		t.Fatal("symlink accepted")
+	}
+}
+
+// A FIFO must be rejected without blocking: the open must not wait for a
+// writer before the regular-file check runs.
+func TestSecretFileRejectsFIFOWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "pipe")
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secrets.ReadSecretFile(path); err == nil {
+		t.Fatal("FIFO accepted")
+	} else if !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("error = %q, want non-regular-file rejection", err)
 	}
 }
 

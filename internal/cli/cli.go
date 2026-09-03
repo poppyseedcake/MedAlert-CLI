@@ -21,6 +21,7 @@ type options struct {
 	database         string
 	output           string
 	nonInteractive   bool
+	versionRequested bool
 	accountID        string
 	username         string
 	passwordFile     string
@@ -43,6 +44,17 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 		writeError(stderr, "command", "invalid_arguments", err.Error(), wantsJSON(arguments, getenv))
 		return 2
 	}
+	// --version takes precedence over any command: print the version and exit
+	// instead of treating the flag as a positional account id or similar.
+	if settings.versionRequested {
+		commit := buildinfo.SourceCommit()
+		if settings.output == "json" {
+			writeResult(stdout, "version", map[string]any{"commit": commit})
+		} else {
+			fmt.Fprintf(stdout, "medalert %s\n", commit)
+		}
+		return 0
+	}
 	commandName := strings.Join(settings.command, " ")
 	if err := checkCommandFlags(commandName, settings); err != nil {
 		writeError(stderr, commandName, "invalid_arguments", err.Error(), settings.output == "json")
@@ -50,6 +62,10 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 	}
 	switch commandName {
 	case "version":
+		if len(settings.positionals) > 0 {
+			writeError(stderr, commandName, "invalid_arguments", "too many arguments for version", settings.output == "json")
+			return 2
+		}
 		commit := buildinfo.SourceCommit()
 		if settings.output == "json" {
 			writeResult(stdout, "version", map[string]any{"commit": commit})
@@ -58,6 +74,10 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 		}
 		return 0
 	case "doctor":
+		if len(settings.positionals) > 0 {
+			writeError(stderr, commandName, "invalid_arguments", "too many arguments for doctor", settings.output == "json")
+			return 2
+		}
 		status, inspectErr := store.Inspect(settings.database)
 		if inspectErr != nil {
 			return reportStoreError(stderr, commandName, inspectErr, settings.output == "json")
@@ -71,6 +91,10 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 		}
 		return 0
 	case "database initialize":
+		if len(settings.positionals) > 0 {
+			writeError(stderr, commandName, "invalid_arguments", "too many arguments for database initialize", settings.output == "json")
+			return 2
+		}
 		status, initializeErr := store.Initialize(settings.database)
 		if initializeErr != nil {
 			return reportStoreError(stderr, commandName, initializeErr, settings.output == "json")
@@ -105,7 +129,7 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 		argument := arguments[index]
 		switch argument {
 		case "--version":
-			raw = append(raw, "version")
+			settings.versionRequested = true
 		case "--output", "--database", "--account", "--username", "--user", "--password-file":
 			if index+1 >= len(arguments) {
 				return settings, fmt.Errorf("%s needs a value", argument)

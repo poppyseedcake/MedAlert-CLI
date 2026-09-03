@@ -102,13 +102,20 @@ func accountCreate(command string, settings options, stdin *os.File, stdout, std
 		writeError(stderr, command, "invalid_arguments", "account id is required (use --account or a positional id)", jsonOutput)
 		return 2
 	}
-	if strings.TrimSpace(settings.username) == "" {
+	username := strings.TrimSpace(settings.username)
+	if username == "" {
 		writeError(stderr, command, "invalid_arguments", "username is required (use --username)", jsonOutput)
 		return 2
 	}
 	if countPasswordOptions(settings) > 1 {
 		writeError(stderr, command, "invalid_arguments", "use only one of --password-file, --password-prompt, --no-stored-password", jsonOutput)
 		return 2
+	}
+	// Validate the full account before any side effects: a rejected create
+	// must neither prompt for nor save a password.
+	intendedSource, intendedRef := intendedPasswordSource(settings)
+	if err := store.ValidateAccount(store.Account{ID: id, Username: username, PasswordSource: intendedSource, PasswordRef: intendedRef}); err != nil {
+		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 	storage, err := ensureStore(settings.database)
 	if err != nil {
@@ -120,7 +127,10 @@ func accountCreate(command string, settings options, stdin *os.File, stdout, std
 	if _, err := storage.GetAccount(id); err == nil {
 		writeError(stderr, command, "account_exists", fmt.Sprintf("account %q already exists", id), jsonOutput)
 		return 2
-	} else if !errors.Is(err, store.ErrAccountNotFound) && !errors.Is(err, store.ErrAccountInvalid) {
+	} else if !errors.Is(err, store.ErrAccountNotFound) {
+		if errors.Is(err, store.ErrAccountInvalid) {
+			return reportAccountError(stderr, command, err, jsonOutput)
+		}
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	source, ref, secretErr := prepareNewSecret(id, settings, stdin, stderr)
@@ -129,14 +139,15 @@ func accountCreate(command string, settings options, stdin *os.File, stdout, std
 	}
 	created, err := storage.CreateAccount(store.Account{
 		ID:             id,
-		Username:       strings.TrimSpace(settings.username),
+		Username:       username,
 		PasswordSource: source,
 		PasswordRef:    ref,
 	})
 	if err != nil {
-		// Best effort: a failed create after a Secret Service save leaves an
-		// orphaned entry that the next create or edit overwrites. The database
-		// remains the source of truth and never holds the secret value.
+		// A failed create after a Secret Service save is possible only
+		// through a concurrent duplicate. The orphaned entry is left alone:
+		// deleting it could remove the concurrent winner's password. The
+		// database remains the source of truth and never holds secret values.
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 	writeAccount(stdout, command, created, "Created account %s.\n", jsonOutput)
@@ -188,27 +199,45 @@ func accountEdit(command string, settings options, stdin *os.File, stdout, stder
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 	update := store.AccountUpdate{}
+	newUsername := current.Username
 	if settings.username != "" {
-		trimmed := strings.TrimSpace(settings.username)
-		update.Username = &trimmed
+		newUsername = strings.TrimSpace(settings.username)
+		update.Username = &newUsername
 	}
 	oldSource := current.PasswordSource
 	newSource := ""
 	newRef := ""
 	needsSecretUpdate := false
+	var stashedPassword string
+	stashed, stashKnown := false, true
 	if settings.passwordFile != "" || settings.passwordPrompt || settings.noStoredPassword {
+		intendedSource, intendedRef := intendedPasswordSource(settings)
+		// Validate before prompting or saving: a rejected edit must not
+		// replace the stored secret.
+		if err := store.ValidateAccount(store.Account{ID: id, Username: newUsername, PasswordSource: intendedSource, PasswordRef: intendedRef}); err != nil {
+			return reportAccountError(stderr, command, err, jsonOutput)
+		}
+		// Stash the current service password so a failed SQLite update can
+		// restore it instead of leaving the replacement behind.
+		if oldSource == store.PasswordSourceSecretService && intendedSource == store.PasswordSourceSecretService {
+			if value, err := secrets.GetPassword(id); err == nil {
+				stashedPassword, stashed = value, true
+			} else if !errors.Is(err, secrets.ErrSecretNotFound) {
+				stashKnown = false
+			}
+		}
 		source, ref, secretErr := prepareNewSecret(id, settings, stdin, stderr)
 		if secretErr != nil {
 			return reportSecretError(stderr, command, secretErr, jsonOutput)
 		}
-		newSource = source
-		newRef = ref
+		newSource, newRef = source, ref
 		update.PasswordSource = &newSource
 		update.PasswordRef = &newRef
 		needsSecretUpdate = true
 	}
 	updated, err := storage.UpdateAccount(id, update)
 	if err != nil {
+		restoreSecretAfterFailedUpdate(id, oldSource, newSource, stashedPassword, stashed, stashKnown)
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 	if needsSecretUpdate && oldSource == store.PasswordSourceSecretService && newSource != store.PasswordSourceSecretService {
@@ -266,31 +295,53 @@ func countPasswordOptions(settings options) int {
 	return count
 }
 
+// intendedPasswordSource returns the password source and reference selected
+// by the flags, without prompting, reading files, or saving anything, so
+// callers can validate the resulting account before causing side effects.
+func intendedPasswordSource(settings options) (string, string) {
+	switch {
+	case settings.passwordFile != "":
+		return store.PasswordSourceFile, settings.passwordFile
+	case settings.noStoredPassword:
+		return store.PasswordSourcePrompt, ""
+	default:
+		return store.PasswordSourceSecretService, ""
+	}
+}
+
+// restoreSecretAfterFailedUpdate best-effort returns Secret Service to its
+// prior state after UpdateAccount fails. Only a service-bound edit can leave
+// anything behind: file validation only reads, and prompt-only edits store
+// nothing. When the prior state is unknown, Secret Service is left untouched
+// rather than risk deleting a live secret.
+func restoreSecretAfterFailedUpdate(id, oldSource, newSource, stashedPassword string, stashed, stashKnown bool) {
+	if newSource != store.PasswordSourceSecretService {
+		return
+	}
+	if oldSource == store.PasswordSourceSecretService && stashed {
+		_ = secrets.SetPassword(id, stashedPassword)
+		return
+	}
+	if oldSource != store.PasswordSourceSecretService || stashKnown {
+		_ = secrets.DeletePassword(id)
+	}
+}
+
 // prepareNewSecret resolves the password source without ever returning the
 // secret value to callers. For file sources it validates the file is safe and
 // readable. For Secret Service it prompts once and saves. For prompt-only it
 // stores nothing.
 func prepareNewSecret(accountID string, settings options, stdin *os.File, stderr io.Writer) (string, string, error) {
-	switch {
-	case settings.passwordFile != "":
-		if _, err := secrets.ReadSecretFile(settings.passwordFile); err != nil {
+	source, ref := intendedPasswordSource(settings)
+	switch source {
+	case store.PasswordSourcePrompt:
+		return source, ref, nil
+	case store.PasswordSourceFile:
+		if _, err := secrets.ReadSecretFile(ref); err != nil {
 			return "", "", err
 		}
-		return store.PasswordSourceFile, settings.passwordFile, nil
-	case settings.passwordPrompt:
-		value, err := secrets.PromptForPassword("Password: ", stdin, stderr, settings.nonInteractive)
-		if err != nil {
-			return "", "", err
-		}
-		if err := secrets.SetPassword(accountID, value); err != nil {
-			return "", "", err
-		}
-		return store.PasswordSourceSecretService, "", nil
-	case settings.noStoredPassword:
-		return store.PasswordSourcePrompt, "", nil
+		return source, ref, nil
 	default:
-		// No explicit password flag: interactive commands prompt once and keep
-		// the value in Secret Service; non-interactive commands fail instead.
 		value, err := secrets.PromptForPassword("Password: ", stdin, stderr, settings.nonInteractive)
 		if err != nil {
 			return "", "", err
@@ -298,7 +349,7 @@ func prepareNewSecret(accountID string, settings options, stdin *os.File, stderr
 		if err := secrets.SetPassword(accountID, value); err != nil {
 			return "", "", err
 		}
-		return store.PasswordSourceSecretService, "", nil
+		return source, "", nil
 	}
 }
 

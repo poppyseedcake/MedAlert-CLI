@@ -48,7 +48,7 @@ func ServiceKey(accountID string) string {
 
 // test seams (private, per product decisions)
 var (
-	isTerminalFunc  = term.IsTerminal
+	isTerminalFunc   = term.IsTerminal
 	readPasswordFunc = term.ReadPassword
 )
 
@@ -115,14 +115,15 @@ func secretKind(err error) error {
 
 // ReadSecretFile reads a mounted secret file. It rejects symbolic links,
 // non-regular files, and files readable by group or others. The file is
-// opened with O_NOFOLLOW and then validated and read through the same open
-// descriptor, so a path replacement between the checks and the read cannot
-// substitute unchecked content.
+// opened with O_NOFOLLOW and O_NONBLOCK, then validated and read through the
+// same open descriptor: O_NOFOLLOW rejects a trailing symlink without a
+// second path lookup, and O_NONBLOCK keeps the open from blocking on a FIFO
+// before the regular-file check can reject it.
 func ReadSecretFile(path string) (string, error) {
 	if strings.TrimSpace(path) == "" || strings.ContainsRune(path, '\x00') {
 		return "", fmt.Errorf("read secret file: %w", ErrSecretNotFound)
 	}
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
 			return "", fmt.Errorf("read secret file %q: %w", path, ErrSecretNotFound)
