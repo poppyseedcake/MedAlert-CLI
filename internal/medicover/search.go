@@ -54,7 +54,7 @@ func (c *Client) Search(ctx context.Context, accessToken string, criteria Search
 	}
 	page, pages := 1, 1
 	result := SearchResult{Slots: []Slot{}}
-	seenBookings := map[string]bool{}
+	seenBookings := map[string]Slot{}
 	fallbackIndexes := map[string]int{}
 	stableBookings := map[string]bool{}
 	for page <= pages {
@@ -77,10 +77,13 @@ func (c *Client) Search(ctx context.Context, accessToken string, criteria Search
 		}
 		for _, item := range items {
 			if item.BookingString != "" {
-				if seenBookings[item.BookingString] {
+				if previous, ok := seenBookings[item.BookingString]; ok {
+					if !sameSlotDetails(previous, item) {
+						return SearchResult{}, &Error{Code: CodeConflicting, Message: "appointment search returned conflicting slot records"}
+					}
 					continue
 				}
-				seenBookings[item.BookingString] = true
+				seenBookings[item.BookingString] = item
 				stableBookings[item.StableIdentity] = true
 				if index, ok := fallbackIndexes[item.StableIdentity]; ok {
 					result.Slots[index] = item
@@ -93,7 +96,10 @@ func (c *Client) Search(ctx context.Context, accessToken string, criteria Search
 			if stableBookings[item.StableIdentity] {
 				continue
 			}
-			if _, ok := fallbackIndexes[item.StableIdentity]; ok {
+			if index, ok := fallbackIndexes[item.StableIdentity]; ok {
+				if !sameSlotDetails(result.Slots[index], item) {
+					return SearchResult{}, &Error{Code: CodeConflicting, Message: "appointment search returned conflicting slot records"}
+				}
 				continue
 			}
 			fallbackIndexes[item.StableIdentity] = len(result.Slots)
@@ -103,6 +109,16 @@ func (c *Client) Search(ctx context.Context, accessToken string, criteria Search
 	}
 	result.Pages = pages
 	return result, nil
+}
+
+func sameSlotDetails(left, right Slot) bool {
+	return left.StableIdentity == right.StableIdentity &&
+		left.BookingString == right.BookingString &&
+		left.Time == right.Time &&
+		left.Clinic == right.Clinic &&
+		left.Doctor == right.Doctor &&
+		left.Specialty == right.Specialty &&
+		left.VisitType == right.VisitType
 }
 
 func validFilterResponse(body []byte) bool {

@@ -93,6 +93,23 @@ func TestSearchDistinguishesProtocolHTTPAndCancellation(t *testing.T) {
 	}
 }
 
+func TestSearchRejectsConflictingDuplicateSlotRecords(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/slots") {
+			_, _ = w.Write([]byte(`{"items":[{"bookingString":"same-booking","appointmentDate":"2099-09-10T10:00:00Z"},{"bookingString":"same-booking","appointmentDate":"2099-09-11T10:00:00Z"}],"totalPages":1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"regions":[]}`))
+	}))
+	defer server.Close()
+	_, err := medicover.NewClient(medicover.Config{APIBaseURL: server.URL, HTTPClient: server.Client()}).Search(context.Background(), "access", medicover.SearchCriteria{})
+	var typed *medicover.Error
+	if !errors.As(err, &typed) || typed.Code != medicover.CodeConflicting {
+		t.Fatalf("error = %v, want conflicting result", err)
+	}
+}
+
 func TestSearchDistinguishesConflictStaleTimeoutAndPartial(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
