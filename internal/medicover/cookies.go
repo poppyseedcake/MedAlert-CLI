@@ -23,6 +23,9 @@ func (s *cookieStore) headerFor(requestURL string) string {
 	}
 	var parts []string
 	for _, stored := range s.cookies {
+		if strings.TrimSpace(stored.Value) == "" {
+			continue
+		}
 		if isExpiredCookie(stored, s.now) {
 			continue
 		}
@@ -53,6 +56,21 @@ func (s *cookieStore) addFromResponse(response *http.Response) {
 }
 
 func (s *cookieStore) upsert(cookie StoredCookie) {
+	// An empty value is a deletion directive (for example
+	// `MFA-Pending=; Max-Age=0`). Remove the stored entry so stale MFA or
+	// trusted-session state is never replayed or persisted. Match by name
+	// alone: a deletion must clear the cookie even when the directive omits
+	// the original domain or path attributes.
+	if strings.TrimSpace(cookie.Value) == "" {
+		kept := s.cookies[:0]
+		for _, existing := range s.cookies {
+			if existing.Name != cookie.Name {
+				kept = append(kept, existing)
+			}
+		}
+		s.cookies = kept
+		return
+	}
 	for index, existing := range s.cookies {
 		if existing.Name == cookie.Name && existing.Domain == cookie.Domain && existing.Path == cookie.Path {
 			s.cookies[index] = cookie
@@ -94,7 +112,7 @@ func parseSetCookie(header string) *StoredCookie {
 	}
 	name := strings.TrimSpace(nameValue[0])
 	value := strings.TrimSpace(nameValue[1])
-	if name == "" || value == "" {
+	if name == "" {
 		return nil
 	}
 	cookie := &StoredCookie{Name: name, Value: value}
