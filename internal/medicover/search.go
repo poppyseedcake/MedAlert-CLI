@@ -54,7 +54,9 @@ func (c *Client) Search(ctx context.Context, accessToken string, criteria Search
 	}
 	page, pages := 1, 1
 	result := SearchResult{Slots: []Slot{}}
-	seen := map[string]bool{}
+	seenBookings := map[string]bool{}
+	fallbackIndexes := map[string]int{}
+	stableBookings := map[string]bool{}
 	for page <= pages {
 		q := cloneValues(query)
 		q.Set("Page", strconv.Itoa(page))
@@ -74,10 +76,28 @@ func (c *Client) Search(ctx context.Context, accessToken string, criteria Search
 			pages = totalPages
 		}
 		for _, item := range items {
-			if !seen[item.StableIdentity] {
+			if item.BookingString != "" {
+				if seenBookings[item.BookingString] {
+					continue
+				}
+				seenBookings[item.BookingString] = true
+				stableBookings[item.StableIdentity] = true
+				if index, ok := fallbackIndexes[item.StableIdentity]; ok {
+					result.Slots[index] = item
+					delete(fallbackIndexes, item.StableIdentity)
+					continue
+				}
 				result.Slots = append(result.Slots, item)
-				seen[item.StableIdentity] = true
+				continue
 			}
+			if stableBookings[item.StableIdentity] {
+				continue
+			}
+			if _, ok := fallbackIndexes[item.StableIdentity]; ok {
+				continue
+			}
+			fallbackIndexes[item.StableIdentity] = len(result.Slots)
+			result.Slots = append(result.Slots, item)
 		}
 		page++
 	}

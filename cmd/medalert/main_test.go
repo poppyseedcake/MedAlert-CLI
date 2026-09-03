@@ -409,6 +409,22 @@ func TestAccountManageMultipleAccountsWithTextAndJSON(t *testing.T) {
 	assertProcessQueryValue(t, databasePath, "SELECT password_ref FROM accounts WHERE id = 'alice'", fileOne)
 }
 
+func TestDryFlagCannotDeleteAnAccount(t *testing.T) {
+	databasePath := filepath.Join(privateTempDir(t), "medalert.db")
+	created := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "alice", "--username", "alice@example.com", "--no-stored-password")
+	if created.exitCode != 0 {
+		t.Fatalf("create = %#v", created)
+	}
+	deleted := run(t, nil, "account", "delete", "--database", databasePath, "--account", "alice", "--dry")
+	if deleted.exitCode != 2 || !strings.Contains(deleted.stderr, "--dry is not supported") {
+		t.Fatalf("delete = %#v", deleted)
+	}
+	shown := run(t, nil, "account", "show", "--database", databasePath, "--account", "alice")
+	if shown.exitCode != 0 {
+		t.Fatalf("account was deleted: %#v", shown)
+	}
+}
+
 func TestAccountRejectsUnsafeSecretFiles(t *testing.T) {
 	root := privateTempDir(t)
 	databasePath := filepath.Join(root, "medalert.db")

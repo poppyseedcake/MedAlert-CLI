@@ -324,6 +324,9 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 // ignored. --database, --output, --non-interactive, --medicover-base-url, and
 // --session-dir remain global.
 func checkCommandFlags(command string, settings options) error {
+	if settings.dry && command != "check" {
+		return fmt.Errorf("--dry is not supported for %s", command)
+	}
 	hasAccountID := settings.accountID != ""
 	hasUsername := settings.username != ""
 	hasPasswordFile := settings.passwordFile != ""

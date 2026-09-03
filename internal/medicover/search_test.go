@@ -25,7 +25,7 @@ func TestSearchUsesV2CriteriaPaginationAndStableFallback(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/slots") {
 			if r.URL.Query().Get("Page") == "1" {
-				_, _ = w.Write([]byte(`{"items":[{"bookingString":"book-1","appointmentDate":"2026-09-10T10:00:00","clinic":{"name":"A"},"doctor":null,"specialty":{"value":"Cardiology"},"visitType":"Center"}],"totalPages":2}`))
+				_, _ = w.Write([]byte(`{"items":[{"bookingString":"book-1","appointmentDate":"2026-09-10T10:00:00","clinic":{"name":"A"},"doctor":null,"specialty":{"value":"Cardiology"},"visitType":"Center"},{"bookingString":"book-2","appointmentDate":"2026-09-10T10:00:00","clinic":{"name":"A"},"doctor":null,"specialty":{"value":"Cardiology"},"visitType":"Center"}],"totalPages":2}`))
 				return
 			}
 			_, _ = w.Write([]byte(`{"items":[{"appointmentDate":"2026-09-10T10:00:00","clinic":{"name":"A"},"doctor":null,"specialty":{"value":"Cardiology"},"visitType":"Center"},{"appointmentDate":"2026-09-11T10:00:00","clinic":null,"doctor":{"name":"Dr B"},"specialty":null,"visitType":"Center"}],"totalPages":2}`))
@@ -43,10 +43,10 @@ func TestSearchUsesV2CriteriaPaginationAndStableFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Slots) != 2 || result.Pages != 2 {
+	if len(result.Slots) != 3 || result.Pages != 2 {
 		t.Fatalf("result=%+v", result)
 	}
-	if result.Slots[0].Identity != "book-1" || result.Slots[0].StableIdentity == "" || result.Slots[1].Identity != result.Slots[1].StableIdentity {
+	if result.Slots[0].Identity != "book-1" || result.Slots[1].Identity != "book-2" || result.Slots[0].StableIdentity != result.Slots[1].StableIdentity || result.Slots[2].Identity != result.Slots[2].StableIdentity {
 		t.Fatalf("identities=%+v", result.Slots)
 	}
 	for _, request := range requests {
