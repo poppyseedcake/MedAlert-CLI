@@ -8,6 +8,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -82,9 +83,15 @@ var (
 // CreateProfile stores a new observation profile. The referenced account must
 // already exist. The profile starts enabled unless Enabled is false.
 func (s *Store) CreateProfile(profile Profile) (Profile, error) {
-	if err := ValidateProfile(profile); err != nil {
+	// Normalize first so direct store callers get the same documented
+	// storage format as the CLI ("205, 204" -> "204,205", "0" -> "Standard").
+	// ValidateProfile only checks normalized copies, so without this the
+	// original unnormalized values would be written.
+	normalized, err := normalizeProfile(profile)
+	if err != nil {
 		return Profile{}, err
 	}
+	profile = normalized
 	if _, err := s.GetAccount(profile.AccountID); err != nil {
 		if errors.Is(err, ErrAccountNotFound) || errors.Is(err, ErrAccountInvalid) {
 			return Profile{}, fmt.Errorf("%w: %s", ErrAccountNotFound, profile.AccountID)
@@ -98,12 +105,7 @@ func (s *Store) CreateProfile(profile Profile) (Profile, error) {
 	if profile.Enabled {
 		enabled = 1
 	}
-	// Default an empty search type to Standard so every row carries an
-	// explicit value for later filter and slot requests.
-	if strings.TrimSpace(profile.SearchType) == "" {
-		profile.SearchType = defaultSearchType
-	}
-	_, err := s.db.Exec(
+	_, err = s.db.Exec(
 		`INSERT INTO profiles (id, account_id, region_ids, specialty_ids, clinic_ids, doctor_ids, language_ids, visit_type, search_type, start_date, end_date, check_interval_minutes, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		profile.ID, profile.AccountID, profile.RegionIDs, profile.SpecialtyIDs, profile.ClinicIDs, profile.DoctorIDs, profile.LanguageIDs, profile.VisitType, profile.SearchType, profile.StartDate, profile.EndDate, profile.CheckIntervalMinutes, enabled, profile.CreatedAt, profile.UpdatedAt,
 	)
@@ -180,92 +182,128 @@ func (s *Store) GetProfile(id string) (Profile, error) {
 // plus updated_at are stored. Untouched criteria and the enabled flag keep
 // their database values, so a concurrent edit of other fields or a
 // concurrent enable/disable is not silently undone.
+//
+// Read, combined-row validation, and write run inside one BEGIN IMMEDIATE
+// transaction. Two concurrent updates therefore serialize: the second one
+// reads the first one's committed row and validates against it, so combined
+// cross-field rules (for example end_date >= start_date) cannot end up
+// violated in the stored row.
 func (s *Store) UpdateProfile(id string, update ProfileUpdate) (Profile, error) {
-	current, err := s.GetProfile(id)
+	if !profileIDPattern.MatchString(id) {
+		return Profile{}, fmt.Errorf("%w: profile id %q", ErrProfileInvalid, id)
+	}
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	var current Profile
+	var enabledFlag int
+	err = conn.QueryRowContext(ctx,
+		`SELECT id, account_id, region_ids, specialty_ids, clinic_ids, doctor_ids, language_ids, visit_type, search_type, start_date, end_date, check_interval_minutes, enabled, created_at, updated_at FROM profiles WHERE id = ?`, id,
+	).Scan(&current.ID, &current.AccountID, &current.RegionIDs, &current.SpecialtyIDs, &current.ClinicIDs, &current.DoctorIDs, &current.LanguageIDs, &current.VisitType, &current.SearchType, &current.StartDate, &current.EndDate, &current.CheckIntervalMinutes, &enabledFlag, &current.CreatedAt, &current.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Profile{}, fmt.Errorf("%w: %s", ErrProfileNotFound, id)
+		}
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	current.Enabled = enabledFlag == 1
+	merged := current
+	if update.RegionIDs != nil {
+		merged.RegionIDs = *update.RegionIDs
+	}
+	if update.SpecialtyIDs != nil {
+		merged.SpecialtyIDs = *update.SpecialtyIDs
+	}
+	if update.ClinicIDs != nil {
+		merged.ClinicIDs = *update.ClinicIDs
+	}
+	if update.DoctorIDs != nil {
+		merged.DoctorIDs = *update.DoctorIDs
+	}
+	if update.LanguageIDs != nil {
+		merged.LanguageIDs = *update.LanguageIDs
+	}
+	if update.VisitType != nil {
+		merged.VisitType = *update.VisitType
+	}
+	if update.SearchType != nil {
+		merged.SearchType = *update.SearchType
+	}
+	if update.StartDate != nil {
+		merged.StartDate = *update.StartDate
+	}
+	if update.EndDate != nil {
+		merged.EndDate = *update.EndDate
+	}
+	if update.CheckIntervalMinutes != nil {
+		merged.CheckIntervalMinutes = *update.CheckIntervalMinutes
+	}
+	// Normalize the merged row so direct store callers cannot persist
+	// unnormalized equivalents ("205, 204" vs "204,205", "0" vs "Standard").
+	normalized, err := normalizeProfile(merged)
 	if err != nil {
 		return Profile{}, err
 	}
-	validated := current
-	if update.RegionIDs != nil {
-		validated.RegionIDs = *update.RegionIDs
-	}
-	if update.SpecialtyIDs != nil {
-		validated.SpecialtyIDs = *update.SpecialtyIDs
-	}
-	if update.ClinicIDs != nil {
-		validated.ClinicIDs = *update.ClinicIDs
-	}
-	if update.DoctorIDs != nil {
-		validated.DoctorIDs = *update.DoctorIDs
-	}
-	if update.LanguageIDs != nil {
-		validated.LanguageIDs = *update.LanguageIDs
-	}
-	if update.VisitType != nil {
-		validated.VisitType = *update.VisitType
-	}
-	if update.SearchType != nil {
-		validated.SearchType = *update.SearchType
-	}
-	if update.StartDate != nil {
-		validated.StartDate = *update.StartDate
-	}
-	if update.EndDate != nil {
-		validated.EndDate = *update.EndDate
-	}
-	if update.CheckIntervalMinutes != nil {
-		validated.CheckIntervalMinutes = *update.CheckIntervalMinutes
-	}
-	if err := ValidateProfile(validated); err != nil {
-		return Profile{}, err
-	}
+	merged = normalized
 	sets := make([]string, 0, 11)
 	args := make([]any, 0, 12)
 	if update.RegionIDs != nil {
 		sets = append(sets, "region_ids = ?")
-		args = append(args, validated.RegionIDs)
+		args = append(args, merged.RegionIDs)
 	}
 	if update.SpecialtyIDs != nil {
 		sets = append(sets, "specialty_ids = ?")
-		args = append(args, validated.SpecialtyIDs)
+		args = append(args, merged.SpecialtyIDs)
 	}
 	if update.ClinicIDs != nil {
 		sets = append(sets, "clinic_ids = ?")
-		args = append(args, validated.ClinicIDs)
+		args = append(args, merged.ClinicIDs)
 	}
 	if update.DoctorIDs != nil {
 		sets = append(sets, "doctor_ids = ?")
-		args = append(args, validated.DoctorIDs)
+		args = append(args, merged.DoctorIDs)
 	}
 	if update.LanguageIDs != nil {
 		sets = append(sets, "language_ids = ?")
-		args = append(args, validated.LanguageIDs)
+		args = append(args, merged.LanguageIDs)
 	}
 	if update.VisitType != nil {
 		sets = append(sets, "visit_type = ?")
-		args = append(args, validated.VisitType)
+		args = append(args, merged.VisitType)
 	}
 	if update.SearchType != nil {
 		sets = append(sets, "search_type = ?")
-		args = append(args, validated.SearchType)
+		args = append(args, merged.SearchType)
 	}
 	if update.StartDate != nil {
 		sets = append(sets, "start_date = ?")
-		args = append(args, validated.StartDate)
+		args = append(args, merged.StartDate)
 	}
 	if update.EndDate != nil {
 		sets = append(sets, "end_date = ?")
-		args = append(args, validated.EndDate)
+		args = append(args, merged.EndDate)
 	}
 	if update.CheckIntervalMinutes != nil {
 		sets = append(sets, "check_interval_minutes = ?")
-		args = append(args, validated.CheckIntervalMinutes)
+		args = append(args, merged.CheckIntervalMinutes)
 	}
 	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	sets = append(sets, "updated_at = ?")
 	args = append(args, updatedAt)
 	args = append(args, id)
-	result, err := s.db.Exec(
+	result, err := conn.ExecContext(ctx,
 		fmt.Sprintf(`UPDATE profiles SET %s WHERE id = ?`, strings.Join(sets, ", ")),
 		args...,
 	)
@@ -279,10 +317,26 @@ func (s *Store) UpdateProfile(id string, update ProfileUpdate) (Profile, error) 
 	if affected == 0 {
 		return Profile{}, fmt.Errorf("%w: %s", ErrProfileNotFound, id)
 	}
-	fresh, err := s.GetProfile(id)
+	// Re-read the stored row inside the same transaction and validate the
+	// final state before committing. This is defense in depth: with
+	// BEGIN IMMEDIATE no other writer could have slipped in, but the check
+	// guarantees we never commit an invalid date range.
+	var fresh Profile
+	var freshEnabled int
+	err = conn.QueryRowContext(ctx,
+		`SELECT id, account_id, region_ids, specialty_ids, clinic_ids, doctor_ids, language_ids, visit_type, search_type, start_date, end_date, check_interval_minutes, enabled, created_at, updated_at FROM profiles WHERE id = ?`, id,
+	).Scan(&fresh.ID, &fresh.AccountID, &fresh.RegionIDs, &fresh.SpecialtyIDs, &fresh.ClinicIDs, &fresh.DoctorIDs, &fresh.LanguageIDs, &fresh.VisitType, &fresh.SearchType, &fresh.StartDate, &fresh.EndDate, &fresh.CheckIntervalMinutes, &freshEnabled, &fresh.CreatedAt, &fresh.UpdatedAt)
 	if err != nil {
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	fresh.Enabled = freshEnabled == 1
+	if err := ValidateProfile(fresh); err != nil {
 		return Profile{}, err
 	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	committed = true
 	return fresh, nil
 }
 
@@ -350,6 +404,44 @@ func (s *Store) DeleteProfile(id string) error {
 		return fmt.Errorf("delete profile: %w", err)
 	}
 	return nil
+}
+
+// normalizeProfile returns the documented storage form of a profile:
+// trimmed identity, sorted deduplicated ID lists, canonical search type,
+// and trimmed dates and visit type. It validates the normalized row.
+func normalizeProfile(profile Profile) (Profile, error) {
+	profile.ID = strings.TrimSpace(profile.ID)
+	profile.AccountID = strings.TrimSpace(profile.AccountID)
+	var err error
+	if profile.RegionIDs, err = NormalizeIDList(profile.RegionIDs); err != nil {
+		return Profile{}, fmt.Errorf("%w: region is required (comma-separated Medicover IDs)", ErrProfileInvalid)
+	}
+	if profile.SpecialtyIDs, err = NormalizeIDList(profile.SpecialtyIDs); err != nil {
+		return Profile{}, fmt.Errorf("%w: specialty is required (comma-separated Medicover IDs)", ErrProfileInvalid)
+	}
+	if profile.ClinicIDs, err = NormalizeIDList(profile.ClinicIDs); err != nil {
+		return Profile{}, fmt.Errorf("%w: clinic IDs must be comma-separated positive integers", ErrProfileInvalid)
+	}
+	if profile.DoctorIDs, err = NormalizeIDList(profile.DoctorIDs); err != nil {
+		return Profile{}, fmt.Errorf("%w: doctor IDs must be comma-separated positive integers", ErrProfileInvalid)
+	}
+	if profile.LanguageIDs, err = NormalizeIDList(profile.LanguageIDs); err != nil {
+		return Profile{}, fmt.Errorf("%w: language IDs must be comma-separated positive integers", ErrProfileInvalid)
+	}
+	if profile.SearchType, err = NormalizeSearchType(profile.SearchType); err != nil {
+		return Profile{}, fmt.Errorf("%w: search type must be Standard or DiagnosticProcedure", ErrProfileInvalid)
+	}
+	profile.VisitType = strings.TrimSpace(profile.VisitType)
+	if profile.StartDate, err = NormalizeDate(profile.StartDate, true); err != nil {
+		return Profile{}, fmt.Errorf("%w: start date must be YYYY-MM-DD", ErrProfileInvalid)
+	}
+	if profile.EndDate, err = NormalizeDate(profile.EndDate, true); err != nil {
+		return Profile{}, fmt.Errorf("%w: end date must be YYYY-MM-DD", ErrProfileInvalid)
+	}
+	if err := ValidateProfile(profile); err != nil {
+		return Profile{}, err
+	}
+	return profile, nil
 }
 
 // ValidateProfile checks identity, account reference, search criteria, date

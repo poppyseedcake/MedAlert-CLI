@@ -395,3 +395,90 @@ func TestConcurrentUpdateAndDisableDoNotLoseState(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateProfileNormalizesStorageFormat(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	created, err := storage.CreateProfile(store.Profile{
+		ID: "norm", AccountID: "alice",
+		RegionIDs: "205, 204,204", SpecialtyIDs: "132",
+		SearchType: "0", CheckIntervalMinutes: 30, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if created.RegionIDs != "204,205" {
+		t.Fatalf("region stored as %q, want normalized 204,205", created.RegionIDs)
+	}
+	if created.SearchType != store.SearchTypeStandard {
+		t.Fatalf("search type stored as %q, want Standard", created.SearchType)
+	}
+	shown, err := storage.GetProfile("norm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shown.RegionIDs != "204,205" || shown.SearchType != store.SearchTypeStandard {
+		t.Fatalf("stored row not normalized: %#v", shown)
+	}
+}
+
+func TestUpdateProfileNormalizesStorageFormat(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateProfile(validProfile("norm-edit", "alice")); err != nil {
+		t.Fatal(err)
+	}
+	rawRegion := "205, 204"
+	rawSearch := "0"
+	updated, err := storage.UpdateProfile("norm-edit", store.ProfileUpdate{RegionIDs: &rawRegion, SearchType: &rawSearch})
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if updated.RegionIDs != "204,205" || updated.SearchType != store.SearchTypeStandard {
+		t.Fatalf("updated not normalized: %#v", updated)
+	}
+}
+
+func TestConcurrentDateRangeUpdatesKeepValidRow(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	profile := validProfile("dates", "alice")
+	profile.StartDate = "2026-09-01"
+	profile.EndDate = "2026-09-30"
+	if _, err := storage.CreateProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	// Repeat the race so a missing transaction would very likely commit
+	// an invalid combination at least once. With BEGIN IMMEDIATE the loser
+	// validates against the winner's committed row and fails instead of
+	// committing an invalid combination, so every iteration stays valid.
+	for range 30 {
+		resetStart := "2026-09-01"
+		resetEnd := "2026-09-30"
+		if _, err := storage.UpdateProfile("dates", store.ProfileUpdate{StartDate: &resetStart, EndDate: &resetEnd}); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		go func() {
+			<-start
+			late := "2026-09-20"
+			_, err := storage.UpdateProfile("dates", store.ProfileUpdate{StartDate: &late})
+			results <- err
+		}()
+		go func() {
+			<-start
+			early := "2026-09-10"
+			_, err := storage.UpdateProfile("dates", store.ProfileUpdate{EndDate: &early})
+			results <- err
+		}()
+		close(start)
+		for range 2 {
+			<-results
+		}
+		final, err := storage.GetProfile("dates")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ValidateProfile(final); err != nil {
+			t.Fatalf("final row invalid after concurrent date edits: %#v: %v", final, err)
+		}
+	}
+}
