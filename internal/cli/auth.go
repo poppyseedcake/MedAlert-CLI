@@ -45,6 +45,7 @@ func medicoverClientFor(settings options) *medicover.Client {
 		// The registered callback must live on the same server, otherwise
 		// exact callback matching rejects the fake code redirect.
 		cfg.RedirectURI = strings.TrimSuffix(baseURL, "/") + "/signin-oidc"
+		cfg.APIBaseURL = baseURL
 	}
 	return medicover.NewClient(cfg)
 }
@@ -322,6 +323,9 @@ func reportMedicoverError(stderr io.Writer, command string, err error, jsonOutpu
 		case medicover.CodeProtocolChanged:
 			writeError(stderr, command, "protocol_changed", medicoverErr.Message, jsonOutput)
 			return 5
+		case medicover.CodeCancelled, medicover.CodePartial, medicover.CodeConflicting, medicover.CodeStale:
+			writeError(stderr, command, medicoverErr.Code, medicoverErr.Message, jsonOutput)
+			return 6
 		}
 	}
 	if errors.Is(err, secrets.ErrMissingInput) {

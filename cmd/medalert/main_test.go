@@ -409,6 +409,38 @@ func TestAccountManageMultipleAccountsWithTextAndJSON(t *testing.T) {
 	assertProcessQueryValue(t, databasePath, "SELECT password_ref FROM accounts WHERE id = 'alice'", fileOne)
 }
 
+func TestDryFlagCannotDeleteAnAccount(t *testing.T) {
+	databasePath := filepath.Join(privateTempDir(t), "medalert.db")
+	created := run(t, nil, "account", "create", "--database", databasePath, "--non-interactive", "--account", "alice", "--username", "alice@example.com", "--no-stored-password")
+	if created.exitCode != 0 {
+		t.Fatalf("create = %#v", created)
+	}
+	deleted := run(t, nil, "account", "delete", "--database", databasePath, "--account", "alice", "--dry")
+	if deleted.exitCode != 2 || !strings.Contains(deleted.stderr, "--dry is not supported") {
+		t.Fatalf("delete = %#v", deleted)
+	}
+	shown := run(t, nil, "account", "show", "--database", databasePath, "--account", "alice")
+	if shown.exitCode != 0 {
+		t.Fatalf("account was deleted: %#v", shown)
+	}
+}
+
+func TestCheckRejectsUnusedFlags(t *testing.T) {
+	databasePath := filepath.Join(privateTempDir(t), "missing.db")
+	for _, flag := range [][]string{
+		{"--region", "999"}, {"--clinic", "10"}, {"--start-date", "2026-09-01"},
+		{"--check-interval", "5"}, {"--account", "alice"}, {"--password-file", "/unused"},
+		{"--disabled"}, {"--clear-doctor"},
+	} {
+		arguments := []string{"check", "--dry", "--profile", "cardio", "--database", databasePath}
+		arguments = append(arguments, flag...)
+		result := run(t, nil, arguments...)
+		if result.exitCode != 2 || !strings.Contains(result.stderr, "is not supported for check") {
+			t.Fatalf("flag %v = %#v", flag, result)
+		}
+	}
+}
+
 func TestAccountRejectsUnsafeSecretFiles(t *testing.T) {
 	root := privateTempDir(t)
 	databasePath := filepath.Join(root, "medalert.db")
