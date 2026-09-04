@@ -6,7 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/poppyseedcake/MedAlert/internal/medicover"
+	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/zalando/go-keyring"
 )
@@ -88,6 +91,98 @@ func TestHistoryRunsEmptyAndJSONEnvelope(t *testing.T) {
 	}
 }
 
+func TestHistoryRunsStatusFilterAppliesBeforeLimit(t *testing.T) {
+	database, getenv := setupHistoryFixture(t)
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	oldRun, err := storage.BeginObservationRun("prof", now)
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.FailObservationRun(oldRun.ID, store.ObservationRunFailed, "temporary_failure", "old failure", now); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	newRun, err := storage.BeginObservationRun("prof", now.Add(time.Minute))
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.ReconcileObservationRun(newRun.ID, nil, now.Add(time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	storage.Close()
+
+	code, stdout, stderr := runCLI(t, getenv, "history", "runs", "--database", database, "--status", "failed", "--limit", "1", "--output", "json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("history runs: code=%d stderr=%q stdout=%q", code, stderr, stdout)
+	}
+	data := decodeEnvelope(t, stdout, "history runs")
+	runs, ok := data["runs"].([]any)
+	if !ok || len(runs) != 1 {
+		t.Fatalf("runs = %#v, want one failed run", data["runs"])
+	}
+	if run, ok := runs[0].(map[string]any); !ok || run["id"] != oldRun.ID || run["status"] != store.ObservationRunFailed {
+		t.Fatalf("run = %#v, want old failed run %s", runs[0], oldRun.ID)
+	}
+}
+
+func TestHistoryEpisodesEndedFilterAppliesBeforeLimit(t *testing.T) {
+	database, getenv := setupHistoryFixture(t)
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	firstRun, err := storage.BeginObservationRun("prof", now)
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	first, err := storage.ReconcileObservationRun(firstRun.ID, []store.ObservationSlot{{Identity: "old-slot", StableIdentity: "old-stable", BookingString: "old-booking", Time: "2099-01-10T10:00:00Z"}}, now)
+	if err != nil || len(first.NewEpisodes) != 1 {
+		storage.Close()
+		t.Fatalf("first reconciliation = %#v, err=%v", first, err)
+	}
+	endRun, err := storage.BeginObservationRun("prof", now.Add(time.Minute))
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.ReconcileObservationRun(endRun.ID, nil, now.Add(time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	activeRun, err := storage.BeginObservationRun("prof", now.Add(2*time.Minute))
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.ReconcileObservationRun(activeRun.ID, []store.ObservationSlot{{Identity: "new-slot", StableIdentity: "new-stable", BookingString: "new-booking", Time: "2099-01-10T10:00:00Z"}}, now.Add(2*time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	storage.Close()
+
+	code, stdout, stderr := runCLI(t, getenv, "history", "episodes", "--database", database, "--status", "ended", "--limit", "1", "--output", "json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("history episodes: code=%d stderr=%q stdout=%q", code, stderr, stdout)
+	}
+	data := decodeEnvelope(t, stdout, "history episodes")
+	episodes, ok := data["episodes"].([]any)
+	if !ok || len(episodes) != 1 {
+		t.Fatalf("episodes = %#v, want one ended episode", data["episodes"])
+	}
+	if episode, ok := episodes[0].(map[string]any); !ok || episode["active"] != false || episode["id"] != first.NewEpisodes[0].ID {
+		t.Fatalf("episode = %#v, want ended episode %s", episodes[0], first.NewEpisodes[0].ID)
+	}
+}
+
 func TestHistoryStatusIdentifiesAuthAndDisabled(t *testing.T) {
 	database, getenv := setupHistoryFixture(t)
 	// Disable the profile and destination so status must list them.
@@ -128,6 +223,47 @@ func TestHistoryStatusIdentifiesAuthAndDisabled(t *testing.T) {
 	if code != 0 || !strings.Contains(stdout, "authentication_required") || !strings.Contains(stdout, "profile_disabled") {
 		t.Fatalf("status text: code=%d stdout=%q", code, stdout)
 	}
+}
+
+type historyStatusSessionStore struct {
+	state *medicover.SessionState
+}
+
+func (s historyStatusSessionStore) Load(string) (*medicover.SessionState, error) {
+	if s.state == nil {
+		return nil, session.ErrNotFound
+	}
+	return s.state, nil
+}
+
+func (historyStatusSessionStore) Save(string, *medicover.SessionState) error { return nil }
+
+func (historyStatusSessionStore) Delete(string) error { return nil }
+
+func TestHistoryStatusFlagsExpiredSession(t *testing.T) {
+	database, _ := setupHistoryFixture(t)
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	backend := historyStatusSessionStore{state: &medicover.SessionState{
+		DeviceID: "device",
+		Cookies:  []medicover.StoredCookie{{Name: "MedicoverTrusted", Value: "expired", Expires: "2000-01-01T00:00:00Z"}},
+	}}
+	data, err := collectHistoryStatus(storage, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Accounts) != 1 || data.Accounts[0].Authenticated || !data.Accounts[0].AuthRequired {
+		t.Fatalf("account status = %#v, want authentication required", data.Accounts)
+	}
+	for _, action := range data.RequiredActions {
+		if action.Code == "authentication_required" && action.ID == "alice" {
+			return
+		}
+	}
+	t.Fatalf("required actions = %#v, want authentication_required", data.RequiredActions)
 }
 
 func TestHistoryRetentionShowSetAndPrune(t *testing.T) {

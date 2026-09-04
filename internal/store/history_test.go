@@ -180,3 +180,171 @@ func TestListRecentQueriesRespectLimits(t *testing.T) {
 		t.Fatal("deliveries is nil, want empty slice")
 	}
 }
+
+func TestListRecentDeliveriesReturnsNewestRows(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateProfile(validProfile("recent-deliveries", "alice")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(store.Destination{ID: "recent-dest", Name: "Recent", ChatID: "123", TokenSource: store.TokenSourcePrompt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("recent-deliveries", []string{"recent-dest"}); err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	for index, at := range []time.Time{base, base.Add(time.Minute), base.Add(2 * time.Minute)} {
+		run, err := storage.BeginObservationRun("recent-deliveries", at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reconciliation, err := storage.ReconcileObservationRun(run.ID, []store.ObservationSlot{
+			observationSlot("recent-slot-"+string(rune('a'+index)), "recent-stable-"+string(rune('a'+index)), "recent-booking", "2099-01-10T10:00:00Z"),
+		}, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(reconciliation.NewEpisodes) != 1 {
+			t.Fatalf("new episodes = %#v, want one", reconciliation)
+		}
+		if _, err := storage.EnsureEpisodeDeliveries("recent-deliveries", reconciliation.NewEpisodes[0].ID, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deliveries, err := storage.ListRecentDeliveries("", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 2 {
+		t.Fatalf("deliveries = %#v, want two", deliveries)
+	}
+	if deliveries[0].CreatedAt != base.Add(2*time.Minute).Format(time.RFC3339Nano) || deliveries[1].CreatedAt != base.Add(time.Minute).Format(time.RFC3339Nano) {
+		t.Fatalf("deliveries = %#v, want newest first", deliveries)
+	}
+}
+
+func TestListRecentIncidentDeliveriesReturnsNewestRows(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateDestination(store.Destination{ID: "incident-recent-dest", Name: "Recent", ChatID: "123", TokenSource: store.TokenSourcePrompt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	for index, at := range []time.Time{base, base.Add(time.Minute), base.Add(2 * time.Minute)} {
+		if _, created, newly, err := storage.RecordIncidentFailure(store.IncidentScopeAccount, "incident-recent-"+string(rune('a'+index)), "", "", "", "authentication_required", "login required", at, []string{"incident-recent-dest"}); err != nil {
+			t.Fatal(err)
+		} else if !newly || len(created) != 1 {
+			t.Fatalf("created = %#v, newly = %v, want one new delivery", created, newly)
+		}
+	}
+
+	deliveries, err := storage.ListRecentIncidentDeliveries("", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("deliveries = %#v, want one", deliveries)
+	}
+	if deliveries[0].CreatedAt != base.Add(2*time.Minute).Format(time.RFC3339Nano) {
+		t.Fatalf("delivery = %#v, want newest first", deliveries[0])
+	}
+}
+
+func TestPruneHistoryKeepsPendingIncidentChildren(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateDestination(store.Destination{ID: "prune-incident-dest", Name: "Prune", ChatID: "123", TokenSource: store.TokenSourcePrompt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	old := now.AddDate(0, 0, -100)
+	incident, created, newly, err := storage.RecordIncidentFailure(store.IncidentScopeAccount, "prune-account", "", "", "", "authentication_required", "login required", old, []string{"prune-incident-dest"})
+	if err != nil || !newly || len(created) != 1 {
+		t.Fatalf("record = %#v, %v, newly=%v, created=%d", incident, err, newly, len(created))
+	}
+	claimed, err := storage.BeginIncidentDeliveryAttempt(created[0].ID, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: 1}, old.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	_, recoveries, cancelled, err := storage.ResolveIncident(store.IncidentScopeAccount, "prune-account", "", "", old.Add(2*time.Minute))
+	if err != nil || len(recoveries) != 1 || len(cancelled) != 0 {
+		t.Fatalf("resolve recoveries=%d cancelled=%d err=%v, want one pending recovery", len(recoveries), len(cancelled), err)
+	}
+	if _, err := storage.SetHistoryRetentionDays(1); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := storage.PruneHistory(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OperationalIncidents != 0 {
+		t.Fatalf("prune removed incident with pending recovery: %#v", result)
+	}
+	deliveries, err := storage.ListIncidentDeliveries(incident.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || deliveries[0].Kind != store.IncidentDeliveryRecovery || deliveries[0].Status != store.DeliveryPending {
+		t.Fatalf("incident deliveries after prune = %#v, want pending recovery", deliveries)
+	}
+}
+
+func TestPruneHistoryKeepsPendingEpisodeChildren(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateProfile(validProfile("prune-episode", "alice")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(store.Destination{ID: "prune-episode-dest", Name: "Prune", ChatID: "123", TokenSource: store.TokenSourcePrompt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("prune-episode", []string{"prune-episode-dest"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	old := now.AddDate(0, 0, -100)
+	firstRun, err := storage.BeginObservationRun("prune-episode", old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := storage.ReconcileObservationRun(firstRun.ID, []store.ObservationSlot{observationSlot("prune-slot", "prune-stable", "prune-booking", "2099-01-10T10:00:00Z")}, old)
+	if err != nil || len(first.NewEpisodes) != 1 {
+		t.Fatalf("first reconciliation = %#v, err=%v", first, err)
+	}
+	if _, err := storage.EnsureEpisodeDeliveries("prune-episode", first.NewEpisodes[0].ID, old); err != nil {
+		t.Fatal(err)
+	}
+	endRun, err := storage.BeginObservationRun("prune-episode", old.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended, err := storage.ReconcileObservationRun(endRun.ID, nil, old.Add(time.Minute))
+	if err != nil || len(ended.EndedEpisodes) != 1 {
+		t.Fatalf("ending reconciliation = %#v, err=%v", ended, err)
+	}
+	if _, err := storage.SetHistoryRetentionDays(1); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := storage.PruneHistory(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AvailabilityEpisodes != 0 {
+		t.Fatalf("prune removed episode with pending delivery: %#v", result)
+	}
+	episodes, err := storage.ListAvailabilityEpisodes("prune-episode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := storage.ListRecentDeliveries("prune-episode", store.DeliveryPending, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(episodes) != 1 || episodes[0].Active || len(deliveries) != 1 {
+		t.Fatalf("after prune episodes=%#v deliveries=%#v, want ended episode and pending delivery", episodes, deliveries)
+	}
+}

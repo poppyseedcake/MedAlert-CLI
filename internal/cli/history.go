@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/poppyseedcake/MedAlert/internal/medicover"
 	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 )
@@ -74,7 +75,11 @@ func historyRuns(command string, settings options, stdout, stderr io.Writer, jso
 			return reportHistoryError(stderr, command, err, jsonOutput)
 		}
 	} else {
-		runs, err = storage.ListRecentObservationRuns(limit)
+		if statusFilter != "" {
+			runs, err = storage.ListRecentObservationRunsByStatus(statusFilter, limit)
+		} else {
+			runs, err = storage.ListRecentObservationRuns(limit)
+		}
 		if err != nil {
 			return reportHistoryError(stderr, command, err, jsonOutput)
 		}
@@ -133,19 +138,16 @@ func historyEpisodes(command string, settings options, stdout, stderr io.Writer,
 		}
 	}
 	activeOnly := statusFilter == "active"
-	episodes, err := storage.ListRecentEpisodes(profileFilter, activeOnly, limit)
+	var episodes []store.AvailabilityEpisode
+	if statusFilter == "ended" {
+		episodes, err = storage.ListRecentEpisodesByStatus(profileFilter, "ended", limit)
+	} else {
+		episodes, err = storage.ListRecentEpisodes(profileFilter, activeOnly, limit)
+	}
 	if err != nil {
 		return reportHistoryError(stderr, command, err, jsonOutput)
 	}
 	filtered := episodes
-	if statusFilter == "ended" {
-		filtered = []store.AvailabilityEpisode{}
-		for _, episode := range episodes {
-			if !episode.Active {
-				filtered = append(filtered, episode)
-			}
-		}
-	}
 	if jsonOutput {
 		writeResult(stdout, command, map[string]any{"episodes": filtered})
 		return 0
@@ -291,13 +293,13 @@ func historyIncidentDeliveries(command string, settings options, stdout, stderr 
 // doctor diagnostics. Text may change; these fields and meanings do not.
 type historyStatusData struct {
 	Accounts             []historyAccountStatus `json:"accounts"`
-	DisabledProfiles     []historyProfileRef   `json:"disabled_profiles"`
-	DisabledDestinations []historyDestRef      `json:"disabled_destinations"`
-	ActiveIncidents      []store.Incident      `json:"active_incidents"`
-	PermanentFailures    []store.Delivery      `json:"permanent_failures"`
-	RequiredActions      []historyAction       `json:"required_actions"`
-	RetentionDays        int                   `json:"retention_days"`
-	Summary              map[string]int        `json:"summary"`
+	DisabledProfiles     []historyProfileRef    `json:"disabled_profiles"`
+	DisabledDestinations []historyDestRef       `json:"disabled_destinations"`
+	ActiveIncidents      []store.Incident       `json:"active_incidents"`
+	PermanentFailures    []store.Delivery       `json:"permanent_failures"`
+	RequiredActions      []historyAction        `json:"required_actions"`
+	RetentionDays        int                    `json:"retention_days"`
+	Summary              map[string]int         `json:"summary"`
 }
 
 type historyAccountStatus struct {
@@ -416,7 +418,7 @@ func collectHistoryStatus(storage *store.Store, backend session.Store) (historyS
 	for _, account := range accounts {
 		authenticated := true
 		authRequired := false
-		if _, loadErr := backend.Load(account.ID); loadErr != nil {
+		if state, loadErr := backend.Load(account.ID); loadErr != nil {
 			if errors.Is(loadErr, session.ErrNotFound) || errors.Is(loadErr, session.ErrCorrupt) {
 				authenticated = false
 				authRequired = true
@@ -427,6 +429,9 @@ func collectHistoryStatus(storage *store.Store, backend session.Store) (historyS
 				// known state unknown without marking auth required.
 				authenticated = false
 			}
+		} else if !medicover.HasUsableSessionCookies(state, time.Now().UTC()) {
+			authenticated = false
+			authRequired = true
 		}
 		data.Accounts = append(data.Accounts, historyAccountStatus{ID: account.ID, Username: account.Username, Authenticated: authenticated, AuthRequired: authRequired})
 		if authRequired {
@@ -483,14 +488,14 @@ func collectHistoryStatus(storage *store.Store, backend session.Store) (historyS
 	}
 	data.RetentionDays = retention
 	data.Summary = map[string]int{
-		"accounts":             len(accounts),
-		"profiles":             len(profiles),
-		"disabled_profiles":    len(data.DisabledProfiles),
-		"destinations":         len(destinations),
+		"accounts":              len(accounts),
+		"profiles":              len(profiles),
+		"disabled_profiles":     len(data.DisabledProfiles),
+		"destinations":          len(destinations),
 		"disabled_destinations": len(data.DisabledDestinations),
-		"active_incidents":     len(data.ActiveIncidents),
-		"permanent_failures":   len(data.PermanentFailures),
-		"required_actions":     len(data.RequiredActions),
+		"active_incidents":      len(data.ActiveIncidents),
+		"permanent_failures":    len(data.PermanentFailures),
+		"required_actions":      len(data.RequiredActions),
 	}
 	return data, nil
 }
@@ -903,13 +908,13 @@ func runDoctor(command string, settings options, stdout, stderr io.Writer) int {
 	}
 	if jsonOutput {
 		writeResult(stdout, command, map[string]any{
-			"exists":               status.Exists,
-			"schema_version":       status.SchemaVersion,
+			"exists":                  status.Exists,
+			"schema_version":          status.SchemaVersion,
 			"required_schema_version": status.RequiredVersion,
-			"migration_required":   status.MigrationRequired,
-			"retention_days":       diagnostics.RetentionDays,
-			"summary":              diagnostics.Summary,
-			"required_actions":     diagnostics.RequiredActions,
+			"migration_required":      status.MigrationRequired,
+			"retention_days":          diagnostics.RetentionDays,
+			"summary":                 diagnostics.Summary,
+			"required_actions":        diagnostics.RequiredActions,
 		})
 		return 0
 	}

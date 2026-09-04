@@ -168,6 +168,23 @@ func (s *cookieStore) persist() []StoredCookie {
 	return kept
 }
 
+// HasUsableSessionCookies reports whether a saved session contains at least
+// one non-empty cookie that has not expired. This is the same basic cookie
+// check used before a saved session is sent for trusted-session reuse; a
+// structurally valid session without such a cookie still requires login.
+func HasUsableSessionCookies(state *SessionState, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	for _, cookie := range state.Cookies {
+		if strings.TrimSpace(cookie.Name) == "" || strings.TrimSpace(cookie.Value) == "" || isExpiredCookie(cookie, now) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func parseSetCookie(header string) *StoredCookie {
 	segments := strings.Split(header, ";")
 	if len(segments) == 0 {

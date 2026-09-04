@@ -117,7 +117,7 @@ func (s *Store) PruneHistory(now time.Time) (PruneResult, error) {
 	} else {
 		result.OperationalDeliveries = count
 	}
-	if count, err := pruneQuery(s.db, `DELETE FROM operational_incidents WHERE status = ? AND ended_at != '' AND ended_at < ?`, IncidentStatusResolved, cutoff); err != nil {
+	if count, err := pruneQuery(s.db, `DELETE FROM operational_incidents WHERE status = ? AND ended_at != '' AND ended_at < ? AND NOT EXISTS (SELECT 1 FROM operational_deliveries WHERE operational_deliveries.incident_id = operational_incidents.id AND operational_deliveries.status IN ('pending', 'retry'))`, IncidentStatusResolved, cutoff); err != nil {
 		return PruneResult{}, err
 	} else {
 		result.OperationalIncidents = count
@@ -130,7 +130,7 @@ func (s *Store) PruneHistory(now time.Time) (PruneResult, error) {
 	} else {
 		result.TelegramDeliveries = count
 	}
-	if count, err := pruneQuery(s.db, `DELETE FROM availability_episodes WHERE active = 0 AND ended_at != '' AND ended_at < ?`, cutoff); err != nil {
+	if count, err := pruneQuery(s.db, `DELETE FROM availability_episodes WHERE active = 0 AND ended_at != '' AND ended_at < ? AND NOT EXISTS (SELECT 1 FROM telegram_deliveries WHERE telegram_deliveries.episode_id = availability_episodes.id AND telegram_deliveries.status IN ('pending', 'retry'))`, cutoff); err != nil {
 		return PruneResult{}, err
 	} else {
 		result.AvailabilityEpisodes = count
@@ -161,13 +161,35 @@ func pruneQuery(database *sql.DB, query string, args ...any) (int, error) {
 // ListRecentObservationRuns returns observation runs across all profiles from
 // newest to oldest, up to limit (0 means a sane default cap).
 func (s *Store) ListRecentObservationRuns(limit int) ([]ObservationRun, error) {
+	return s.listRecentObservationRuns("", limit)
+}
+
+// ListRecentObservationRunsByStatus returns observation runs across all
+// profiles with the requested status, from newest to oldest, up to limit.
+func (s *Store) ListRecentObservationRunsByStatus(status string, limit int) ([]ObservationRun, error) {
+	status = strings.TrimSpace(status)
+	if !validObservationRunStatus(status) {
+		return nil, fmt.Errorf("%w: status %q", ErrObservationRunInvalid, status)
+	}
+	return s.listRecentObservationRuns(status, limit)
+}
+
+func (s *Store) listRecentObservationRuns(status string, limit int) ([]ObservationRun, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	if limit > 1000 {
 		limit = 1000
 	}
-	rows, err := s.db.Query(`SELECT id, profile_id, profile_updated_at, status, started_at, completed_at, slot_count, error_code, error_message FROM observation_runs ORDER BY started_at DESC, id DESC LIMIT ?`, limit)
+	query := `SELECT id, profile_id, profile_updated_at, status, started_at, completed_at, slot_count, error_code, error_message FROM observation_runs WHERE 1 = 1`
+	args := []any{}
+	if status != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY started_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		if isNoSuchTable(err) {
 			return []ObservationRun{}, nil
@@ -193,6 +215,28 @@ func (s *Store) ListRecentObservationRuns(limit int) ([]ObservationRun, error) {
 // An empty profileID returns episodes for all profiles. activeOnly keeps only
 // active episodes. limit 0 means a sane default cap.
 func (s *Store) ListRecentEpisodes(profileID string, activeOnly bool, limit int) ([]AvailabilityEpisode, error) {
+	status := ""
+	if activeOnly {
+		status = "active"
+	}
+	return s.listRecentEpisodes(profileID, status, limit)
+}
+
+// ListRecentEpisodesByStatus returns availability episodes with the requested
+// status from newest to oldest. An empty profileID returns episodes for all
+// profiles. Status must be active, ended, or all.
+func (s *Store) ListRecentEpisodesByStatus(profileID, status string, limit int) ([]AvailabilityEpisode, error) {
+	status = strings.TrimSpace(status)
+	if status == "all" {
+		status = ""
+	}
+	if status != "" && status != "active" && status != "ended" {
+		return nil, fmt.Errorf("%w: episode status %q", ErrObservationRunInvalid, status)
+	}
+	return s.listRecentEpisodes(profileID, status, limit)
+}
+
+func (s *Store) listRecentEpisodes(profileID, status string, limit int) ([]AvailabilityEpisode, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -208,8 +252,10 @@ func (s *Store) ListRecentEpisodes(profileID string, activeOnly bool, limit int)
 		query += ` AND profile_id = ?`
 		args = append(args, trimmed)
 	}
-	if activeOnly {
+	if status == "active" {
 		query += ` AND active = 1`
+	} else if status == "ended" {
+		query += ` AND active = 0`
 	}
 	query += ` ORDER BY started_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)
@@ -235,8 +281,8 @@ func (s *Store) ListRecentEpisodes(profileID string, activeOnly bool, limit int)
 	return result, nil
 }
 
-// ListRecentDeliveries returns Telegram availability deliveries from oldest to
-// newest (creation order). An empty profileID returns deliveries for all
+// ListRecentDeliveries returns Telegram availability deliveries from newest to
+// oldest (creation order). An empty profileID returns deliveries for all
 // profiles. An empty status returns all statuses. limit 0 means a sane
 // default cap.
 func (s *Store) ListRecentDeliveries(profileID, status string, limit int) ([]Delivery, error) {
@@ -264,7 +310,7 @@ func (s *Store) ListRecentDeliveries(profileID, status string, limit int) ([]Del
 		query += ` AND status = ?`
 		args = append(args, trimmed)
 	}
-	query += ` ORDER BY created_at, id LIMIT ?`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -289,8 +335,8 @@ func (s *Store) ListRecentDeliveries(profileID, status string, limit int) ([]Del
 }
 
 // ListRecentIncidentDeliveries returns operational deliveries for one incident
-// (empty incidentID returns recent deliveries across incidents) ordered by
-// creation. limit 0 means a sane default cap.
+// (empty incidentID returns recent deliveries across incidents) ordered from
+// newest to oldest by creation. limit 0 means a sane default cap.
 func (s *Store) ListRecentIncidentDeliveries(incidentID string, limit int) ([]IncidentDelivery, error) {
 	if limit <= 0 {
 		limit = 100
@@ -304,7 +350,7 @@ func (s *Store) ListRecentIncidentDeliveries(incidentID string, limit int) ([]In
 		query += ` AND incident_id = ?`
 		args = append(args, trimmed)
 	}
-	query += ` ORDER BY created_at, id LIMIT ?`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
