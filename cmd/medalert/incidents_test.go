@@ -397,3 +397,110 @@ func TestIncidentProfileIsolationInWatch(t *testing.T) {
 		t.Fatalf("good runs = %s, want 1 complete", got)
 	}
 }
+
+func TestIncidentRetrySentWithoutProfileRun(t *testing.T) {
+	medicoverFake, medicoverCleanup := newIncidentMedicoverFake(t)
+	defer medicoverCleanup()
+	telegramFake := newIncidentTelegramFake()
+	telegramFake.setGlobal("temporary")
+	telegramServer := httptest.NewServer(telegramFake.handler())
+	defer telegramServer.Close()
+
+	root := t.TempDir()
+	database, environment, secretDir := createIncidentFixture(t, medicoverFake.baseURL, telegramServer.URL, root, 1)
+	singleToken := writeProcessSecretFile(t, secretDir, "single-token", "TOKEN-RETRY-UNIQUE")
+	if created := run(t, environment, "telegram", "create", "--telegram", "single", "--name", "Solo", "--chat-id", "999999", "--token-file", singleToken, "--non-interactive"); created.exitCode != 0 {
+		t.Fatalf("create single = %#v", created)
+	}
+	if created := run(t, environment, "profile", "create", "--profile", "solo", "--account", "alice", "--region", "204", "--specialty", "132", "--check-interval-minutes", "30", "--telegram", "single", "--non-interactive"); created.exitCode != 0 {
+		t.Fatalf("create solo = %#v", created)
+	}
+
+	// Protocol failure is immediately notifiable, but every Telegram send
+	// fails temporarily, leaving a retry delivery that is due immediately.
+	medicoverFake.setMode("protocol")
+	failed := run(t, environment, "check", "--profile", "solo", "--output", "json", "--non-interactive")
+	if failed.exitCode != 5 {
+		t.Fatalf("protocol check = %#v, want exit 5", failed)
+	}
+	if got := incidentQuery(t, database, "SELECT status FROM operational_deliveries WHERE kind = 'failure' LIMIT 1"); got != "retry" {
+		t.Fatalf("failure delivery = %s, want retry", got)
+	}
+	if got := telegramFake.requestCount(); got != 1 {
+		t.Fatalf("telegram after failed check = %d, want 1", got)
+	}
+
+	// The profile just ran inside its 30-minute interval, so no observation
+	// is due. The retry must still go out on the next watch iteration
+	// without waiting for another profile check.
+	telegramFake.setGlobal("success")
+	watched := run(t, environment, "watch", "--once", "--poll-interval", "100ms", "--output", "json", "--non-interactive")
+	if watched.exitCode != 0 {
+		t.Fatalf("watch --once = %#v", watched)
+	}
+	if got := telegramFake.requestCount(); got != 2 {
+		t.Fatalf("telegram after watch = %d, want 2 (retry sent without a profile run)", got)
+	}
+	if got := incidentQuery(t, database, "SELECT status FROM operational_deliveries WHERE kind = 'failure' LIMIT 1"); got != "delivered" {
+		t.Fatalf("failure delivery after retry = %s, want delivered", got)
+	}
+	if got := incidentQuery(t, database, "SELECT count(*) FROM observation_runs WHERE profile_id = 'solo'"); got != "1" {
+		t.Fatalf("observation runs = %s, want 1 (no new run scheduled the retry)", got)
+	}
+}
+
+func TestIncidentSearchAuthCreatesOnlyAccountIncident(t *testing.T) {
+	medicoverFake, medicoverCleanup := newIncidentMedicoverFake(t)
+	defer medicoverCleanup()
+	medicoverFake.setSlots(incidentSlot("booking-search-auth"))
+	telegramFake := newIncidentTelegramFake()
+	telegramServer := httptest.NewServer(telegramFake.handler())
+	defer telegramServer.Close()
+
+	root := t.TempDir()
+	database, environment, secretDir := createIncidentFixture(t, medicoverFake.baseURL, telegramServer.URL, root, 1)
+	createIncidentDestinations(t, environment, secretDir)
+	createIncidentProfile(t, environment, "searchauth", "alice", "204", "phone")
+
+	// Login succeeds but the search endpoint rejects the token: one
+	// account-level problem, not one problem per profile.
+	medicoverFake.setMode("auth")
+	failed := run(t, environment, "check", "--profile", "searchauth", "--output", "json", "--non-interactive")
+	if failed.exitCode != 3 || !strings.Contains(failed.stderr, "authentication_required") {
+		t.Fatalf("search-auth check = %#v, want exit 3 authentication_required", failed)
+	}
+	if got := incidentQuery(t, database, "SELECT count(*) FROM operational_incidents WHERE scope_type = 'account' AND scope_id = 'alice' AND status = 'active'"); got != "1" {
+		t.Fatalf("account incidents = %s, want 1", got)
+	}
+	if got := incidentQuery(t, database, "SELECT count(*) FROM operational_incidents WHERE scope_type = 'profile' AND scope_id = 'searchauth'"); got != "0" {
+		t.Fatalf("profile incidents = %s, want 0 (no duplicate alert)", got)
+	}
+	if got := incidentQuery(t, database, "SELECT count(*) FROM operational_deliveries WHERE kind = 'failure'"); got != "1" {
+		t.Fatalf("failure deliveries = %s, want 1 (not duplicated)", got)
+	}
+	if got := telegramFake.requestCount(); got != 1 {
+		t.Fatalf("telegram after search-auth failure = %d, want 1", got)
+	}
+
+	// A repeated failure updates the same account incident without noise.
+	again := run(t, environment, "check", "--profile", "searchauth", "--output", "json", "--non-interactive")
+	if again.exitCode != 3 {
+		t.Fatalf("second search-auth check = %#v", again)
+	}
+	if got := telegramFake.requestCount(); got != 1 {
+		t.Fatalf("telegram after repeat = %d, want still 1", got)
+	}
+
+	// One successful run ends the single incident with one recovery.
+	medicoverFake.setSlots(incidentSlot("booking-search-auth"))
+	recovered := run(t, environment, "check", "--profile", "searchauth", "--output", "json", "--non-interactive")
+	if recovered.exitCode != 0 {
+		t.Fatalf("recovery check = %#v", recovered)
+	}
+	if got := incidentQuery(t, database, "SELECT status FROM operational_incidents WHERE scope_type = 'account' AND scope_id = 'alice'"); got != "resolved" {
+		t.Fatalf("account incident = %s, want resolved", got)
+	}
+	if got := incidentQuery(t, database, "SELECT count(*) FROM operational_deliveries WHERE kind = 'recovery' AND status = 'delivered'"); got != "1" {
+		t.Fatalf("recoveries = %s, want 1 (not duplicated)", got)
+	}
+}

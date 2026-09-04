@@ -133,6 +133,23 @@ func incidentTime(value time.Time) time.Time {
 	return value.UTC()
 }
 
+// hasLiveClaimLease reports whether a delivery row is currently claimed by
+// another worker's in-flight Telegram request. Claims hold a future
+// next_attempt_at lease that comfortably covers transport timeouts, while
+// fresh pending rows carry an empty timestamp and scheduled retries carry a
+// past-due or backoff timestamp with retry status. Only pending rows can hold
+// claim leases: claiming always resets status to pending.
+func hasLiveClaimLease(nextAttemptAt string, now time.Time) bool {
+	if strings.TrimSpace(nextAttemptAt) == "" {
+		return false
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextAttemptAt)
+	if err != nil {
+		return false
+	}
+	return next.After(now)
+}
+
 func normalizeIncidentScope(scopeType, scopeID, accountID, profileID, destinationID string) (string, string, string, string, string, error) {
 	scopeType = strings.TrimSpace(scopeType)
 	scopeID = strings.TrimSpace(scopeID)
@@ -352,8 +369,13 @@ func (s *Store) RecordIncidentFailure(scopeType, scopeID, accountID, profileID, 
 }
 
 // ResolveIncident ends the active incident for a scope. Pending failure
-// notifications that never delivered are cancelled; one pending recovery is
-// created for each destination that delivered the failure.
+// notifications that never delivered are cancelled, except rows with a live
+// claim lease: another worker's Telegram request is in flight for those, and
+// cancelling them would lose the send result (the late record conflicts and
+// is skipped) leaving a failure with no recovery. Claimed rows finish
+// instead, and a late delivered failure queues its recovery on record. One
+// pending recovery is created for each destination that delivered the
+// failure.
 func (s *Store) ResolveIncident(scopeType, scopeID, profileID, destinationID string, now time.Time) (Incident, []IncidentDelivery, []IncidentDelivery, error) {
 	scopeType, scopeID, _, profileID, destinationID, err := normalizeIncidentScope(scopeType, scopeID, "", profileID, destinationID)
 	if err != nil {
@@ -464,6 +486,9 @@ func (s *Store) ResolveIncident(scopeType, scopeID, profileID, destinationID str
 			}
 			recoveries = append(recoveries, recovery)
 		case DeliveryPending, DeliveryRetry:
+			if delivery.Status == DeliveryPending && hasLiveClaimLease(delivery.NextAttemptAt, now) {
+				continue
+			}
 			result, err := conn.ExecContext(ctx, `UPDATE operational_deliveries SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND status IN ('pending', 'retry')`, DeliveryPermanentFailure, incidentCancelledMessage, stamp, delivery.ID)
 			if err != nil {
 				return Incident{}, nil, nil, fmt.Errorf("resolve operational incident: %w", err)
@@ -815,6 +840,29 @@ func (s *Store) RecordIncidentDeliveryResult(id string, claimed IncidentDelivery
 			return current, fmt.Errorf("%w: delivery %s", ErrDeliveryConflict, id)
 		}
 		return fresh, fmt.Errorf("%w: delivery %s", ErrDeliveryConflict, id)
+	}
+	if finalStatus == DeliveryDelivered && current.Kind == IncidentDeliveryFailure {
+		// A failure delivered after its incident already resolved (its send
+		// was in flight during resolve) still owes its recovery pair.
+		// Recoveries are never created for recovery rows themselves: a
+		// failure in an operational notification never creates another
+		// incident or notification.
+		var incidentStatus string
+		if err := conn.QueryRowContext(ctx, `SELECT status FROM operational_incidents WHERE id = ?`, current.IncidentID).Scan(&incidentStatus); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) && !isNoSuchTable(err) {
+				return IncidentDelivery{}, fmt.Errorf("record operational delivery: %w", err)
+			}
+		} else if incidentStatus == IncidentStatusResolved {
+			recoveryID, err := newObservationID("incident-delivery")
+			if err != nil {
+				return IncidentDelivery{}, fmt.Errorf("record operational delivery: %w", err)
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO operational_deliveries (id, incident_id, destination_id, kind, status, attempts, next_attempt_at, last_error, created_at, updated_at, delivered_at, message_id) VALUES (?, ?, ?, ?, ?, 0, '', '', ?, ?, '', 0) ON CONFLICT(incident_id, destination_id, kind) DO NOTHING`, recoveryID, current.IncidentID, current.DestinationID, IncidentDeliveryRecovery, DeliveryPending, stamp, stamp); err != nil {
+				if !isNoSuchTable(err) && !strings.Contains(strings.ToLower(err.Error()), "foreign key") {
+					return IncidentDelivery{}, fmt.Errorf("record operational delivery: %w", err)
+				}
+			}
+		}
 	}
 	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return IncidentDelivery{}, fmt.Errorf("record operational delivery: %w", err)

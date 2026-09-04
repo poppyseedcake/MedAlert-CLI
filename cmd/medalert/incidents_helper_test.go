@@ -131,6 +131,12 @@ func newIncidentMedicoverFake(t *testing.T) (*incidentMedicoverFake, func()) {
 			_, _ = w.Write([]byte(`{"unexpected":true}`))
 			return
 		}
+		if mode == "auth" {
+			// Revoked or expired access token: the search endpoint
+			// rejects the bearer token after a successful login.
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		if failRegion != "" && strings.Contains(r.URL.RawQuery, failRegion) {
 			_, _ = w.Write([]byte(`{"unexpected":true}`))
 			return

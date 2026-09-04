@@ -120,3 +120,65 @@ func TestIncidentPendingFailureCancelledOnResolve(t *testing.T) {
 		t.Fatalf("deliveries after cancel = %#v, want one permanent_failure", deliveries)
 	}
 }
+
+func TestIncidentResolveSkipsInFlightClaimAndRecoversLateDelivery(t *testing.T) {
+	storage := openIncidentStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	mustDeliveryProfile(t, storage, "race", "alice")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("race", []string{"one"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	incident, created, newly, err := storage.RecordIncidentFailure(store.IncidentScopeProfile, "race", "alice", "race", "", "protocol_changed", "changed", now, []string{"one"})
+	if err != nil || !newly || len(created) != 1 {
+		t.Fatalf("record = %#v, %v newly=%v created=%d", incident, err, newly, len(created))
+	}
+	// Worker A claims the failure delivery; its Telegram request is in flight.
+	claimed, err := storage.BeginIncidentDeliveryAttempt(created[0].ID, now)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	// Worker B resolves the incident while the send is in flight. The
+	// claimed row must survive so the late result is not lost.
+	resolved, recoveries, cancelled, err := storage.ResolveIncident(store.IncidentScopeProfile, "race", "race", "", now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if resolved.Status != store.IncidentStatusResolved {
+		t.Fatalf("resolved status = %q, want resolved", resolved.Status)
+	}
+	if len(recoveries) != 0 || len(cancelled) != 0 {
+		t.Fatalf("recoveries=%d cancelled=%d, want none yet (claim in flight)", len(recoveries), len(cancelled))
+	}
+	// The in-flight send succeeded after resolution. It must record and
+	// queue its recovery pair instead of conflicting away silently.
+	delivered, err := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: 7}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("record late delivery: %v", err)
+	}
+	if delivered.Status != store.DeliveryDelivered {
+		t.Fatalf("late delivery status = %q, want delivered", delivered.Status)
+	}
+	deliveries, err := storage.ListIncidentDeliveries(incident.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failure, recovery *store.IncidentDelivery
+	for index := range deliveries {
+		switch deliveries[index].Kind {
+		case store.IncidentDeliveryFailure:
+			failure = &deliveries[index]
+		case store.IncidentDeliveryRecovery:
+			recovery = &deliveries[index]
+		}
+	}
+	if failure == nil || failure.Status != store.DeliveryDelivered {
+		t.Fatalf("failure = %#v, want delivered", failure)
+	}
+	if recovery == nil || recovery.Status != store.DeliveryPending {
+		t.Fatalf("recovery = %#v, want pending pair for the late failure", recovery)
+	}
+}

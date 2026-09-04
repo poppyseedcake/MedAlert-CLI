@@ -278,6 +278,23 @@ func (w *watchLoop) launchIteration(ctx context.Context) bool {
 	if _, err := w.storage.ReapExpiredIncidentClaims(now); err != nil {
 		w.log("cannot reap incident deliveries: %s", shortWatchMessage(err))
 	}
+	// Incident retries need no observation run, so due incident deliveries
+	// are sent directly from the iteration. Otherwise a retry whose backoff
+	// passed (including a Telegram retry_after) would wait for the next due
+	// profile or authentication attempt, up to a full check interval away,
+	// delaying an operational alert substantially. Claims fence concurrent
+	// sends across iterations and profile workers.
+	if ctx.Err() == nil {
+		if dueIncidents, err := w.storage.ListDueIncidentDeliveries(now); err != nil {
+			w.log("cannot list incident deliveries: %s", shortWatchMessage(err))
+		} else if len(dueIncidents) > 0 {
+			w.wg.Add(1)
+			go func() {
+				defer w.wg.Done()
+				w.processWatchIncidents(ctx)
+			}()
+		}
+	}
 	w.mu.Lock()
 	due := monitoring.DueProfiles(profiles, w.lastRuns, now)
 	w.mu.Unlock()
@@ -607,8 +624,16 @@ func (w *watchLoop) trackWatchAccountFailure(ctx context.Context, account store.
 }
 
 // trackWatchProfileFailure records a search-phase operational incident for
-// one profile without stopping other profiles.
+// one profile without stopping other profiles. A search-phase authentication
+// failure means the account session is bad, so it records one account-level
+// problem instead of a profile incident.
 func (w *watchLoop) trackWatchProfileFailure(ctx context.Context, profile store.Profile, account store.Account, checkErr error) {
+	if medicover.IsAuthRequired(checkErr) {
+		// Search-phase authentication failure means the account session is
+		// bad: one account-level problem, not one problem per profile.
+		w.trackWatchAccountFailure(ctx, account, checkErr)
+		return
+	}
 	if !shouldRecordProfileIncident(checkErr) {
 		return
 	}
@@ -618,15 +643,6 @@ func (w *watchLoop) trackWatchProfileFailure(ctx context.Context, profile store.
 	if err != nil {
 		w.log("profile %s cannot record incident: %s", profile.ID, shortWatchMessage(err))
 		return
-	}
-	if medicover.IsAuthRequired(checkErr) {
-		if _, _, err := monitoring.RecordAccountFailure(w.storage, account.ID, code, message, now); err != nil {
-			w.log("account %s cannot record incident: %s", account.ID, shortWatchMessage(err))
-		} else if newly {
-			// Account failure shares the same portal cause; the profile
-			// incident event already describes it, so no duplicate account
-			// event is needed here beyond the queued notification.
-		}
 	}
 	if newly {
 		w.log("profile %s operational incident started: %s", profile.ID, code)

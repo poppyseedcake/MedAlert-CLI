@@ -109,14 +109,16 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 	result, err := monitoring.Check(ctx, storage, profile, account, client, auth.AccessToken, time.Now().UTC())
 	if err != nil {
 		now := time.Now().UTC()
-		if recordErr := recordProfileFailure(storage, profile, err, now); recordErr != nil {
-			return reportStoreError(stderr, command, recordErr, jsonOutput)
-		}
-		// A search-phase authentication failure also pauses the account.
 		if medicover.IsAuthRequired(err) {
+			// A search-phase authentication failure means the account
+			// session is bad. It creates one account-level problem, not
+			// one problem per profile, so only the account incident is
+			// recorded here.
 			if recordErr := recordAccountFailure(storage, account, err, now); recordErr != nil {
 				return reportStoreError(stderr, command, recordErr, jsonOutput)
 			}
+		} else if recordErr := recordProfileFailure(storage, profile, err, now); recordErr != nil {
+			return reportStoreError(stderr, command, recordErr, jsonOutput)
 		}
 		if _, processErr := processIncidentDeliveries(ctx, storage, settings, stdin, stderr); processErr != nil {
 			return reportStoreError(stderr, command, processErr, jsonOutput)
