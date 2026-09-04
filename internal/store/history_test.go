@@ -181,6 +181,35 @@ func TestListRecentQueriesRespectLimits(t *testing.T) {
 	}
 }
 
+func TestListRecentObservationRunsForProfileFiltersBeforeLimit(t *testing.T) {
+	storage, _ := openProfileStore(t)
+	if _, err := storage.CreateProfile(validProfile("limited", "alice")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	for index, status := range []string{store.ObservationRunFailed, store.ObservationRunComplete, store.ObservationRunFailed} {
+		run, err := storage.BeginObservationRun("limited", now.Add(time.Duration(index)*time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status == store.ObservationRunComplete {
+			if _, err := storage.ReconcileObservationRun(run.ID, nil, now.Add(time.Duration(index)*time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+		} else if _, err := storage.FailObservationRun(run.ID, status, "temporary_failure", "failure", now.Add(time.Duration(index)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runs, err := storage.ListRecentObservationRunsForProfile("limited", store.ObservationRunFailed, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != store.ObservationRunFailed || runs[0].StartedAt != now.Add(2*time.Minute).Format(time.RFC3339Nano) {
+		t.Fatalf("runs = %#v, want newest failed run only", runs)
+	}
+}
+
 func TestListRecentDeliveriesReturnsNewestRows(t *testing.T) {
 	storage, _ := openProfileStore(t)
 	if _, err := storage.CreateProfile(validProfile("recent-deliveries", "alice")); err != nil {

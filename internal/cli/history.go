@@ -70,7 +70,7 @@ func historyRuns(command string, settings options, stdout, stderr io.Writer, jso
 	}
 	var runs []store.ObservationRun
 	if profileFilter != "" {
-		runs, err = storage.ListObservationRuns(profileFilter)
+		runs, err = storage.ListRecentObservationRunsForProfile(profileFilter, statusFilter, limit)
 		if err != nil {
 			return reportHistoryError(stderr, command, err, jsonOutput)
 		}
@@ -292,14 +292,15 @@ func historyIncidentDeliveries(command string, settings options, stdout, stderr 
 // historyStatusData is the stable machine contract for history status and
 // doctor diagnostics. Text may change; these fields and meanings do not.
 type historyStatusData struct {
-	Accounts             []historyAccountStatus `json:"accounts"`
-	DisabledProfiles     []historyProfileRef    `json:"disabled_profiles"`
-	DisabledDestinations []historyDestRef       `json:"disabled_destinations"`
-	ActiveIncidents      []store.Incident       `json:"active_incidents"`
-	PermanentFailures    []store.Delivery       `json:"permanent_failures"`
-	RequiredActions      []historyAction        `json:"required_actions"`
-	RetentionDays        int                    `json:"retention_days"`
-	Summary              map[string]int         `json:"summary"`
+	Accounts              []historyAccountStatus   `json:"accounts"`
+	DisabledProfiles      []historyProfileRef      `json:"disabled_profiles"`
+	DisabledDestinations  []historyDestRef         `json:"disabled_destinations"`
+	ActiveIncidents       []store.Incident         `json:"active_incidents"`
+	PermanentFailures     []store.Delivery         `json:"permanent_failures"`
+	OperationalDeliveries []store.IncidentDelivery `json:"operational_deliveries"`
+	RequiredActions       []historyAction          `json:"required_actions"`
+	RetentionDays         int                      `json:"retention_days"`
+	Summary               map[string]int           `json:"summary"`
 }
 
 type historyAccountStatus struct {
@@ -343,7 +344,7 @@ func historyStatus(command string, settings options, stdout, stderr io.Writer, j
 		// may leave it empty.
 		settings.sessionDir = strings.TrimSpace(os.Getenv("MEDALERT_SESSION_DIR"))
 	}
-	data, err := collectHistoryStatus(storage, sessionStoreFor(settings))
+	data, err := collectHistoryStatusForIssuer(storage, sessionStoreFor(settings), settings.medicoverBaseURL)
 	if err != nil {
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
@@ -402,14 +403,19 @@ func historyStatus(command string, settings options, stdout, stderr io.Writer, j
 // disabled configuration, active incidents, and permanent delivery failures.
 // It never prompts and never returns secret values.
 func collectHistoryStatus(storage *store.Store, backend session.Store) (historyStatusData, error) {
+	return collectHistoryStatusForIssuer(storage, backend, "")
+}
+
+func collectHistoryStatusForIssuer(storage *store.Store, backend session.Store, medicoverIssuer string) (historyStatusData, error) {
 	data := historyStatusData{
-		Accounts:             []historyAccountStatus{},
-		DisabledProfiles:     []historyProfileRef{},
-		DisabledDestinations: []historyDestRef{},
-		ActiveIncidents:      []store.Incident{},
-		PermanentFailures:    []store.Delivery{},
-		RequiredActions:      []historyAction{},
-		Summary:              map[string]int{},
+		Accounts:              []historyAccountStatus{},
+		DisabledProfiles:      []historyProfileRef{},
+		DisabledDestinations:  []historyDestRef{},
+		ActiveIncidents:       []store.Incident{},
+		PermanentFailures:     []store.Delivery{},
+		OperationalDeliveries: []store.IncidentDelivery{},
+		RequiredActions:       []historyAction{},
+		Summary:               map[string]int{},
 	}
 	accounts, err := storage.ListAccounts()
 	if err != nil {
@@ -429,7 +435,7 @@ func collectHistoryStatus(storage *store.Store, backend session.Store) (historyS
 				// known state unknown without marking auth required.
 				authenticated = false
 			}
-		} else if !medicover.HasUsableSessionCookies(state, time.Now().UTC()) {
+		} else if !medicover.HasUsableSessionCookiesForIssuer(state, medicoverIssuer, time.Now().UTC()) {
 			authenticated = false
 			authRequired = true
 		}
@@ -479,8 +485,19 @@ func collectHistoryStatus(storage *store.Store, backend session.Store) (historyS
 	for _, delivery := range failures {
 		data.RequiredActions = append(data.RequiredActions, historyAction{Code: "permanent_failure", Scope: "delivery", ID: delivery.ID, Message: fmt.Sprintf("profile %s destination %s delivery failed permanently", delivery.ProfileID, delivery.DestinationID)})
 	}
+	operationalFailures, err := storage.ListRecentIncidentDeliveriesByStatus("", store.DeliveryPermanentFailure, 1000)
+	if err != nil {
+		return data, err
+	}
+	data.OperationalDeliveries = operationalFailures
+	for _, delivery := range operationalFailures {
+		data.RequiredActions = append(data.RequiredActions, historyAction{Code: "permanent_failure", Scope: "operational_delivery", ID: delivery.ID, Message: fmt.Sprintf("incident %s destination %s %s delivery failed permanently", delivery.IncidentID, delivery.DestinationID, delivery.Kind)})
+	}
 	retention, err := storage.GetHistoryRetentionDays()
 	if err != nil {
+		if !errors.Is(err, store.ErrHistoryInvalid) {
+			return data, err
+		}
 		// An invalid saved policy is itself a required action; keep the
 		// default for display so automation still gets a number.
 		retention = store.DefaultHistoryRetentionDays
@@ -488,14 +505,15 @@ func collectHistoryStatus(storage *store.Store, backend session.Store) (historyS
 	}
 	data.RetentionDays = retention
 	data.Summary = map[string]int{
-		"accounts":              len(accounts),
-		"profiles":              len(profiles),
-		"disabled_profiles":     len(data.DisabledProfiles),
-		"destinations":          len(destinations),
-		"disabled_destinations": len(data.DisabledDestinations),
-		"active_incidents":      len(data.ActiveIncidents),
-		"permanent_failures":    len(data.PermanentFailures),
-		"required_actions":      len(data.RequiredActions),
+		"accounts":               len(accounts),
+		"profiles":               len(profiles),
+		"disabled_profiles":      len(data.DisabledProfiles),
+		"destinations":           len(destinations),
+		"disabled_destinations":  len(data.DisabledDestinations),
+		"active_incidents":       len(data.ActiveIncidents),
+		"permanent_failures":     len(data.PermanentFailures) + len(data.OperationalDeliveries),
+		"operational_deliveries": len(data.OperationalDeliveries),
+		"required_actions":       len(data.RequiredActions),
 	}
 	return data, nil
 }
@@ -902,7 +920,7 @@ func runDoctor(command string, settings options, stdout, stderr io.Writer) int {
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
-	diagnostics, err := collectHistoryStatus(storage, sessionStoreFor(settings))
+	diagnostics, err := collectHistoryStatusForIssuer(storage, sessionStoreFor(settings), settings.medicoverBaseURL)
 	if err != nil {
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}

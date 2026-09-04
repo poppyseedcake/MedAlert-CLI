@@ -161,7 +161,7 @@ func pruneQuery(database *sql.DB, query string, args ...any) (int, error) {
 // ListRecentObservationRuns returns observation runs across all profiles from
 // newest to oldest, up to limit (0 means a sane default cap).
 func (s *Store) ListRecentObservationRuns(limit int) ([]ObservationRun, error) {
-	return s.listRecentObservationRuns("", limit)
+	return s.listRecentObservationRuns("", "", limit)
 }
 
 // ListRecentObservationRunsByStatus returns observation runs across all
@@ -171,10 +171,24 @@ func (s *Store) ListRecentObservationRunsByStatus(status string, limit int) ([]O
 	if !validObservationRunStatus(status) {
 		return nil, fmt.Errorf("%w: status %q", ErrObservationRunInvalid, status)
 	}
-	return s.listRecentObservationRuns(status, limit)
+	return s.listRecentObservationRuns("", status, limit)
 }
 
-func (s *Store) listRecentObservationRuns(status string, limit int) ([]ObservationRun, error) {
+// ListRecentObservationRunsForProfile returns one profile's observation runs,
+// optionally filtered by status, from newest to oldest, up to limit.
+func (s *Store) ListRecentObservationRunsForProfile(profileID, status string, limit int) ([]ObservationRun, error) {
+	profileID = strings.TrimSpace(profileID)
+	if !profileIDPattern.MatchString(profileID) {
+		return nil, fmt.Errorf("%w: profile id %q", ErrObservationRunInvalid, profileID)
+	}
+	status = strings.TrimSpace(status)
+	if status != "" && !validObservationRunStatus(status) {
+		return nil, fmt.Errorf("%w: status %q", ErrObservationRunInvalid, status)
+	}
+	return s.listRecentObservationRuns(profileID, status, limit)
+}
+
+func (s *Store) listRecentObservationRuns(profileID, status string, limit int) ([]ObservationRun, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -183,6 +197,10 @@ func (s *Store) listRecentObservationRuns(status string, limit int) ([]Observati
 	}
 	query := `SELECT id, profile_id, profile_updated_at, status, started_at, completed_at, slot_count, error_code, error_message FROM observation_runs WHERE 1 = 1`
 	args := []any{}
+	if profileID != "" {
+		query += ` AND profile_id = ?`
+		args = append(args, profileID)
+	}
 	if status != "" {
 		query += ` AND status = ?`
 		args = append(args, status)
@@ -338,6 +356,23 @@ func (s *Store) ListRecentDeliveries(profileID, status string, limit int) ([]Del
 // (empty incidentID returns recent deliveries across incidents) ordered from
 // newest to oldest by creation. limit 0 means a sane default cap.
 func (s *Store) ListRecentIncidentDeliveries(incidentID string, limit int) ([]IncidentDelivery, error) {
+	return s.listRecentIncidentDeliveries(incidentID, "", limit)
+}
+
+// ListRecentIncidentDeliveriesByStatus returns operational deliveries for one
+// incident, optionally filtered by status, from newest to oldest, up to limit.
+// An empty incidentID returns deliveries across incidents.
+func (s *Store) ListRecentIncidentDeliveriesByStatus(incidentID, status string, limit int) ([]IncidentDelivery, error) {
+	status = strings.TrimSpace(status)
+	switch status {
+	case "", DeliveryPending, DeliveryDelivered, DeliveryRetry, DeliveryPermanentFailure:
+	default:
+		return nil, fmt.Errorf("%w: delivery status %q", ErrDeliveryInvalid, status)
+	}
+	return s.listRecentIncidentDeliveries(incidentID, status, limit)
+}
+
+func (s *Store) listRecentIncidentDeliveries(incidentID, status string, limit int) ([]IncidentDelivery, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -349,6 +384,10 @@ func (s *Store) ListRecentIncidentDeliveries(incidentID string, limit int) ([]In
 	if trimmed := strings.TrimSpace(incidentID); trimmed != "" {
 		query += ` AND incident_id = ?`
 		args = append(args, trimmed)
+	}
+	if status != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
 	}
 	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)

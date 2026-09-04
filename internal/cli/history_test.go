@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/zalando/go-keyring"
+	_ "modernc.org/sqlite"
 )
 
 func historyTestEnv(root string) func(string) string {
@@ -225,6 +227,65 @@ func TestHistoryStatusIdentifiesAuthAndDisabled(t *testing.T) {
 	}
 }
 
+func TestHistoryStatusIncludesPermanentOperationalDelivery(t *testing.T) {
+	database, getenv := setupHistoryFixture(t)
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	incident, created, newly, err := storage.RecordIncidentFailure(store.IncidentScopeProfile, "prof", "alice", "prof", "", "authentication_required", "login required", now, []string{"dest"})
+	if err != nil || !newly || len(created) != 1 {
+		storage.Close()
+		t.Fatalf("record incident = %#v deliveries=%d newly=%v err=%v", incident, len(created), newly, err)
+	}
+	claimed, err := storage.BeginIncidentDeliveryAttempt(created[0].ID, now)
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: 1}, now); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	_, recoveries, cancelled, err := storage.ResolveIncident(store.IncidentScopeProfile, "prof", "prof", "", now.Add(time.Minute))
+	if err != nil || len(recoveries) != 1 || len(cancelled) != 0 {
+		storage.Close()
+		t.Fatalf("resolve recoveries=%d cancelled=%d err=%v", len(recoveries), len(cancelled), err)
+	}
+	recoveryClaim, err := storage.BeginIncidentDeliveryAttempt(recoveries[0].ID, now.Add(time.Minute))
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.RecordIncidentDeliveryResult(recoveryClaim.ID, recoveryClaim, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: "permanent test failure"}, now.Add(2*time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	storage.Close()
+
+	code, stdout, stderr := runCLI(t, getenv, "history", "status", "--database", database, "--output", "json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("history status: code=%d stderr=%q stdout=%q", code, stderr, stdout)
+	}
+	data := decodeEnvelope(t, stdout, "history status")
+	operational, ok := data["operational_deliveries"].([]any)
+	if !ok || len(operational) != 1 {
+		t.Fatalf("operational_deliveries = %#v, want one permanent delivery", data["operational_deliveries"])
+	}
+	summary, ok := data["summary"].(map[string]any)
+	if !ok || summary["permanent_failures"] != float64(1) {
+		t.Fatalf("summary = %#v, want one permanent failure", data["summary"])
+	}
+	actions, _ := data["required_actions"].([]any)
+	for _, raw := range actions {
+		if action, ok := raw.(map[string]any); ok && action["code"] == "permanent_failure" && action["scope"] == "operational_delivery" {
+			return
+		}
+	}
+	t.Fatalf("required_actions = %#v, want operational permanent failure", actions)
+}
+
 type historyStatusSessionStore struct {
 	state *medicover.SessionState
 }
@@ -264,6 +325,29 @@ func TestHistoryStatusFlagsExpiredSession(t *testing.T) {
 		}
 	}
 	t.Fatalf("required actions = %#v, want authentication_required", data.RequiredActions)
+}
+
+func TestHistoryStatusReturnsRetentionReadError(t *testing.T) {
+	database, getenv := setupHistoryFixture(t)
+	databaseHandle, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := databaseHandle.Exec("ALTER TABLE application_metadata RENAME COLUMN value TO broken_value"); err != nil {
+		databaseHandle.Close()
+		t.Fatal(err)
+	}
+	if err := databaseHandle.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := runCLI(t, getenv, "history", "status", "--database", database, "--output", "json")
+	if code == 0 {
+		t.Fatalf("history status succeeded for retention read failure: stdout=%q stderr=%q", stdout, stderr)
+	}
+	if stdout != "" || !strings.Contains(stderr, "database_error") || strings.Contains(stderr, "invalid_retention") {
+		t.Fatalf("history status error: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
 }
 
 func TestHistoryRetentionShowSetAndPrune(t *testing.T) {

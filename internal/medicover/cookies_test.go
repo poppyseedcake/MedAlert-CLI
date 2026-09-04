@@ -65,6 +65,44 @@ func TestCookieDomainPathAndSecureMatching(t *testing.T) {
 	}
 }
 
+func TestHasUsableSessionCookiesRequiresTrustedCookieTarget(t *testing.T) {
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name    string
+		cookie  StoredCookie
+		wantUse bool
+	}{
+		{
+			name:    "unrelated cookie",
+			cookie:  StoredCookie{Name: "OtherSession", Value: "active", Path: "/"},
+			wantUse: false,
+		},
+		{
+			name:    "wrong domain",
+			cookie:  StoredCookie{Name: "MedicoverTrusted", Value: "active", Domain: "other.example", Path: "/"},
+			wantUse: false,
+		},
+		{
+			name:    "wrong path",
+			cookie:  StoredCookie{Name: "MedicoverTrusted", Value: "active", Path: "/other"},
+			wantUse: false,
+		},
+		{
+			name:    "matching trusted cookie",
+			cookie:  StoredCookie{Name: "MedicoverTrusted", Value: "active", Path: "/"},
+			wantUse: true,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			state := &SessionState{Cookies: []StoredCookie{test.cookie}}
+			if got := HasUsableSessionCookies(state, now); got != test.wantUse {
+				t.Fatalf("HasUsableSessionCookies = %v, want %v", got, test.wantUse)
+			}
+		})
+	}
+}
+
 func containsCookie(header, name string) bool {
 	for _, part := range splitCookieHeader(header) {
 		if part == name {
