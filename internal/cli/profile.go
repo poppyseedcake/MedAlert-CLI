@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -126,16 +127,33 @@ func profileCreate(command string, settings options, stdout, stderr io.Writer, j
 	if err := store.ValidateProfile(profile); err != nil {
 		return reportProfileError(stderr, command, err, jsonOutput)
 	}
+	var telegramIDs []string
+	if strings.TrimSpace(settings.telegramIDsRaw) != "" {
+		parsed, err := store.ParseDestinationIDList(settings.telegramIDsRaw)
+		if err != nil {
+			return reportTelegramError(stderr, command, err, jsonOutput)
+		}
+		telegramIDs = parsed
+	}
 	storage, err := ensureStore(settings.database)
 	if err != nil {
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
-	created, err := storage.CreateProfile(profile)
+	// Create the profile and its links in one transaction so a missing
+	// destination never leaves a partial orphan row behind.
+	created, err := storage.CreateProfileWithDestinations(profile, telegramIDs)
 	if err != nil {
+		// Map destination errors to the telegram domain; profile errors stay
+		// in the profile domain for stable automation codes.
+		if errors.Is(err, store.ErrDestinationNotFound) || errors.Is(err, store.ErrDestinationInvalid) {
+			return reportTelegramError(stderr, command, err, jsonOutput)
+		}
 		return reportProfileError(stderr, command, err, jsonOutput)
 	}
-	writeProfile(stdout, command, created, fmt.Sprintf("Created profile %s for account %s.\n", created.ID, created.AccountID), jsonOutput)
+	if err := writeProfileWithDestinations(stdout, command, storage, created, fmt.Sprintf("Created profile %s for account %s.\n", created.ID, created.AccountID), jsonOutput); err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
 	return 0
 }
 
@@ -157,7 +175,9 @@ func profileShow(command string, settings options, stdout, stderr io.Writer, jso
 	if err != nil {
 		return reportProfileError(stderr, command, err, jsonOutput)
 	}
-	writeProfile(stdout, command, profile, "", jsonOutput)
+	if err := writeProfileWithDestinations(stdout, command, storage, profile, "", jsonOutput); err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
 	return 0
 }
 
@@ -170,13 +190,30 @@ func profileEdit(command string, settings options, stdout, stderr io.Writer, jso
 		writeError(stderr, command, "invalid_arguments", "profile id is required (use --profile or a positional id)", jsonOutput)
 		return 2
 	}
+	if strings.TrimSpace(settings.telegramIDsRaw) != "" && settings.clearTelegram {
+		writeError(stderr, command, "invalid_arguments", "use either --telegram or --clear-telegram, not both", jsonOutput)
+		return 2
+	}
+	var telegramIDs []string
+	hasTelegramChange := false
+	if strings.TrimSpace(settings.telegramIDsRaw) != "" {
+		parsed, err := store.ParseDestinationIDList(settings.telegramIDsRaw)
+		if err != nil {
+			return reportTelegramError(stderr, command, err, jsonOutput)
+		}
+		telegramIDs = parsed
+		hasTelegramChange = true
+	} else if settings.clearTelegram {
+		telegramIDs = []string{}
+		hasTelegramChange = true
+	}
 	update, hasChange, err := buildProfileUpdateFromOptions(settings)
 	if err != nil {
 		writeError(stderr, command, "invalid_arguments", err.Error(), jsonOutput)
 		return 2
 	}
-	if !hasChange {
-		writeError(stderr, command, "invalid_arguments", "no profile changes requested (use --region, --specialty, --clinic, --doctor, --language, --visit-type, --search-type, --start-date, --end-date, --check-interval-minutes, or a --clear-* flag)", jsonOutput)
+	if !hasChange && !hasTelegramChange {
+		writeError(stderr, command, "invalid_arguments", "no profile changes requested (use --region, --specialty, --clinic, --doctor, --language, --visit-type, --search-type, --start-date, --end-date, --check-interval-minutes, --telegram, or a --clear-* flag)", jsonOutput)
 		return 2
 	}
 	storage, err := ensureStore(settings.database)
@@ -186,15 +223,22 @@ func profileEdit(command string, settings options, stdout, stderr io.Writer, jso
 	defer storage.Close()
 	// Fetch first so a missing profile reports profile_not_found before any
 	// validation of the combined row. Editing keeps the stable identity,
-	// the account, and the enabled state.
+	// the account, and the enabled state. Criteria and links commit together
+	// so a concurrent destination delete never leaves criteria updated
+	// without the requested links.
 	if _, err := storage.GetProfile(strings.TrimSpace(id)); err != nil {
 		return reportProfileError(stderr, command, err, jsonOutput)
 	}
-	updated, err := storage.UpdateProfile(strings.TrimSpace(id), update)
+	updated, err := storage.UpdateProfileWithDestinations(strings.TrimSpace(id), update, hasChange, telegramIDs, hasTelegramChange)
 	if err != nil {
+		if errors.Is(err, store.ErrDestinationNotFound) || errors.Is(err, store.ErrDestinationInvalid) {
+			return reportTelegramError(stderr, command, err, jsonOutput)
+		}
 		return reportProfileError(stderr, command, err, jsonOutput)
 	}
-	writeProfile(stdout, command, updated, fmt.Sprintf("Updated profile %s for account %s.\n", updated.ID, updated.AccountID), jsonOutput)
+	if err := writeProfileWithDestinations(stdout, command, storage, updated, fmt.Sprintf("Updated profile %s for account %s.\n", updated.ID, updated.AccountID), jsonOutput); err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
 	return 0
 }
 
@@ -220,7 +264,9 @@ func profileSetEnabled(command string, settings options, enabled bool, stdout, s
 	if !enabled {
 		verb = "Disabled"
 	}
-	writeProfile(stdout, command, updated, fmt.Sprintf("%s profile %s for account %s.\n", verb, updated.ID, updated.AccountID), jsonOutput)
+	if err := writeProfileWithDestinations(stdout, command, storage, updated, fmt.Sprintf("%s profile %s for account %s.\n", verb, updated.ID, updated.AccountID), jsonOutput); err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
 	return 0
 }
 
@@ -480,6 +526,48 @@ func writeProfile(stdout io.Writer, command string, profile store.Profile, textT
 	fmt.Fprintf(stdout, "Start date: %s\n", orAny(profile.StartDate))
 	fmt.Fprintf(stdout, "End date: %s\n", orAny(profile.EndDate))
 	fmt.Fprintf(stdout, "Check interval: %d minutes\n", profile.CheckIntervalMinutes)
+}
+
+// writeProfileWithDestinations renders a profile together with its linked
+// Telegram Destinations. JSON keeps the stable profile object and adds the
+// destination id list so automation can process links without parsing text.
+// A destination read failure is returned so callers surface database errors
+// instead of reporting an incorrect empty link list.
+func writeProfileWithDestinations(stdout io.Writer, command string, storage *store.Store, profile store.Profile, textTemplate string, jsonOutput bool) error {
+	destinationIDs := []string{}
+	if storage != nil {
+		ids, err := storage.ListProfileDestinationIDs(profile.ID)
+		if err != nil {
+			return err
+		}
+		destinationIDs = ids
+	}
+	if jsonOutput {
+		writeResult(stdout, command, map[string]any{"profile": profile, "telegram_destinations": destinationIDs})
+		return nil
+	}
+	if textTemplate != "" {
+		fmt.Fprint(stdout, textTemplate)
+	}
+	fmt.Fprintf(stdout, "ID: %s\n", profile.ID)
+	fmt.Fprintf(stdout, "Account: %s\n", profile.AccountID)
+	fmt.Fprintf(stdout, "Enabled: %s\n", formatEnabled(profile.Enabled))
+	fmt.Fprintf(stdout, "Region: %s\n", orAny(profile.RegionIDs))
+	fmt.Fprintf(stdout, "Specialty: %s\n", orAny(profile.SpecialtyIDs))
+	fmt.Fprintf(stdout, "Clinic: %s\n", orAny(profile.ClinicIDs))
+	fmt.Fprintf(stdout, "Doctor: %s\n", orAny(profile.DoctorIDs))
+	fmt.Fprintf(stdout, "Language: %s\n", orAny(profile.LanguageIDs))
+	fmt.Fprintf(stdout, "Visit type: %s\n", orAny(profile.VisitType))
+	fmt.Fprintf(stdout, "Search type: %s\n", orAny(profile.SearchType))
+	fmt.Fprintf(stdout, "Start date: %s\n", orAny(profile.StartDate))
+	fmt.Fprintf(stdout, "End date: %s\n", orAny(profile.EndDate))
+	fmt.Fprintf(stdout, "Check interval: %d minutes\n", profile.CheckIntervalMinutes)
+	if len(destinationIDs) == 0 {
+		fmt.Fprintf(stdout, "Telegram: %s\n", "none")
+	} else {
+		fmt.Fprintf(stdout, "Telegram: %s\n", strings.Join(destinationIDs, ","))
+	}
+	return nil
 }
 
 func formatProfileLine(profile store.Profile) string {

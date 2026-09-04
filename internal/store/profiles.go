@@ -379,10 +379,10 @@ func (s *Store) DeleteProfile(id string) error {
 		return fmt.Errorf("delete profile: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	// Delete known history tables when they exist. Older databases (schema 3
-	// without later history tables) simply skip the missing tables so the
+	// Delete known history and link tables when they exist. Older databases
+	// (schema 3 without later tables) simply skip the missing tables so the
 	// profile delete still succeeds.
-	for _, table := range []string{"observation_runs", "availability_episodes", "telegram_deliveries", "operational_incidents"} {
+	for _, table := range []string{"observation_runs", "availability_episodes", "telegram_deliveries", "operational_incidents", "profile_telegram_destinations"} {
 		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE profile_id = ?`, table), id); err != nil {
 			if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 				return fmt.Errorf("delete profile history: %w", err)
