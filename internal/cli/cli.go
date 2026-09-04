@@ -53,6 +53,11 @@ type options struct {
 	clearStartDate   bool
 	clearEndDate     bool
 	dry              bool
+	// Watch controls. Raw strings keep "flag missing" apart from invalid
+	// values; --once is shorthand for exactly one iteration.
+	watchOnce         bool
+	maxIterationsRaw  string
+	pollIntervalRaw   string
 }
 
 type errorBody struct {
@@ -153,6 +158,14 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 			settings.medicoverBaseURL = strings.TrimSpace(getenv("MEDALERT_MEDICOVER_BASE_URL"))
 		}
 		return runCheck(commandName, settings, stdin, stdout, stderr)
+	case "watch":
+		if settings.sessionDir == "" {
+			settings.sessionDir = strings.TrimSpace(getenv("MEDALERT_SESSION_DIR"))
+		}
+		if settings.medicoverBaseURL == "" {
+			settings.medicoverBaseURL = strings.TrimSpace(getenv("MEDALERT_MEDICOVER_BASE_URL"))
+		}
+		return runWatch(commandName, settings, stdin, stdout, stderr)
 	default:
 		writeError(stderr, commandName, "invalid_arguments", "a supported command is required", settings.output == "json")
 		return 2
@@ -187,7 +200,8 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 			"--language", "--languages", "--doctor-language", "--doctor-languages", "--doctor-language-ids",
 			"--visit-type", "--visit_type", "--search-type", "--search_type", "--slot-search-type",
 			"--start-date", "--date", "--from-date", "--end-date", "--enddate", "--to-date",
-			"--check-interval-minutes", "--check-interval", "--interval-minutes", "--interval":
+			"--check-interval-minutes", "--check-interval", "--interval-minutes", "--interval",
+			"--max-iterations", "--max_iterations", "--poll-interval", "--poll_interval":
 			if index+1 >= len(arguments) {
 				return settings, fmt.Errorf("%s needs a value", argument)
 			}
@@ -275,6 +289,16 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 					return settings, fmt.Errorf("%s needs a non-empty value", argument)
 				}
 				settings.checkIntervalRaw = value
+			case "--max-iterations", "--max_iterations":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.maxIterationsRaw = value
+			case "--poll-interval", "--poll_interval":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.pollIntervalRaw = value
 			}
 		case "--password-prompt":
 			settings.passwordPrompt = true
@@ -302,6 +326,8 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 			settings.nonInteractive = true
 		case "--dry":
 			settings.dry = true
+		case "--once":
+			settings.watchOnce = true
 		default:
 			if strings.HasPrefix(argument, "-") {
 				return settings, fmt.Errorf("unknown flag: %s", argument)
@@ -327,8 +353,20 @@ func checkCommandFlags(command string, settings options) error {
 	if settings.dry && command != "check" {
 		return fmt.Errorf("--dry is not supported for %s", command)
 	}
+	if settings.watchOnce && command != "watch" {
+		return fmt.Errorf("--once is not supported for %s", command)
+	}
+	if settings.maxIterationsRaw != "" && command != "watch" {
+		return fmt.Errorf("--max-iterations is not supported for %s", command)
+	}
+	if settings.pollIntervalRaw != "" && command != "watch" {
+		return fmt.Errorf("--poll-interval is not supported for %s", command)
+	}
 	if command == "check" {
 		return checkObservationFlags(settings)
+	}
+	if command == "watch" {
+		return checkWatchFlags(settings)
 	}
 	hasAccountID := settings.accountID != ""
 	hasUsername := settings.username != ""
@@ -724,6 +762,7 @@ func splitCommand(raw []string) ([]string, []string) {
 		{"profile", "disable"},
 		{"profile", "delete"},
 		{"check"},
+		{"watch"},
 		{"version"},
 		{"doctor"},
 	}
