@@ -730,8 +730,8 @@ func resolveWatchMaxIterations(settings options) (int, error) {
 
 // checkWatchFlags rejects every flag watch does not consume so typos fail
 // instead of being silently ignored. Watch always runs non-interactively and
-// covers every enabled profile, so account, profile, criteria, secret, and
-// dry flags are never valid here.
+// covers every enabled profile, so account, profile, criteria, secret,
+// telegram, and dry flags are never valid here.
 func checkWatchFlags(settings options) error {
 	switch {
 	case settings.accountID != "":
@@ -786,6 +786,20 @@ func checkWatchFlags(settings options) error {
 		return fmt.Errorf("--clear-start-date is not supported for watch")
 	case settings.clearEndDate:
 		return fmt.Errorf("--clear-end-date is not supported for watch")
+	case settings.telegramIDsRaw != "":
+		return fmt.Errorf("--telegram is not supported for watch")
+	case settings.telegramName != "":
+		return fmt.Errorf("--name is not supported for watch")
+	case settings.chatID != "":
+		return fmt.Errorf("--chat-id is not supported for watch")
+	case settings.tokenFile != "":
+		return fmt.Errorf("--token-file is not supported for watch")
+	case settings.tokenPrompt:
+		return fmt.Errorf("--token-prompt is not supported for watch")
+	case settings.noStoredToken:
+		return fmt.Errorf("--no-stored-token is not supported for watch")
+	case settings.clearTelegram:
+		return fmt.Errorf("--clear-telegram is not supported for watch")
 	case settings.dry:
 		return fmt.Errorf("--dry is not supported for watch")
 	}

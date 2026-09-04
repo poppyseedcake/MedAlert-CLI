@@ -146,3 +146,34 @@ func TestPromptRejectsNonInteractive(t *testing.T) {
 		t.Fatal("nil stdin prompt succeeded")
 	}
 }
+
+func TestTelegramTokenSeparateNamespaceDoesNotLeak(t *testing.T) {
+	keyring.MockInit()
+	marker := "SECRET-TELEGRAM-MARKER-unique-abc123"
+	if err := secrets.SetTelegramToken("phone", marker); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	// Same id in the account namespace must not see the telegram token.
+	if _, err := secrets.GetPassword("phone"); err == nil {
+		t.Fatal("account namespace saw telegram token")
+	}
+	value, err := secrets.GetTelegramToken("phone")
+	if err != nil || value != marker {
+		t.Fatalf("get = %q, %v", value, err)
+	}
+	if _, err := secrets.GetTelegramToken("missing-dest"); err == nil {
+		t.Fatal("missing token found")
+	} else if strings.Contains(err.Error(), marker) {
+		t.Fatal("missing error leaks token")
+	}
+	resolved, err := secrets.ResolveTelegramToken(secrets.SourceSecretService, "", "phone", nil, os.Stderr, true)
+	if err != nil || resolved != marker {
+		t.Fatalf("resolve = %q, %v", resolved, err)
+	}
+	if err := secrets.DeleteTelegramToken("phone"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := secrets.GetTelegramToken("phone"); err == nil {
+		t.Fatal("deleted token still readable")
+	}
+}

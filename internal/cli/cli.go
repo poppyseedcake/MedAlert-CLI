@@ -55,9 +55,19 @@ type options struct {
 	dry              bool
 	// Watch controls. Raw strings keep "flag missing" apart from invalid
 	// values; --once is shorthand for exactly one iteration.
-	watchOnce         bool
-	maxIterationsRaw  string
-	pollIntervalRaw   string
+	watchOnce        bool
+	maxIterationsRaw string
+	pollIntervalRaw  string
+	// Telegram Destination fields. telegramIDsRaw stays a string so the CLI
+	// can tell "flag missing" apart from "flag empty" (clear).
+	telegramIDsRaw   string
+	telegramName     string
+	chatID           string
+	tokenFile        string
+	tokenPrompt      bool
+	noStoredToken    bool
+	telegramBaseURL  string
+	clearTelegram    bool
 }
 
 type errorBody struct {
@@ -140,6 +150,11 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 		return runAccount(commandName, settings, stdin, stdout, stderr)
 	case "profile create", "profile list", "profile show", "profile edit", "profile enable", "profile disable", "profile delete":
 		return runProfile(commandName, settings, stdout, stderr)
+	case "telegram create", "telegram list", "telegram show", "telegram edit", "telegram enable", "telegram disable", "telegram test", "telegram delete":
+		if settings.telegramBaseURL == "" {
+			settings.telegramBaseURL = strings.TrimSpace(getenv("MEDALERT_TELEGRAM_BASE_URL"))
+		}
+		return runTelegram(commandName, settings, stdin, stdout, stderr)
 	case "account login", "account authenticate", "account logout", "account status":
 		// Resolve session directory defaults from the environment before
 		// selecting the session backend.
@@ -189,6 +204,9 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 	if baseURL := strings.TrimSpace(getenv("MEDALERT_MEDICOVER_BASE_URL")); baseURL != "" {
 		settings.medicoverBaseURL = baseURL
 	}
+	if telegramBaseURL := strings.TrimSpace(getenv("MEDALERT_TELEGRAM_BASE_URL")); telegramBaseURL != "" {
+		settings.telegramBaseURL = telegramBaseURL
+	}
 	var raw []string
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
@@ -201,7 +219,9 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 			"--visit-type", "--visit_type", "--search-type", "--search_type", "--slot-search-type",
 			"--start-date", "--date", "--from-date", "--end-date", "--enddate", "--to-date",
 			"--check-interval-minutes", "--check-interval", "--interval-minutes", "--interval",
-			"--max-iterations", "--max_iterations", "--poll-interval", "--poll_interval":
+			"--max-iterations", "--max_iterations", "--poll-interval", "--poll_interval",
+			"--telegram", "--destination", "--destinations", "--telegram-destination", "--telegram-destinations",
+			"--name", "--chat-id", "--chat_id", "--chat", "--token-file", "--token_file", "--telegram-base-url":
 			if index+1 >= len(arguments) {
 				return settings, fmt.Errorf("%s needs a value", argument)
 			}
@@ -299,9 +319,40 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 					return settings, fmt.Errorf("%s needs a non-empty value", argument)
 				}
 				settings.pollIntervalRaw = value
+			case "--telegram", "--destination", "--destinations", "--telegram-destination", "--telegram-destinations":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.telegramIDsRaw = value
+			case "--name":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("--name needs a non-empty value")
+				}
+				settings.telegramName = value
+			case "--chat-id", "--chat_id", "--chat":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.chatID = value
+			case "--token-file", "--token_file":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.tokenFile = value
+			case "--telegram-base-url":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("--telegram-base-url needs a non-empty value")
+				}
+				settings.telegramBaseURL = value
 			}
 		case "--password-prompt":
 			settings.passwordPrompt = true
+		case "--token-prompt":
+			settings.tokenPrompt = true
+		case "--no-stored-token":
+			settings.noStoredToken = true
+		case "--clear-telegram", "--clear-telegram-destination", "--clear-telegram-destinations", "--clear-destination", "--clear-destinations":
+			settings.clearTelegram = true
 		case "--disabled":
 			settings.profileDisabled = true
 		case "--clear-clinic":
@@ -373,6 +424,9 @@ func checkCommandFlags(command string, settings options) error {
 	hasPasswordFile := settings.passwordFile != ""
 	hasMFACodeFile := settings.mfaCodeFile != ""
 	if err := checkProfileFlagsForNonProfileCommands(command, settings); err != nil {
+		return err
+	}
+	if err := checkTelegramFlagsForNonTelegramCommands(command, settings); err != nil {
 		return err
 	}
 	switch command {
@@ -627,6 +681,94 @@ func checkCommandFlags(command string, settings options) error {
 		case settings.profileDisabled:
 			return fmt.Errorf("--disabled is not supported for %s (use profile enable and profile disable)", command)
 		}
+	case "telegram create":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for %s", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		case settings.profileID != "":
+			return fmt.Errorf("--profile is not supported for %s", command)
+		case settings.clearTelegram:
+			return fmt.Errorf("--clear-telegram is not supported for %s", command)
+		}
+	case "telegram list":
+		switch {
+		case settings.telegramIDsRaw != "":
+			return fmt.Errorf("--telegram is not supported for %s", command)
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for %s", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		case settings.profileID != "":
+			return fmt.Errorf("--profile is not supported for %s", command)
+		}
+	case "telegram show", "telegram enable", "telegram disable", "telegram delete", "telegram test":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for %s", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		case settings.profileID != "":
+			return fmt.Errorf("--profile is not supported for %s", command)
+		case settings.region != "":
+			return fmt.Errorf("--region is not supported for %s", command)
+		case settings.specialty != "":
+			return fmt.Errorf("--specialty is not supported for %s", command)
+		case settings.clearTelegram:
+			return fmt.Errorf("--clear-telegram is not supported for %s", command)
+		}
+	case "telegram edit":
+		switch {
+		case hasAccountID:
+			return fmt.Errorf("--account is not supported for %s", command)
+		case hasUsername:
+			return fmt.Errorf("--username is not supported for %s", command)
+		case hasPasswordFile:
+			return fmt.Errorf("--password-file is not supported for %s", command)
+		case settings.passwordPrompt:
+			return fmt.Errorf("--password-prompt is not supported for %s", command)
+		case settings.noStoredPassword:
+			return fmt.Errorf("--no-stored-password is not supported for %s", command)
+		case hasMFACodeFile:
+			return fmt.Errorf("--mfa-code-file is not supported for %s", command)
+		case settings.forgetSecret:
+			return fmt.Errorf("--forget-secret is not supported for %s", command)
+		case settings.profileID != "":
+			return fmt.Errorf("--profile is not supported for %s", command)
+		case settings.clearTelegram:
+			return fmt.Errorf("--clear-telegram is not supported for %s", command)
+		}
 	}
 	return nil
 }
@@ -686,6 +828,20 @@ func checkObservationFlags(settings options) error {
 		unsupported = "--clear-start-date"
 	case settings.clearEndDate:
 		unsupported = "--clear-end-date"
+	case settings.telegramIDsRaw != "":
+		unsupported = "--telegram"
+	case settings.telegramName != "":
+		unsupported = "--name"
+	case settings.chatID != "":
+		unsupported = "--chat-id"
+	case settings.tokenFile != "":
+		unsupported = "--token-file"
+	case settings.tokenPrompt:
+		unsupported = "--token-prompt"
+	case settings.noStoredToken:
+		unsupported = "--no-stored-token"
+	case settings.clearTelegram:
+		unsupported = "--clear-telegram"
 	}
 	if unsupported != "" {
 		return fmt.Errorf("%s is not supported for check", unsupported)
@@ -742,6 +898,42 @@ func checkProfileFlagsForNonProfileCommands(command string, settings options) er
 	return nil
 }
 
+// checkTelegramFlagsForNonTelegramCommands rejects --telegram linking and
+// destination configuration flags for commands that do not consume them.
+// Telegram commands consume --telegram as a single id. Profile create and
+// edit consume --telegram as a comma-separated link list.
+func checkTelegramFlagsForNonTelegramCommands(command string, settings options) error {
+	isTelegram := strings.HasPrefix(command, "telegram ")
+	isProfileCreate := command == "profile create"
+	isProfileEdit := command == "profile edit"
+	if !isTelegram && !isProfileCreate && !isProfileEdit {
+		switch {
+		case settings.telegramIDsRaw != "":
+			return fmt.Errorf("--telegram is not supported for %s", command)
+		case settings.clearTelegram:
+			return fmt.Errorf("--clear-telegram is not supported for %s", command)
+		}
+	}
+	if isProfileCreate && settings.clearTelegram {
+		return fmt.Errorf("--clear-telegram is not supported for profile create")
+	}
+	if command != "telegram create" && command != "telegram edit" {
+		switch {
+		case settings.telegramName != "":
+			return fmt.Errorf("--name is not supported for %s", command)
+		case settings.chatID != "":
+			return fmt.Errorf("--chat-id is not supported for %s", command)
+		case settings.tokenFile != "":
+			return fmt.Errorf("--token-file is not supported for %s", command)
+		case settings.tokenPrompt:
+			return fmt.Errorf("--token-prompt is not supported for %s", command)
+		case settings.noStoredToken:
+			return fmt.Errorf("--no-stored-token is not supported for %s", command)
+		}
+	}
+	return nil
+}
+
 func splitCommand(raw []string) ([]string, []string) {
 	candidates := [][]string{
 		{"database", "initialize"},
@@ -761,6 +953,14 @@ func splitCommand(raw []string) ([]string, []string) {
 		{"profile", "enable"},
 		{"profile", "disable"},
 		{"profile", "delete"},
+		{"telegram", "create"},
+		{"telegram", "list"},
+		{"telegram", "show"},
+		{"telegram", "edit"},
+		{"telegram", "enable"},
+		{"telegram", "disable"},
+		{"telegram", "test"},
+		{"telegram", "delete"},
 		{"check"},
 		{"watch"},
 		{"version"},

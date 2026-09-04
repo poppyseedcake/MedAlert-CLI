@@ -46,6 +46,13 @@ func ServiceKey(accountID string) string {
 	return "account:" + accountID
 }
 
+// TelegramServiceKey derives the Secret Service entry for one Telegram
+// Destination id. The telegram: prefix keeps destination tokens separate from
+// account passwords even when ids collide.
+func TelegramServiceKey(destinationID string) string {
+	return "telegram:" + destinationID
+}
+
 // test seams (private, per product decisions)
 var (
 	isTerminalFunc   = term.IsTerminal
@@ -203,6 +210,55 @@ func PromptForPassword(prompt string, stdin *os.File, stderr io.Writer, nonInter
 	return value, nil
 }
 
+// SetTelegramToken saves a bot token to Secret Service. value never appears in errors.
+func SetTelegramToken(destinationID, value string) error {
+	if strings.TrimSpace(destinationID) == "" {
+		return errors.New("destination id is required for secret storage")
+	}
+	if value == "" {
+		return errors.New("secret value is empty")
+	}
+	if len(value) > maxSecretBytes {
+		return errors.New("secret value is too large")
+	}
+	if err := keyring.Set(ServiceName, TelegramServiceKey(destinationID), value); err != nil {
+		return fmt.Errorf("save telegram secret for %q: %w", destinationID, secretKind(err))
+	}
+	return nil
+}
+
+// GetTelegramToken reads a bot token from Secret Service. The value never appears in errors.
+func GetTelegramToken(destinationID string) (string, error) {
+	if strings.TrimSpace(destinationID) == "" {
+		return "", errors.New("destination id is required for secret lookup")
+	}
+	value, err := keyring.Get(ServiceName, TelegramServiceKey(destinationID))
+	if err != nil {
+		if errors.Is(err, keyring.ErrNotFound) {
+			return "", fmt.Errorf("secret for telegram destination %q: %w", destinationID, ErrSecretNotFound)
+		}
+		return "", fmt.Errorf("read telegram secret for %q: %w", destinationID, secretKind(err))
+	}
+	if value == "" {
+		return "", fmt.Errorf("secret for telegram destination %q: %w", destinationID, ErrSecretNotFound)
+	}
+	return value, nil
+}
+
+// DeleteTelegramToken removes a Secret Service entry. Missing entries are not an error.
+func DeleteTelegramToken(destinationID string) error {
+	if strings.TrimSpace(destinationID) == "" {
+		return errors.New("destination id is required for secret removal")
+	}
+	if err := keyring.Delete(ServiceName, TelegramServiceKey(destinationID)); err != nil {
+		if errors.Is(err, keyring.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("remove telegram secret for %q: %w", destinationID, secretKind(err))
+	}
+	return nil
+}
+
 // Resolve returns the password for an account without ever logging the value.
 // source is one of secret-service, file, prompt. ref is the file path for
 // file sources and is ignored otherwise. accountID scopes Secret Service keys.
@@ -216,5 +272,22 @@ func Resolve(source, ref, accountID string, stdin *os.File, stderr io.Writer, no
 		return PromptForPassword("Password: ", stdin, stderr, nonInteractive)
 	default:
 		return "", fmt.Errorf("unknown password source %q", source)
+	}
+}
+
+// ResolveTelegramToken returns the bot token for a destination without ever
+// logging the value. source is one of secret-service, file, prompt. ref is
+// the file path for file sources and is ignored otherwise. destinationID
+// scopes Secret Service keys.
+func ResolveTelegramToken(source, ref, destinationID string, stdin *os.File, stderr io.Writer, nonInteractive bool) (string, error) {
+	switch source {
+	case SourceFile:
+		return ReadSecretFile(ref)
+	case SourceSecretService:
+		return GetTelegramToken(destinationID)
+	case SourcePrompt:
+		return PromptForPassword("Telegram bot token: ", stdin, stderr, nonInteractive)
+	default:
+		return "", fmt.Errorf("unknown token source %q", source)
 	}
 }

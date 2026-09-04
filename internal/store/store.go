@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion = 4
+	CurrentSchemaVersion = 5
 	backupLimit          = 3
 )
 
@@ -369,6 +369,21 @@ func migrate(database *sql.DB) (err error) {
 		for _, statement := range statements {
 			if _, err = connection.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("apply schema migration 4: %w", err)
+			}
+		}
+	}
+	if fromVersion < 5 {
+		statements := []string{
+			"CREATE TABLE telegram_destinations (id TEXT PRIMARY KEY, name TEXT NOT NULL, chat_id TEXT NOT NULL, token_source TEXT NOT NULL CHECK(token_source IN ('secret-service','file','prompt')), token_ref TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)), last_test_at TEXT NOT NULL DEFAULT '', last_test_status TEXT NOT NULL DEFAULT '', last_test_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL) STRICT",
+			"CREATE TABLE profile_telegram_destinations (profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE, destination_id TEXT NOT NULL REFERENCES telegram_destinations(id) ON DELETE CASCADE, PRIMARY KEY (profile_id, destination_id)) STRICT",
+			"CREATE INDEX idx_profile_telegram_profile ON profile_telegram_destinations(profile_id)",
+			"CREATE INDEX idx_profile_telegram_destination ON profile_telegram_destinations(destination_id)",
+			"INSERT INTO schema_migrations (version, applied_at) VALUES (5, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+			"PRAGMA user_version = 5",
+		}
+		for _, statement := range statements {
+			if _, err = connection.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply schema migration 5: %w", err)
 			}
 		}
 	}
