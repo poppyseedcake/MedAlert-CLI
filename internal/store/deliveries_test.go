@@ -1,8 +1,10 @@
 package store_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,7 +131,7 @@ func TestDeliveryStatesUsePendingDeliveredRetryPermanentFailure(t *testing.T) {
 	if err != nil || restarted.Status != store.DeliveryPending || restarted.Attempts != 1 {
 		t.Fatalf("restarted read = %#v, %v", restarted, err)
 	}
-	delivered, err := storage.RecordDeliveryResult(claimed.ID, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: 42}, now)
+	delivered, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: 42}, now)
 	if err != nil {
 		t.Fatalf("record delivered: %v", err)
 	}
@@ -164,7 +166,7 @@ func TestDeliveryRetryBudgetAndRetryAfter(t *testing.T) {
 	due, _ := storage.ListDueDeliveries("retry", now)
 	claimed, _ := storage.BeginDeliveryAttempt(due[0].ID, now)
 	retryAfter := now.Add(31 * time.Second)
-	retried, err := storage.RecordDeliveryResult(claimed.ID, store.DeliveryResult{Status: store.DeliveryRetry, LastError: "temporary_failure: telegram is temporarily unavailable", NextAttempt: retryAfter, HasNextRetry: true}, now)
+	retried, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: "temporary_failure: telegram is temporarily unavailable", NextAttempt: retryAfter, HasNextRetry: true}, now)
 	if err != nil {
 		t.Fatalf("record retry: %v", err)
 	}
@@ -205,7 +207,7 @@ func TestDeliveryRetryBudgetAndRetryAfter(t *testing.T) {
 		if claimed.Attempts != attempt {
 			t.Fatalf("attempt %d count = %d", attempt, claimed.Attempts)
 		}
-		final, err := storage.RecordDeliveryResult(claimed.ID, store.DeliveryResult{Status: store.DeliveryRetry, LastError: "temporary"}, at)
+		final, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: "temporary"}, at)
 		if err != nil {
 			t.Fatalf("attempt %d record: %v", attempt, err)
 		}
@@ -351,6 +353,194 @@ func TestDeleteDestinationAndProfileRemoveDeliveries(t *testing.T) {
 	if err := storage.DeleteProfile("gone"); err != nil {
 		t.Fatalf("delete profile: %v", err)
 	}
+}
+
+func TestBeginHoldsLeaseExclusivelyAcrossProcesses(t *testing.T) {
+	storage := openDeliveryStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	mustDeliveryProfile(t, storage, "exclusive", "alice")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("exclusive", []string{"one"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	episode := mustDeliveryEpisode(t, storage, "exclusive", now)
+	if _, err := storage.EnsureEpisodeDeliveries("exclusive", episode.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	due, err := storage.ListDueDeliveries("exclusive", now)
+	if err != nil || len(due) != 1 {
+		t.Fatalf("due = %#v, %v, want one", due, err)
+	}
+	first, err := storage.BeginDeliveryAttempt(due[0].ID, now)
+	if err != nil {
+		t.Fatalf("first begin: %v", err)
+	}
+	if first.Attempts != 1 || strings.TrimSpace(first.NextAttemptAt) == "" {
+		t.Fatalf("first claim = %#v, want attempts=1 with lease", first)
+	}
+	// A concurrent process selecting the same row must not claim it while
+	// the lease is held: no attempt consumed, no second send.
+	if _, err := storage.BeginDeliveryAttempt(due[0].ID, now.Add(time.Second)); !errors.Is(err, store.ErrDeliveryNotDue) {
+		t.Fatalf("second begin error = %v, want ErrDeliveryNotDue", err)
+	}
+	after, err := storage.GetDelivery(due[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Attempts != 1 {
+		t.Fatalf("attempts after raced begin = %d, want 1", after.Attempts)
+	}
+	if held, err := storage.ListDueDeliveries("exclusive", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	} else if len(held) != 0 {
+		t.Fatalf("due while leased = %#v, want none", held)
+	}
+	// After the lease expires the row is due again for a later cycle.
+	if expired, err := storage.ListDueDeliveries("exclusive", now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	} else if len(expired) != 1 {
+		t.Fatalf("due after lease = %#v, want one", expired)
+	}
+}
+
+func TestRecordOnlyUpdatesItsOwnClaim(t *testing.T) {
+	storage := openDeliveryStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	mustDeliveryProfile(t, storage, "fenced", "alice")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("fenced", []string{"one"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	episode := mustDeliveryEpisode(t, storage, "fenced", now)
+	if _, err := storage.EnsureEpisodeDeliveries("fenced", episode.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	due, _ := storage.ListDueDeliveries("fenced", now)
+	claimed, err := storage.BeginDeliveryAttempt(due[0].ID, now)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	// A stale cancellation wins first: the later result must not revive it.
+	if _, err := storage.CancelDeliveriesForEndedEpisodes("fenced", []string{episode.ID}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: 7}, now.Add(2*time.Second)); !errors.Is(err, store.ErrDeliveryConflict) {
+		t.Fatalf("record after cancel error = %v, want ErrDeliveryConflict", err)
+	}
+	kept, err := storage.GetDelivery(claimed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.Status != store.DeliveryPermanentFailure || kept.MessageID != 0 {
+		t.Fatalf("revived stale delivery = %#v, want permanent_failure without message", kept)
+	}
+	// A second record with the same spent claim also conflicts instead of
+	// overwriting the winner.
+	due2, _ := storage.ListDueDeliveries("fenced", now)
+	if len(due2) != 0 {
+		t.Fatalf("stale row due = %#v, want none", due2)
+	}
+}
+
+func TestUnlinkedDestinationsAreNotNotified(t *testing.T) {
+	storage := openDeliveryStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	mustDeliveryProfile(t, storage, "unlinked", "alice")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(validDestination("two")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("unlinked", []string{"one", "two"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	episode := mustDeliveryEpisode(t, storage, "unlinked", now)
+	if _, err := storage.EnsureEpisodeDeliveries("unlinked", episode.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	// User explicitly removes the second destination: its pending work must
+	// stop being eligible even though the destination stays globally enabled.
+	if err := storage.SetProfileDestinations("unlinked", []string{"one"}); err != nil {
+		t.Fatal(err)
+	}
+	if linked, err := storage.IsDestinationLinked("unlinked", "two"); err != nil || linked {
+		t.Fatalf("linked(two) = %v, %v, want false", linked, err)
+	}
+	if linked, err := storage.IsDestinationLinked("unlinked", "one"); err != nil || !linked {
+		t.Fatalf("linked(one) = %v, %v, want true", linked, err)
+	}
+	due, err := storage.ListDueDeliveries("unlinked", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].DestinationID != "one" {
+		t.Fatalf("due after unlink = %#v, want only the still-linked destination", due)
+	}
+	// The authoritative claim rejects the unlinked row even if it is
+	// addressed directly.
+	var unlinkedID string
+	for _, delivery := range mustListDeliveries(t, storage, "unlinked") {
+		if delivery.DestinationID == "two" {
+			unlinkedID = delivery.ID
+		}
+	}
+	if unlinkedID == "" {
+		t.Fatal("unlinked delivery row missing")
+	}
+	if _, err := storage.BeginDeliveryAttempt(unlinkedID, now); !errors.Is(err, store.ErrDeliveryNotDue) {
+		t.Fatalf("begin unlinked error = %v, want ErrDeliveryNotDue", err)
+	}
+}
+
+func TestIsRetryDueUsesChronologicalLatestRun(t *testing.T) {
+	storage := openDeliveryStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	mustDeliveryProfile(t, storage, "chrono", "alice")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("chrono", []string{"one"}); err != nil {
+		t.Fatal(err)
+	}
+	// Same-second runs with variable fractional precision: lexical text
+	// ordering puts ".77Z" after the later ".777Z". The latest run must be
+	// chosen chronologically (by insertion), so a newer failed run keeps the
+	// interval backoff instead of bypassing it.
+	base := time.Date(2026, time.September, 4, 12, 0, 0, 770000000, time.UTC)
+	episode := mustDeliveryEpisode(t, storage, "chrono", base)
+	if _, err := storage.EnsureEpisodeDeliveries("chrono", episode.ID, base); err != nil {
+		t.Fatal(err)
+	}
+	later := base.Add(7 * time.Millisecond)
+	failing, err := storage.BeginObservationRun("chrono", later)
+	if err != nil {
+		t.Fatalf("begin failed run: %v", err)
+	}
+	if _, err := storage.FailObservationRun(failing.ID, store.ObservationRunFailed, "temporary_failure", "portal down", later); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := storage.IsRetryDue("chrono", later); err != nil {
+		t.Fatal(err)
+	} else if due {
+		t.Fatal("retry due with latest failed run in the same second, want false")
+	}
+}
+
+func mustListDeliveries(t *testing.T, storage *store.Store, profileID string) []store.Delivery {
+	t.Helper()
+	deliveries, err := storage.ListDeliveriesForProfile(profileID)
+	if err != nil {
+		t.Fatalf("list deliveries: %v", err)
+	}
+	return deliveries
 }
 
 func TestMigrateV5ToV6KeepsDestinations(t *testing.T) {

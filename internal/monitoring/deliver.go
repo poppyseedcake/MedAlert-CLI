@@ -167,17 +167,32 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 		// re-enable makes the row due again while the episode stays active.
 		return deliveryOutcome{skipped: true}, nil
 	}
+	if linked, err := storage.IsDestinationLinked(profile.ID, destination.ID); err != nil || !linked {
+		// Explicitly unlinked destinations are never notified, even for
+		// pending work created while they were linked. Relinking resumes
+		// them via Ensure while the episode stays active.
+		if err != nil {
+			return deliveryOutcome{}, err
+		}
+		return deliveryOutcome{skipped: true}, nil
+	}
 	claimed, err := storage.BeginDeliveryAttempt(pending.ID, now)
 	if err != nil {
-		if errors.Is(err, store.ErrDeliveryNotFound) || errors.Is(err, store.ErrDeliveryInvalid) {
+		if errors.Is(err, store.ErrDeliveryNotFound) || errors.Is(err, store.ErrDeliveryInvalid) || errors.Is(err, store.ErrDeliveryNotDue) {
+			// Lost race: claimed by a concurrent process holding the lease,
+			// backed off, stale, disabled, or unlinked after ListDue.
+			// No attempt consumed on the losing side.
 			return deliveryOutcome{skipped: true}, nil
 		}
 		return deliveryOutcome{}, err
 	}
 	token, err := resolveToken(destination)
 	if err != nil {
-		final, recordErr := storage.RecordDeliveryResult(claimed.ID, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortDeliveryMessage(err)}, now)
+		final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortDeliveryMessage(err)}, now)
 		if recordErr != nil {
+			if errors.Is(recordErr, store.ErrDeliveryConflict) {
+				return deliveryOutcome{skipped: true}, nil
+			}
 			return deliveryOutcome{}, recordErr
 		}
 		return deliveryOutcome{final: final}, nil
@@ -207,33 +222,48 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 					next.HasNextRetry = true
 					next.NextAttempt = now.Add(telegramErr.RetryAfter)
 				}
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, next, now)
+				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, next, now)
 				if recordErr != nil {
+					if errors.Is(recordErr, store.ErrDeliveryConflict) {
+						return deliveryOutcome{skipped: true}, nil
+					}
 					return deliveryOutcome{}, recordErr
 				}
 				return deliveryOutcome{final: final}, nil
 			case telegram.IsPermanent(err):
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortDeliveryMessage(err)}, now)
+				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortDeliveryMessage(err)}, now)
 				if recordErr != nil {
+					if errors.Is(recordErr, store.ErrDeliveryConflict) {
+						return deliveryOutcome{skipped: true}, nil
+					}
 					return deliveryOutcome{}, recordErr
 				}
 				return deliveryOutcome{final: final}, nil
 			default:
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, now)
+				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, now)
 				if recordErr != nil {
+					if errors.Is(recordErr, store.ErrDeliveryConflict) {
+						return deliveryOutcome{skipped: true}, nil
+					}
 					return deliveryOutcome{}, recordErr
 				}
 				return deliveryOutcome{final: final}, nil
 			}
 		}
-		final, recordErr := storage.RecordDeliveryResult(claimed.ID, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, now)
+		final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, now)
 		if recordErr != nil {
+			if errors.Is(recordErr, store.ErrDeliveryConflict) {
+				return deliveryOutcome{skipped: true}, nil
+			}
 			return deliveryOutcome{}, recordErr
 		}
 		return deliveryOutcome{final: final}, nil
 	}
-	final, err := storage.RecordDeliveryResult(claimed.ID, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: result.MessageID}, now)
+	final, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: result.MessageID}, now)
 	if err != nil {
+		if errors.Is(err, store.ErrDeliveryConflict) {
+			return deliveryOutcome{skipped: true}, nil
+		}
 		return deliveryOutcome{}, err
 	}
 	return deliveryOutcome{final: final}, nil

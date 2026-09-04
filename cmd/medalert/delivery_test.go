@@ -544,6 +544,48 @@ func TestDeliveryPermanentFailureIsVisible(t *testing.T) {
 	}
 }
 
+func TestDeliverySkipsUnlinkedDestination(t *testing.T) {
+	medicoverFake, medicoverCleanup := newDurableCheckFake(t)
+	defer medicoverCleanup()
+	medicoverFake.setSlots(durableSlot("booking-unlink"))
+	telegramFake := newDeliveryTelegramFake()
+	telegramFake.setMode("temporary", 0)
+	telegramServer := httptest.NewServer(telegramFake.handler())
+	defer telegramServer.Close()
+
+	root := t.TempDir()
+	database, environment, _ := createDeliveryFixture(t, medicoverFake.baseURL, telegramServer.URL, root, 30)
+
+	// Both destinations fail once and stay retryable.
+	first := runDeliveryCheck(t, environment)
+	if first.exitCode != 0 {
+		t.Fatalf("first check = %#v", first)
+	}
+	if got := telegramFake.requestCount(); got != 2 {
+		t.Fatalf("requests after temporary = %d, want 2", got)
+	}
+	// User explicitly removes one destination: its pending work must never
+	// send, even though the destination stays globally enabled.
+	unlinked := run(t, environment, "profile", "edit", "--profile", "morning", "--telegram", "phone", "--non-interactive")
+	if unlinked.exitCode != 0 {
+		t.Fatalf("unlink backup = %#v", unlinked)
+	}
+	telegramFake.setMode("success", 0)
+	second := runDeliveryCheck(t, environment)
+	if second.exitCode != 0 {
+		t.Fatalf("second check = %#v", second)
+	}
+	if got := telegramFake.requestCount(); got != 3 {
+		t.Fatalf("requests after unlink retry = %d, want 3 (only still-linked sends)", got)
+	}
+	if got := deliveryQuery(t, database, "SELECT count(*) FROM telegram_deliveries WHERE status = 'delivered'"); got != "1" {
+		t.Fatalf("delivered = %s, want 1", got)
+	}
+	if got := deliveryQuery(t, database, "SELECT status FROM telegram_deliveries WHERE destination_id = 'backup'"); got != "retry" {
+		t.Fatalf("unlinked status = %s, want retry left pending without sending", got)
+	}
+}
+
 func TestDeliveryRetriesUnknownThenSends(t *testing.T) {
 	medicoverFake, medicoverCleanup := newDurableCheckFake(t)
 	defer medicoverCleanup()

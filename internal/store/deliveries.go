@@ -47,6 +47,13 @@ const (
 	// is no longer available. It uses permanent_failure because the allowed
 	// states have no separate cancelled value.
 	staleDeliveryMessage = "slot is no longer available"
+
+	// deliveryClaimLease makes a claim exclusive across processes. Begin sets
+	// next_attempt_at to now+lease, so a concurrent ListDue will not select
+	// the same row until the lease expires. The lease comfortably covers the
+	// Telegram timeouts (15s transport, 30s delivery context); a crash
+	// recovers at most a lease later, still at-least-once.
+	deliveryClaimLease = 2 * time.Minute
 )
 
 var (
@@ -54,6 +61,16 @@ var (
 	ErrDeliveryNotFound = errors.New("telegram delivery not found")
 	// ErrDeliveryInvalid is returned for invalid delivery input.
 	ErrDeliveryInvalid = errors.New("invalid telegram delivery input")
+	// ErrDeliveryNotDue is returned when a delivery is no longer claimable:
+	// already handled, budget exhausted, backoff not reached, episode
+	// inactive, destination disabled or unlinked, or claimed by another
+	// process holding the lease. Callers skip without consuming an attempt.
+	ErrDeliveryNotDue = errors.New("telegram delivery is not due")
+	// ErrDeliveryConflict is returned when a confirmed result cannot update
+	// its claim because another process claimed again or a stale
+	// cancellation won first. Callers keep the winner's state and skip
+	// without overwriting it.
+	ErrDeliveryConflict = errors.New("telegram delivery claim lost")
 )
 
 // Delivery records one durable Telegram notification for one episode and one
@@ -212,8 +229,9 @@ func (s *Store) ListDeliveriesForProfile(profileID string) ([]Delivery, error) {
 
 // ListDueDeliveries returns pending and retry deliveries ready for an attempt:
 // attempts below the budget, next_attempt_at reached, episode still active,
-// and destination still enabled. Disabled destinations stay pending for a
-// later re-enable without consuming attempts.
+// destination still enabled, and destination still linked to the profile.
+// Disabled or unlinked destinations stay pending without consuming attempts,
+// so a later re-enable or relink resumes them while the episode stays active.
 //
 // next_attempt_at is compared in Go, not SQL: RFC3339Nano trims trailing
 // zeros, so lexicographic SQL comparison misorders same-second timestamps
@@ -225,7 +243,7 @@ func (s *Store) ListDueDeliveries(profileID string, now time.Time) ([]Delivery, 
 		return nil, fmt.Errorf("%w: profile id %q", ErrDeliveryInvalid, profileID)
 	}
 	now = deliveryTime(now)
-	rows, err := s.db.Query(`SELECT t.id, t.profile_id, t.episode_id, t.destination_id, t.status, t.attempts, t.next_attempt_at, t.last_error, t.created_at, t.updated_at, t.delivered_at, t.message_id FROM telegram_deliveries t JOIN availability_episodes e ON e.id = t.episode_id JOIN telegram_destinations d ON d.id = t.destination_id WHERE t.profile_id = ? AND t.status IN ('pending', 'retry') AND t.attempts < ? AND e.active = 1 AND d.enabled = 1 ORDER BY t.created_at, t.id`, profileID, MaxDeliveryAttempts)
+	rows, err := s.db.Query(`SELECT t.id, t.profile_id, t.episode_id, t.destination_id, t.status, t.attempts, t.next_attempt_at, t.last_error, t.created_at, t.updated_at, t.delivered_at, t.message_id FROM telegram_deliveries t JOIN availability_episodes e ON e.id = t.episode_id JOIN telegram_destinations d ON d.id = t.destination_id JOIN profile_telegram_destinations l ON l.profile_id = t.profile_id AND l.destination_id = t.destination_id WHERE t.profile_id = ? AND t.status IN ('pending', 'retry') AND t.attempts < ? AND e.active = 1 AND d.enabled = 1 ORDER BY t.created_at, t.id`, profileID, MaxDeliveryAttempts)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
 			return []Delivery{}, nil
@@ -256,6 +274,28 @@ func (s *Store) ListDueDeliveries(profileID string, now time.Time) ([]Delivery, 
 		return nil, fmt.Errorf("list due telegram deliveries: %w", err)
 	}
 	return result, nil
+}
+
+// IsDestinationLinked reports whether a destination is still linked to a
+// profile. Unlinked destinations pause without consuming attempts; monitoring
+// re-checks this right before each send so an explicitly removed destination
+// is never notified.
+func (s *Store) IsDestinationLinked(profileID, destinationID string) (bool, error) {
+	if !profileIDPattern.MatchString(profileID) {
+		return false, fmt.Errorf("%w: profile id %q", ErrDeliveryInvalid, profileID)
+	}
+	if !destinationIDPattern.MatchString(destinationID) {
+		return false, fmt.Errorf("%w: destination id %q", ErrDeliveryInvalid, destinationID)
+	}
+	var count int
+	err := s.db.QueryRow(`SELECT count(*) FROM profile_telegram_destinations WHERE profile_id = ? AND destination_id = ?`, profileID, destinationID).Scan(&count)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return false, nil
+		}
+		return false, fmt.Errorf("check telegram destination link: %w", err)
+	}
+	return count > 0, nil
 }
 
 // GetDelivery returns one delivery by id.
@@ -307,8 +347,14 @@ func (s *Store) IsRetryDue(profileID string, now time.Time) (bool, error) {
 	if len(due) == 0 {
 		return false, nil
 	}
+	// Order by rowid, not started_at text: RFC3339Nano trims trailing zeros,
+	// so lexical ordering misorders same-second runs (".77Z" sorts after the
+	// later ".777Z"). rowid grows with insertion, which matches the order
+	// runs became visible, so the latest attempt is chosen chronologically.
+	// Picking a stale complete run over a newer failed run would bypass the
+	// profile interval and hammer Medicover; the reverse would delay a retry.
 	var status string
-	err = s.db.QueryRow(`SELECT status FROM observation_runs WHERE profile_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, profileID).Scan(&status)
+	err = s.db.QueryRow(`SELECT status FROM observation_runs WHERE profile_id = ? ORDER BY rowid DESC LIMIT 1`, profileID).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -321,14 +367,22 @@ func (s *Store) IsRetryDue(profileID string, now time.Time) (bool, error) {
 	return status == ObservationRunComplete, nil
 }
 
-// BeginDeliveryAttempt saves the pending state before a Telegram call and
-// consumes one of the five attempts. Callers must save this before calling
-// Telegram so a crash between the two writes retries later (at-least-once).
+// BeginDeliveryAttempt exclusively claims one due delivery before a Telegram
+// call and consumes one of the five attempts. The claim sets next_attempt_at
+// to now+lease, so a concurrent check or watch selecting due rows will not
+// see it until the lease expires. Preconditions (due backoff, active
+// episode, enabled and still-linked destination) are re-verified inside the
+// same immediate transaction, closing the ListDue-to-claim race including
+// explicit unlink removals. Callers must save this before calling Telegram
+// so a crash between the two writes retries later (at-least-once); a lost
+// race returns ErrDeliveryNotDue and consumes no attempt.
 func (s *Store) BeginDeliveryAttempt(id string, now time.Time) (Delivery, error) {
 	if strings.TrimSpace(id) == "" {
 		return Delivery{}, fmt.Errorf("%w: delivery id is required", ErrDeliveryInvalid)
 	}
-	stamp := deliveryTime(now).Format(time.RFC3339Nano)
+	now = deliveryTime(now)
+	stamp := now.Format(time.RFC3339Nano)
+	lease := now.Add(deliveryClaimLease).Format(time.RFC3339Nano)
 	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -352,20 +406,65 @@ func (s *Store) BeginDeliveryAttempt(id string, now time.Time) (Delivery, error)
 		return Delivery{}, fmt.Errorf("begin telegram delivery: %w", err)
 	}
 	if delivery.Status != DeliveryPending && delivery.Status != DeliveryRetry {
-		return Delivery{}, fmt.Errorf("%w: delivery %s is %s", ErrDeliveryInvalid, id, delivery.Status)
+		return Delivery{}, fmt.Errorf("%w: delivery %s is %s", ErrDeliveryNotDue, id, delivery.Status)
 	}
 	if delivery.Attempts >= MaxDeliveryAttempts {
-		return Delivery{}, fmt.Errorf("%w: delivery %s exhausted its attempts", ErrDeliveryInvalid, id)
+		return Delivery{}, fmt.Errorf("%w: delivery %s exhausted its attempts", ErrDeliveryNotDue, id)
 	}
-	if _, err := conn.ExecContext(ctx, `UPDATE telegram_deliveries SET status = ?, attempts = ?, updated_at = ? WHERE id = ?`, DeliveryPending, delivery.Attempts+1, stamp, id); err != nil {
+	if strings.TrimSpace(delivery.NextAttemptAt) != "" {
+		if next, err := time.Parse(time.RFC3339Nano, delivery.NextAttemptAt); err == nil && next.After(now) {
+			return Delivery{}, fmt.Errorf("%w: delivery %s backs off until %s", ErrDeliveryNotDue, id, delivery.NextAttemptAt)
+		}
+	}
+	var active int
+	if err := conn.QueryRowContext(ctx, `SELECT active FROM availability_episodes WHERE id = ?`, delivery.EpisodeID).Scan(&active); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Delivery{}, fmt.Errorf("%w: delivery %s lost its episode", ErrDeliveryNotDue, id)
+		}
 		return Delivery{}, fmt.Errorf("begin telegram delivery: %w", err)
+	}
+	if active != 1 {
+		return Delivery{}, fmt.Errorf("%w: delivery %s is stale", ErrDeliveryNotDue, id)
+	}
+	var enabled int
+	if err := conn.QueryRowContext(ctx, `SELECT enabled FROM telegram_destinations WHERE id = ?`, delivery.DestinationID).Scan(&enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Delivery{}, fmt.Errorf("%w: delivery %s lost its destination", ErrDeliveryNotDue, id)
+		}
+		return Delivery{}, fmt.Errorf("begin telegram delivery: %w", err)
+	}
+	if enabled != 1 {
+		return Delivery{}, fmt.Errorf("%w: delivery %s destination is disabled", ErrDeliveryNotDue, id)
+	}
+	var links int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM profile_telegram_destinations WHERE profile_id = ? AND destination_id = ?`, delivery.ProfileID, delivery.DestinationID).Scan(&links); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return Delivery{}, fmt.Errorf("%w: delivery %s lost its link", ErrDeliveryNotDue, id)
+		}
+		return Delivery{}, fmt.Errorf("begin telegram delivery: %w", err)
+	}
+	if links == 0 {
+		return Delivery{}, fmt.Errorf("%w: delivery %s destination was unlinked", ErrDeliveryNotDue, id)
+	}
+	oldStatus, oldAttempts, oldUpdated := delivery.Status, delivery.Attempts, delivery.UpdatedAt
+	result, err := conn.ExecContext(ctx, `UPDATE telegram_deliveries SET status = ?, attempts = ?, next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = ? AND attempts = ? AND updated_at = ?`, DeliveryPending, oldAttempts+1, lease, stamp, id, oldStatus, oldAttempts, oldUpdated)
+	if err != nil {
+		return Delivery{}, fmt.Errorf("begin telegram delivery: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Delivery{}, fmt.Errorf("begin telegram delivery: %w", err)
+	}
+	if affected == 0 {
+		return Delivery{}, fmt.Errorf("%w: delivery %s claimed concurrently", ErrDeliveryNotDue, id)
 	}
 	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return Delivery{}, fmt.Errorf("begin telegram delivery: %w", err)
 	}
 	committed = true
 	delivery.Status = DeliveryPending
-	delivery.Attempts++
+	delivery.Attempts = oldAttempts + 1
+	delivery.NextAttemptAt = lease
 	delivery.UpdatedAt = stamp
 	return delivery, nil
 }
@@ -379,12 +478,17 @@ type DeliveryResult struct {
 	HasNextRetry bool
 }
 
-// RecordDeliveryResult saves the confirmed result after a Telegram call.
+// RecordDeliveryResult saves the confirmed result after a Telegram call, but
+// only for the claim that produced it. claimed must be the Begin return for
+// this attempt; the update fences on (status, attempts, updated_at) so a
+// concurrent second claim or an ended-episode cancellation that won first is
+// never overwritten and stale state is never revived. A lost fence returns
+// the winner's current row with ErrDeliveryConflict for the caller to skip.
 // status is one of delivered, retry, or permanent_failure. Retry with an
 // exhausted budget becomes permanent_failure so history stays terminal.
 // lastError must never contain the bot token; callers pass the sanitized
 // Telegram error message.
-func (s *Store) RecordDeliveryResult(id string, result DeliveryResult, now time.Time) (Delivery, error) {
+func (s *Store) RecordDeliveryResult(id string, claimed Delivery, result DeliveryResult, now time.Time) (Delivery, error) {
 	if strings.TrimSpace(id) == "" {
 		return Delivery{}, fmt.Errorf("%w: delivery id is required", ErrDeliveryInvalid)
 	}
@@ -393,11 +497,15 @@ func (s *Store) RecordDeliveryResult(id string, result DeliveryResult, now time.
 	default:
 		return Delivery{}, fmt.Errorf("%w: status %q", ErrDeliveryInvalid, result.Status)
 	}
+	if strings.TrimSpace(claimed.ID) == "" || claimed.ID != id {
+		return Delivery{}, fmt.Errorf("%w: claim mismatch for delivery %s", ErrDeliveryInvalid, id)
+	}
 	message := strings.TrimSpace(result.LastError)
 	if len(message) > 2048 {
 		message = message[:2048]
 	}
-	stamp := deliveryTime(now).Format(time.RFC3339Nano)
+	now = deliveryTime(now)
+	stamp := now.Format(time.RFC3339Nano)
 	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -419,6 +527,9 @@ func (s *Store) RecordDeliveryResult(id string, result DeliveryResult, now time.
 			return Delivery{}, fmt.Errorf("%w: %s", ErrDeliveryNotFound, id)
 		}
 		return Delivery{}, fmt.Errorf("record telegram delivery: %w", err)
+	}
+	if current.Status != DeliveryPending || current.Attempts != claimed.Attempts || current.UpdatedAt != claimed.UpdatedAt {
+		return current, fmt.Errorf("%w: delivery %s", ErrDeliveryConflict, id)
 	}
 	finalStatus := result.Status
 	var nextAttemptAt string
@@ -443,14 +554,28 @@ func (s *Store) RecordDeliveryResult(id string, result DeliveryResult, now time.
 			nextAttemptAt = result.NextAttempt.UTC().Format(time.RFC3339Nano)
 		} else {
 			// No backoff requested: retry on the next monitoring cycle.
+			// Use the confirmation time (not the claim time) so the row is
+			// immediately due; ListDue parses it chronologically.
 			nextAttemptAt = stamp
 		}
 	}
 	if finalStatus == DeliveryPermanentFailure && message == "" {
 		message = "telegram delivery failed"
 	}
-	if _, err := conn.ExecContext(ctx, `UPDATE telegram_deliveries SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?, delivered_at = ?, message_id = ? WHERE id = ?`, finalStatus, nextAttemptAt, message, stamp, deliveredAt, messageID, id); err != nil {
+	fenced, err := conn.ExecContext(ctx, `UPDATE telegram_deliveries SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?, delivered_at = ?, message_id = ? WHERE id = ? AND status = ? AND attempts = ? AND updated_at = ?`, finalStatus, nextAttemptAt, message, stamp, deliveredAt, messageID, id, DeliveryPending, claimed.Attempts, claimed.UpdatedAt)
+	if err != nil {
 		return Delivery{}, fmt.Errorf("record telegram delivery: %w", err)
+	}
+	affected, err := fenced.RowsAffected()
+	if err != nil {
+		return Delivery{}, fmt.Errorf("record telegram delivery: %w", err)
+	}
+	if affected == 0 {
+		fresh, freshErr := scanDelivery(conn.QueryRowContext(ctx, `SELECT id, profile_id, episode_id, destination_id, status, attempts, next_attempt_at, last_error, created_at, updated_at, delivered_at, message_id FROM telegram_deliveries WHERE id = ?`, id))
+		if freshErr != nil {
+			return current, fmt.Errorf("%w: delivery %s", ErrDeliveryConflict, id)
+		}
+		return fresh, fmt.Errorf("%w: delivery %s", ErrDeliveryConflict, id)
 	}
 	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return Delivery{}, fmt.Errorf("record telegram delivery: %w", err)
