@@ -382,7 +382,24 @@ func (s *Store) DeleteProfile(id string) error {
 	// Delete known history and link tables when they exist. Older databases
 	// (schema 3 without later tables) simply skip the missing tables so the
 	// profile delete still succeeds.
-	for _, table := range []string{"observation_runs", "availability_episodes", "telegram_deliveries", "operational_incidents", "profile_telegram_destinations"} {
+	for _, table := range []string{"observation_runs", "availability_episodes", "telegram_deliveries", "profile_telegram_destinations"} {
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE profile_id = ?`, table), id); err != nil {
+			if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+				return fmt.Errorf("delete profile history: %w", err)
+			}
+		}
+	}
+	// Operational incidents reference profiles without a foreign key, and
+	// their deliveries reference incidents. Delete deliveries first so no
+	// orphaned notification rows remain when constraints are off.
+	if _, err := tx.Exec(`DELETE FROM operational_deliveries WHERE incident_id IN (SELECT id FROM operational_incidents WHERE profile_id = ?)`, id); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("delete profile history: %w", err)
+		}
+	}
+	// Destination-scope incidents for this profile also carry profile_id, so
+	// one delete covers profile and destination scopes.
+	for _, table := range []string{"operational_incidents"} {
 		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE profile_id = ?`, table), id); err != nil {
 			if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 				return fmt.Errorf("delete profile history: %w", err)

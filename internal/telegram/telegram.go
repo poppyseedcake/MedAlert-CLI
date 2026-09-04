@@ -119,6 +119,18 @@ type Availability struct {
 	VisitType string
 }
 
+// OperationalProblem carries the display fields for one Polish operational
+// failure or recovery message. All fields are display data only; secrets
+// never enter this struct.
+type OperationalProblem struct {
+	Scope       string
+	Account     string
+	Profile     string
+	Destination string
+	Code        string
+	Message     string
+}
+
 // FormatTestMessage builds a safe Polish test message. It never contains the
 // bot token.
 func FormatTestMessage(destinationName string) string {
@@ -148,6 +160,60 @@ func FormatAvailability(availability Availability) string {
 	fmt.Fprintf(&builder, "Specjalizacja: %s\n", value(availability.Specialty))
 	fmt.Fprintf(&builder, "Placówka: %s\n", value(availability.Clinic))
 	fmt.Fprintf(&builder, "Typ wizyty: %s", value(availability.VisitType))
+	return builder.String()
+}
+
+// FormatOperationalFailure builds a Polish operational failure message. It
+// always shows the scope, account/profile/destination context, error code,
+// and safe error summary so operators can act without opening history.
+func FormatOperationalFailure(problem OperationalProblem) string {
+	value := func(raw string) string {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return "—"
+		}
+		return trimmed
+	}
+	var builder strings.Builder
+	builder.WriteString("MedAlert: Problem z monitorowaniem\n")
+	fmt.Fprintf(&builder, "Zakres: %s\n", value(problem.Scope))
+	if strings.TrimSpace(problem.Account) != "" {
+		fmt.Fprintf(&builder, "Konto: %s\n", value(problem.Account))
+	}
+	if strings.TrimSpace(problem.Profile) != "" {
+		fmt.Fprintf(&builder, "Profil: %s\n", value(problem.Profile))
+	}
+	if strings.TrimSpace(problem.Destination) != "" {
+		fmt.Fprintf(&builder, "Cel: %s\n", value(problem.Destination))
+	}
+	fmt.Fprintf(&builder, "Błąd: %s\n", value(problem.Code))
+	fmt.Fprintf(&builder, "Opis: %s", value(problem.Message))
+	return builder.String()
+}
+
+// FormatOperationalRecovery builds a Polish recovery message sent once after
+// the related operational incident ends.
+func FormatOperationalRecovery(problem OperationalProblem) string {
+	value := func(raw string) string {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return "—"
+		}
+		return trimmed
+	}
+	var builder strings.Builder
+	builder.WriteString("MedAlert: Monitorowanie wznowione\n")
+	fmt.Fprintf(&builder, "Zakres: %s\n", value(problem.Scope))
+	if strings.TrimSpace(problem.Account) != "" {
+		fmt.Fprintf(&builder, "Konto: %s\n", value(problem.Account))
+	}
+	if strings.TrimSpace(problem.Profile) != "" {
+		fmt.Fprintf(&builder, "Profil: %s\n", value(problem.Profile))
+	}
+	if strings.TrimSpace(problem.Destination) != "" {
+		fmt.Fprintf(&builder, "Cel: %s\n", value(problem.Destination))
+	}
+	fmt.Fprintf(&builder, "Opis: %s", value("Monitorowanie działa ponownie."))
 	return builder.String()
 }
 
@@ -256,11 +322,11 @@ func classifyTransportError(ctx context.Context, err error, diagnostic string) *
 }
 
 type telegramResponse struct {
-	OK          *bool `json:"ok"`
-	Result      *struct {
+	OK     *bool `json:"ok"`
+	Result *struct {
 		MessageID int64 `json:"message_id"`
 	} `json:"result"`
-	ErrorCode   *int `json:"error_code"`
+	ErrorCode   *int   `json:"error_code"`
 	Description string `json:"description"`
 	Parameters  *struct {
 		RetryAfter *int `json:"retry_after"`
