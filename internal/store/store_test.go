@@ -29,6 +29,46 @@ func TestInitializeCreatesPrivateCurrentDatabase(t *testing.T) {
 	assertMode(t, filepath.Join(filepath.Dir(databasePath), "backups"), 0o700)
 }
 
+func TestInspectWaitsForConcurrentWriter(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(databasePath); err != nil {
+		t.Fatal(err)
+	}
+
+	lockDB := openDatabase(t, databasePath)
+	defer lockDB.Close()
+	if _, err := lockDB.Exec("BEGIN EXCLUSIVE"); err != nil {
+		t.Fatalf("begin exclusive lock: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := store.Inspect(databasePath)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("Inspect returned while database was locked: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if _, err := lockDB.Exec("COMMIT"); err != nil {
+		t.Fatalf("release exclusive lock: %v", err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Inspect after lock release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Inspect did not finish after lock release")
+	}
+}
+
 func TestInitializeMigratesWithBackupAndKeepsThreeNewest(t *testing.T) {
 	root := t.TempDir()
 	databasePath := filepath.Join(root, "medalert.db")

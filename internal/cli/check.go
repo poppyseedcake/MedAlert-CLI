@@ -35,6 +35,12 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
+	// Automatic history retention: old terminal records are removed on every
+	// durable check according to the saved policy. Dry runs never touch
+	// durable state, so they skip pruning as well.
+	if !settings.dry {
+		pruneHistoryBestEffort(storage)
+	}
 	profile, err := storage.GetProfile(id)
 	if err != nil {
 		return reportProfileError(stderr, command, err, jsonOutput)

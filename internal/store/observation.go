@@ -547,6 +547,15 @@ func validFailedRunStatus(status string) bool {
 	}
 }
 
+func validObservationRunStatus(status string) bool {
+	switch status {
+	case ObservationRunRunning, ObservationRunComplete, ObservationRunFailed, ObservationRunPartial, ObservationRunCancelled, ObservationRunConflicting, ObservationRunStale:
+		return true
+	default:
+		return false
+	}
+}
+
 func boolInt(value bool) int {
 	if value {
 		return 1

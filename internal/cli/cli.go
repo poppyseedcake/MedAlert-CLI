@@ -69,6 +69,15 @@ type options struct {
 	noStoredToken    bool
 	telegramBaseURL  string
 	clearTelegram    bool
+	// History inspection. historyLimitRaw caps list output; historyStatus
+	// filters by record status; historyScope filters incidents by scope;
+	// historyIncidentID selects incident deliveries; retentionDaysRaw sets
+	// the saved retention policy for history retention.
+	historyLimitRaw    string
+	historyStatus      string
+	historyScope       string
+	historyIncidentID  string
+	retentionDaysRaw   string
 }
 
 type errorBody struct {
@@ -117,22 +126,10 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 		}
 		return 0
 	case "doctor":
-		if len(settings.positionals) > 0 {
-			writeError(stderr, commandName, "invalid_arguments", "too many arguments for doctor", settings.output == "json")
-			return 2
+		if settings.sessionDir == "" {
+			settings.sessionDir = strings.TrimSpace(getenv("MEDALERT_SESSION_DIR"))
 		}
-		status, inspectErr := store.Inspect(settings.database)
-		if inspectErr != nil {
-			return reportStoreError(stderr, commandName, inspectErr, settings.output == "json")
-		}
-		if settings.output == "json" {
-			writeResult(stdout, "doctor", status)
-		} else if status.MigrationRequired {
-			fmt.Fprintf(stdout, "Database migration to schema %d is required.\n", status.RequiredVersion)
-		} else {
-			fmt.Fprintf(stdout, "Database schema %d is supported.\n", status.SchemaVersion)
-		}
-		return 0
+		return runDoctor(commandName, settings, stdout, stderr)
 	case "database initialize":
 		if len(settings.positionals) > 0 {
 			writeError(stderr, commandName, "invalid_arguments", "too many arguments for database initialize", settings.output == "json")
@@ -183,6 +180,13 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 			settings.medicoverBaseURL = strings.TrimSpace(getenv("MEDALERT_MEDICOVER_BASE_URL"))
 		}
 		return runWatch(commandName, settings, stdin, stdout, stderr)
+	case "history runs", "history episodes", "history incidents", "history deliveries", "history incident-deliveries", "history status", "history retention", "history prune", "history":
+		if settings.sessionDir == "" {
+			settings.sessionDir = strings.TrimSpace(getenv("MEDALERT_SESSION_DIR"))
+		}
+		return runHistory(commandName, settings, stdin, stdout, stderr)
+	case "completion":
+		return runCompletion(commandName, settings, stdout, stderr)
 	default:
 		writeError(stderr, commandName, "invalid_arguments", "a supported command is required", settings.output == "json")
 		return 2
@@ -223,7 +227,9 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 			"--check-interval-minutes", "--check-interval", "--interval-minutes", "--interval",
 			"--max-iterations", "--max_iterations", "--poll-interval", "--poll_interval",
 			"--telegram", "--destination", "--destinations", "--telegram-destination", "--telegram-destinations",
-			"--name", "--chat-id", "--chat_id", "--chat", "--token-file", "--token_file", "--telegram-base-url":
+			"--name", "--chat-id", "--chat_id", "--chat", "--token-file", "--token_file", "--telegram-base-url",
+			"--limit", "--history-limit", "--status", "--history-status", "--scope", "--history-scope",
+			"--incident", "--history-incident", "--incident-id", "--retention-days", "--retention_days":
 			if index+1 >= len(arguments) {
 				return settings, fmt.Errorf("%s needs a value", argument)
 			}
@@ -346,6 +352,31 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 					return settings, fmt.Errorf("--telegram-base-url needs a non-empty value")
 				}
 				settings.telegramBaseURL = value
+			case "--limit", "--history-limit":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.historyLimitRaw = value
+			case "--status", "--history-status":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.historyStatus = value
+			case "--scope", "--history-scope":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.historyScope = value
+			case "--incident", "--history-incident", "--incident-id":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.historyIncidentID = value
+			case "--retention-days", "--retention_days":
+				if strings.TrimSpace(value) == "" {
+					return settings, fmt.Errorf("%s needs a non-empty value", argument)
+				}
+				settings.retentionDaysRaw = value
 			}
 		case "--password-prompt":
 			settings.passwordPrompt = true
@@ -392,6 +423,11 @@ func parse(arguments []string, getenv func(string) string) (options, error) {
 	if settings.output != "text" && settings.output != "json" {
 		return settings, fmt.Errorf("output must be text or json")
 	}
+	// Completion is offline and static: it works without a database so shell
+	// setup never needs state directories.
+	if len(settings.command) == 1 && settings.command[0] == "completion" {
+		return settings, nil
+	}
 	if settings.database == "" {
 		return settings, errors.New("database path is empty")
 	}
@@ -420,6 +456,20 @@ func checkCommandFlags(command string, settings options) error {
 	}
 	if command == "watch" {
 		return checkWatchFlags(settings)
+	}
+	if command == "history" || strings.HasPrefix(command, "history ") {
+		return checkHistoryFlags(command, settings)
+	}
+	if command == "completion" {
+		return checkCompletionFlags(command, settings)
+	}
+	if command == "doctor" {
+		if err := checkDoctorFlags(command, settings); err != nil {
+			return err
+		}
+	}
+	if err := checkHistoryFlagsForNonHistoryCommands(command, settings); err != nil {
+		return err
 	}
 	hasAccountID := settings.accountID != ""
 	hasUsername := settings.username != ""
@@ -963,10 +1013,20 @@ func splitCommand(raw []string) ([]string, []string) {
 		{"telegram", "disable"},
 		{"telegram", "test"},
 		{"telegram", "delete"},
+		{"history", "runs"},
+		{"history", "episodes"},
+		{"history", "incidents"},
+		{"history", "deliveries"},
+		{"history", "incident-deliveries"},
+		{"history", "status"},
+		{"history", "retention"},
+		{"history", "prune"},
 		{"check"},
 		{"watch"},
+		{"history"},
 		{"version"},
 		{"doctor"},
+		{"completion"},
 	}
 	for _, candidate := range candidates {
 		if len(raw) >= len(candidate) {

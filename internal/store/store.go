@@ -211,7 +211,10 @@ func openDatabase(path string, readOnly bool) (*sql.DB, error) {
 	if readOnly {
 		mode = "ro"
 	}
-	location := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=" + mode}
+	// Set the busy timeout in the DSN so it is active before the first Ping.
+	// Inspect opens a read-only connection and Ping itself can wait for a
+	// concurrent writer; setting the pragma after Ping is too late.
+	location := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=" + mode + "&_busy_timeout=5000"}
 	database, err := sql.Open("sqlite", location.String())
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)

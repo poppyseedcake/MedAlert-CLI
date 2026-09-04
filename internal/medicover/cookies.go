@@ -1,6 +1,7 @@
 package medicover
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -55,11 +56,14 @@ func parseRequestURL(raw string) (requestTarget, error) {
 	if err != nil {
 		return requestTarget{}, err
 	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return requestTarget{}, errors.New("request URL needs scheme and host")
+	}
 	path := parsed.Path
 	if path == "" {
 		path = "/"
 	}
-	return requestTarget{scheme: parsed.Scheme, host: parsed.Host, path: path}, nil
+	return requestTarget{scheme: parsed.Scheme, host: parsed.Hostname(), path: path}, nil
 }
 
 func domainMatches(requestHost, cookieDomain string) bool {
@@ -68,8 +72,7 @@ func domainMatches(requestHost, cookieDomain string) bool {
 		return true
 	}
 	trimmed = strings.TrimPrefix(strings.ToLower(trimmed), ".")
-	host := strings.ToLower(requestHost)
-	hostOnly, _, _ := strings.Cut(host, ":")
+	hostOnly := strings.Trim(strings.ToLower(requestHost), "[]")
 	if hostOnly == trimmed {
 		return true
 	}
@@ -87,7 +90,13 @@ func pathMatches(requestPath, cookiePath string) bool {
 	if requestPath == "" {
 		requestPath = "/"
 	}
-	return strings.HasPrefix(requestPath, trimmed)
+	if requestPath == trimmed {
+		return true
+	}
+	if !strings.HasPrefix(requestPath, trimmed) {
+		return false
+	}
+	return strings.HasSuffix(trimmed, "/") || strings.HasPrefix(requestPath[len(trimmed):], "/")
 }
 
 func isExpiredCookie(cookie StoredCookie, now time.Time) bool {
@@ -166,6 +175,37 @@ func (s *cookieStore) persist() []StoredCookie {
 		return []StoredCookie{}
 	}
 	return kept
+}
+
+// HasUsableSessionCookies reports whether a saved session contains a trusted
+// Medicover cookie that is usable for the default authorization endpoint.
+func HasUsableSessionCookies(state *SessionState, now time.Time) bool {
+	return HasUsableSessionCookiesForIssuer(state, "", now)
+}
+
+// HasUsableSessionCookiesForIssuer reports whether a saved session contains a
+// trusted cookie that matches the authorization endpoint for issuer. It checks
+// the cookie name, expiry, security, domain, and path. A structurally valid
+// session with only unrelated cookies still requires login.
+func HasUsableSessionCookiesForIssuer(state *SessionState, issuer string, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	issuer = strings.TrimSuffix(strings.TrimSpace(issuer), "/")
+	if issuer == "" {
+		issuer = defaultIssuer
+	}
+	authorizeURL := issuer + "/connect/authorize"
+	for _, cookie := range state.Cookies {
+		if cookie.Name != "MedicoverTrusted" {
+			continue
+		}
+		cookies := &cookieStore{cookies: []StoredCookie{cookie}, now: now}
+		if cookies.headerFor(authorizeURL) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseSetCookie(header string) *StoredCookie {
