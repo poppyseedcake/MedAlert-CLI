@@ -328,7 +328,7 @@ func checkCommandFlags(command string, settings options) error {
 		return fmt.Errorf("--dry is not supported for %s", command)
 	}
 	if command == "check" {
-		return checkDrySearchFlags(settings)
+		return checkObservationFlags(settings)
 	}
 	hasAccountID := settings.accountID != ""
 	hasUsername := settings.username != ""
@@ -593,7 +593,9 @@ func checkCommandFlags(command string, settings options) error {
 	return nil
 }
 
-func checkDrySearchFlags(settings options) error {
+// checkObservationFlags rejects account and ad-hoc criteria flags. Both dry
+// and durable checks use the saved account and profile configuration.
+func checkObservationFlags(settings options) error {
 	unsupported := ""
 	switch {
 	case settings.accountID != "":

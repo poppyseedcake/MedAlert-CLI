@@ -242,7 +242,7 @@ func TestDeleteAccountCascadesProfiles(t *testing.T) {
 	}
 }
 
-func TestMigrateV2ToV3KeepsAccounts(t *testing.T) {
+func TestMigrateV2ToCurrentKeepsAccounts(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)

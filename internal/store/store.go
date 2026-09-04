@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion = 3
+	CurrentSchemaVersion = 4
 	backupLimit          = 3
 )
 
@@ -353,6 +353,22 @@ func migrate(database *sql.DB) (err error) {
 		for _, statement := range statements {
 			if _, err = connection.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("apply schema migration 3: %w", err)
+			}
+		}
+	}
+	if fromVersion < 4 {
+		statements := []string{
+			`CREATE TABLE observation_runs (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE, profile_updated_at TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running', 'complete', 'failed', 'partial', 'cancelled', 'conflicting', 'stale')), started_at TEXT NOT NULL, completed_at TEXT NOT NULL DEFAULT '', slot_count INTEGER NOT NULL DEFAULT 0 CHECK(slot_count >= 0), error_code TEXT NOT NULL DEFAULT '', error_message TEXT NOT NULL DEFAULT '') STRICT`,
+			"CREATE INDEX idx_observation_runs_profile_started ON observation_runs(profile_id, started_at)",
+			`CREATE TABLE availability_episodes (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE, slot_identity TEXT NOT NULL, stable_identity TEXT NOT NULL, booking_string TEXT NOT NULL DEFAULT '', appointment_time TEXT NOT NULL, clinic TEXT NOT NULL DEFAULT '', doctor TEXT NOT NULL DEFAULT '', specialty TEXT NOT NULL DEFAULT '', visit_type TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))) STRICT`,
+			"CREATE INDEX idx_availability_episodes_profile_active ON availability_episodes(profile_id, active)",
+			"CREATE UNIQUE INDEX idx_availability_episodes_active_identity ON availability_episodes(profile_id, slot_identity) WHERE active = 1",
+			"INSERT INTO schema_migrations (version, applied_at) VALUES (4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+			"PRAGMA user_version = 4",
+		}
+		for _, statement := range statements {
+			if _, err = connection.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply schema migration 4: %w", err)
 			}
 		}
 	}

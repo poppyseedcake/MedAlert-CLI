@@ -10,16 +10,14 @@ import (
 	"time"
 
 	"github.com/poppyseedcake/MedAlert/internal/medicover"
+	"github.com/poppyseedcake/MedAlert/internal/monitoring"
 	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/session"
+	"github.com/poppyseedcake/MedAlert/internal/store"
 )
 
 func runCheck(command string, settings options, stdin *os.File, stdout, stderr io.Writer) int {
 	jsonOutput := settings.output == "json"
-	if !settings.dry {
-		writeError(stderr, command, "invalid_arguments", "check currently requires --dry", jsonOutput)
-		return 2
-	}
 	if len(settings.positionals) > 1 || (settings.profileID != "" && len(settings.positionals) > 0 && settings.positionals[0] != settings.profileID) {
 		writeError(stderr, command, "invalid_arguments", "use either --profile or one positional profile id", jsonOutput)
 		return 2
@@ -40,6 +38,9 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 	profile, err := storage.GetProfile(id)
 	if err != nil {
 		return reportProfileError(stderr, command, err, jsonOutput)
+	}
+	if !settings.dry && !profile.Enabled {
+		return reportCheckError(stderr, command, fmt.Errorf("%w: %s", store.ErrProfileDisabled, profile.ID), jsonOutput)
 	}
 	account, err := storage.GetAccount(profile.AccountID)
 	if err != nil {
@@ -72,18 +73,96 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 		writeError(stderr, command, "temporary_failure", "cannot save session state", jsonOutput)
 		return 4
 	}
-	result, err := client.Search(ctx, auth.AccessToken, medicover.SearchCriteria{RegionIDs: profile.RegionIDs, SpecialtyIDs: profile.SpecialtyIDs, ClinicIDs: profile.ClinicIDs, DoctorIDs: profile.DoctorIDs, LanguageIDs: profile.LanguageIDs, VisitType: profile.VisitType, SearchType: profile.SearchType, StartDate: profile.StartDate, EndDate: profile.EndDate})
-	if err != nil {
-		return reportMedicoverError(stderr, command, err, jsonOutput)
+	if settings.dry {
+		result, err := client.Search(ctx, auth.AccessToken, searchCriteriaForProfile(profile))
+		if err != nil {
+			return reportMedicoverError(stderr, command, err, jsonOutput)
+		}
+		data := map[string]any{"account": account.ID, "profile": profile.ID, "dry": true, "complete": true, "slots": result.Slots, "slot_count": len(result.Slots), "pages": result.Pages}
+		if jsonOutput {
+			writeResult(stdout, command, data)
+			return 0
+		}
+		fmt.Fprintf(stdout, "Dry check for profile %s (account %s) found %d available slots.\n", profile.ID, account.ID, len(result.Slots))
+		for _, slot := range result.Slots {
+			fmt.Fprintf(stdout, "%s  %s  %s  %s\n", slot.Time, slot.Doctor, slot.Clinic, slot.Identity)
+		}
+		return 0
 	}
-	data := map[string]any{"account": account.ID, "profile": profile.ID, "dry": true, "complete": true, "slots": result.Slots, "slot_count": len(result.Slots), "pages": result.Pages}
+	result, err := monitoring.Check(ctx, storage, profile, account, client, auth.AccessToken, time.Now().UTC())
+	if err != nil {
+		return reportCheckError(stderr, command, err, jsonOutput)
+	}
+	episodes, err := storage.ListAvailabilityEpisodes(profile.ID)
+	if err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
+	activeEpisodeCount := 0
+	for _, episode := range episodes {
+		if episode.Active {
+			activeEpisodeCount++
+		}
+	}
+	data := map[string]any{
+		"account":              account.ID,
+		"profile":              profile.ID,
+		"dry":                  false,
+		"complete":             true,
+		"run":                  result.Reconciliation.Run,
+		"slots":                result.Search.Slots,
+		"slot_count":           len(result.Search.Slots),
+		"pages":                result.Search.Pages,
+		"new_episodes":         result.Reconciliation.NewEpisodes,
+		"ended_episodes":       result.Reconciliation.EndedEpisodes,
+		"newly_available":      len(result.Reconciliation.NewEpisodes),
+		"ended":                len(result.Reconciliation.EndedEpisodes),
+		"active_episode_count": activeEpisodeCount,
+	}
 	if jsonOutput {
 		writeResult(stdout, command, data)
 		return 0
 	}
-	fmt.Fprintf(stdout, "Dry check for profile %s (account %s) found %d available slots.\n", profile.ID, account.ID, len(result.Slots))
-	for _, slot := range result.Slots {
+	fmt.Fprintf(stdout, "Check for profile %s (account %s) found %d available slots; %d newly available, %d ended.\n", profile.ID, account.ID, len(result.Search.Slots), len(result.Reconciliation.NewEpisodes), len(result.Reconciliation.EndedEpisodes))
+	for _, slot := range result.Search.Slots {
 		fmt.Fprintf(stdout, "%s  %s  %s  %s\n", slot.Time, slot.Doctor, slot.Clinic, slot.Identity)
 	}
 	return 0
+}
+
+func searchCriteriaForProfile(profile store.Profile) medicover.SearchCriteria {
+	return medicover.SearchCriteria{
+		RegionIDs:    profile.RegionIDs,
+		SpecialtyIDs: profile.SpecialtyIDs,
+		ClinicIDs:    profile.ClinicIDs,
+		DoctorIDs:    profile.DoctorIDs,
+		LanguageIDs:  profile.LanguageIDs,
+		VisitType:    profile.VisitType,
+		SearchType:   profile.SearchType,
+		StartDate:    profile.StartDate,
+		EndDate:      profile.EndDate,
+	}
+}
+
+func reportCheckError(stderr io.Writer, command string, err error, jsonOutput bool) int {
+	switch {
+	case errors.Is(err, store.ErrProfileNotFound):
+		return reportProfileError(stderr, command, err, jsonOutput)
+	case errors.Is(err, store.ErrProfileDisabled):
+		writeError(stderr, command, "profile_disabled", err.Error(), jsonOutput)
+		return 2
+	case errors.Is(err, store.ErrObservationRunActive):
+		writeError(stderr, command, "run_active", err.Error(), jsonOutput)
+		return 4
+	case errors.Is(err, store.ErrObservationRunConflicting):
+		writeError(stderr, command, "conflicting_result", err.Error(), jsonOutput)
+		return 6
+	case errors.Is(err, store.ErrObservationRunStale):
+		writeError(stderr, command, "stale_result", err.Error(), jsonOutput)
+		return 6
+	case errors.Is(err, store.ErrObservationRunInvalid), errors.Is(err, store.ErrObservationRunNotFound):
+		writeError(stderr, command, "invalid_arguments", err.Error(), jsonOutput)
+		return 2
+	default:
+		return reportMedicoverError(stderr, command, err, jsonOutput)
+	}
 }
