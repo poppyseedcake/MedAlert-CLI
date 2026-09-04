@@ -151,6 +151,36 @@ func telegramCreate(command string, settings options, stdin *os.File, stdout, st
 		}
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
+	if intendedSource == store.TokenSourceSecretService {
+		// Prompt before INSERT so two concurrent creates cannot both pass
+		// the duplicate check and overwrite each other's token. Only the
+		// INSERT winner saves its token; the loser returns
+		// destination_exists without touching Secret Service.
+		tokenValue, secretErr := secrets.PromptForPassword("Telegram bot token: ", stdin, stderr, settings.nonInteractive)
+		if secretErr != nil {
+			return reportSecretError(stderr, command, secretErr, jsonOutput)
+		}
+		created, err := storage.CreateDestination(store.Destination{
+			ID:          id,
+			Name:        name,
+			ChatID:      chatID,
+			TokenSource: intendedSource,
+			TokenRef:    intendedRef,
+			Enabled:     true,
+		})
+		if err != nil {
+			tokenValue = ""
+			return reportTelegramError(stderr, command, err, jsonOutput)
+		}
+		if err := secrets.SetTelegramToken(id, tokenValue); err != nil {
+			tokenValue = ""
+			_ = storage.DeleteDestination(id)
+			return reportSecretError(stderr, command, err, jsonOutput)
+		}
+		tokenValue = ""
+		writeDestination(stdout, command, created, fmt.Sprintf("Created telegram destination %s.\n", created.ID), jsonOutput)
+		return 0
+	}
 	source, ref, secretErr := prepareNewTelegramSecret(id, settings, stdin, stderr)
 	if secretErr != nil {
 		return reportSecretError(stderr, command, secretErr, jsonOutput)
@@ -394,7 +424,9 @@ func telegramTest(command string, settings options, stdin *os.File, stdout, stde
 		_, _ = storage.RecordDestinationTest(id, status, detail, time.Now().UTC())
 		return reportTelegramSendError(stderr, command, sendErr, jsonOutput)
 	}
-	_, _ = storage.RecordDestinationTest(id, "delivered", "test delivered", time.Now().UTC())
+	if _, err := storage.RecordDestinationTest(id, "delivered", "test delivered", time.Now().UTC()); err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
 	if jsonOutput {
 		writeResult(stdout, command, map[string]any{
 			"destination": destination.ID,

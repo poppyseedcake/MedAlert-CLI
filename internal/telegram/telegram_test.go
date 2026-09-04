@@ -216,3 +216,69 @@ func TestSendRedactsTokenEchoedInDescription(t *testing.T) {
 		t.Fatalf("message = %q, want redacted URL segment", typed.Message)
 	}
 }
+
+func TestSendDoesNotFollowRedirects(t *testing.T) {
+	token := "SECRET-REDIRECT-TOKEN-unique"
+	var evilHits int
+	var evilReferer string
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		evilHits++
+		evilReferer = r.Header.Get("Referer")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":99}}`))
+	}))
+	defer evil.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evil.URL+"/sendMessage", http.StatusFound)
+	}))
+	defer redirect.Close()
+	_, err := testClient(redirect).SendMessage(context.Background(), telegram.Secret(token), "1", "hi")
+	typed, ok := err.(*telegram.Error)
+	if !ok {
+		t.Fatalf("error type = %T (%v), want *telegram.Error", err, err)
+	}
+	if typed.Code != telegram.CodeUnknown {
+		t.Fatalf("code = %q, want unknown_delivery (redirects must not be followed)", typed.Code)
+	}
+	if evilHits != 0 {
+		t.Fatalf("evil server hit %d times, redirect must not be followed", evilHits)
+	}
+	if strings.Contains(evilReferer, token) {
+		t.Fatalf("Referer leaks token: %q", evilReferer)
+	}
+}
+
+func TestSendRequiresValidResult(t *testing.T) {
+	token := "SECRET-RESULT-TOKEN-unique"
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"ok-true-without-result", http.StatusOK, `{"ok":true}`},
+		{"ok-true-empty-result", http.StatusOK, `{"ok":true,"result":{}}`},
+		{"ok-true-zero-id", http.StatusOK, `{"ok":true,"result":{"message_id":0}}`},
+		{"ok-true-non-2xx", http.StatusBadRequest, `{"ok":true,"result":{"message_id":42}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			result, err := testClient(server).SendMessage(context.Background(), telegram.Secret(token), "1", "hi")
+			typed, ok := err.(*telegram.Error)
+			if !ok {
+				t.Fatalf("error type = %T (result=%+v), want *telegram.Error", err, result)
+			}
+			if typed.Code != telegram.CodeUnknown {
+				t.Fatalf("code = %q, want unknown_delivery", typed.Code)
+			}
+			if result.MessageID != 0 {
+				t.Fatalf("message id = %d, want 0 on unknown delivery", result.MessageID)
+			}
+		})
+	}
+}

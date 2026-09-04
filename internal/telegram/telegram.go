@@ -73,9 +73,23 @@ func (c *Config) withDefaults() Config {
 		cfg.BaseURL = defaultBaseURL
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: requestTimeout}
+		cfg.HTTPClient = &http.Client{Timeout: requestTimeout, CheckRedirect: noRedirect}
+		return cfg
 	}
+	// The bot token is part of the request URL path. Go's http.Client would
+	// otherwise follow redirects and send the previous URL (including the
+	// token) as Referer to another host. Never follow redirects.
+	clone := *cfg.HTTPClient
+	clone.CheckRedirect = noRedirect
+	cfg.HTTPClient = &clone
 	return cfg
+}
+
+// noRedirect rejects all redirects so the token-bearing URL is never sent as
+// Referer to another host. Telegram Bot API does not use redirects; a 3xx
+// response surfaces as unknown_delivery instead.
+func noRedirect(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // Client sends Telegram messages. It holds no per-destination state; tokens
@@ -283,11 +297,17 @@ func classifyResponse(status int, retryAfterHeader string, body []byte, diagnost
 		return Result{}, &Error{Code: CodeUnknown, Message: "unknown telegram delivery", Diagnostic: withStatus}
 	}
 	if *envelope.OK {
-		var messageID int64
-		if envelope.Result != nil {
-			messageID = envelope.Result.MessageID
+		// Success requires a 2xx status and a valid result.message_id.
+		// A missing result or a non-2xx status means we cannot confirm
+		// delivery, so report unknown instead of a false success with
+		// message_id 0.
+		if status < 200 || status >= 300 {
+			return Result{}, &Error{Code: CodeUnknown, Message: "unknown telegram delivery", Diagnostic: withStatus}
 		}
-		return Result{MessageID: messageID}, nil
+		if envelope.Result == nil || envelope.Result.MessageID <= 0 {
+			return Result{}, &Error{Code: CodeUnknown, Message: "unknown telegram delivery", Diagnostic: withStatus}
+		}
+		return Result{MessageID: envelope.Result.MessageID}, nil
 	}
 	// ok:false: prefer the Telegram error_code, fall back to HTTP status.
 	code := status
