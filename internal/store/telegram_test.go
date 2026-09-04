@@ -326,3 +326,34 @@ func TestUpdateProfileWithDestinationsIsAtomic(t *testing.T) {
 		t.Fatalf("links changed despite failed atomic update: %#v", links)
 	}
 }
+
+func TestUpdateProfileDestinationsOnlyBumpsUpdatedAt(t *testing.T) {
+	storage := openTelegramStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(validDestination("two")); err != nil {
+		t.Fatal(err)
+	}
+	before, err := storage.CreateProfileWithDestinations(validProfile("bump", "alice"), []string{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Ensure the clock advances past the create timestamp.
+	time.Sleep(2 * time.Millisecond)
+	after, err := storage.UpdateProfileWithDestinations("bump", store.ProfileUpdate{}, false, []string{"one", "two"}, true)
+	if err != nil {
+		t.Fatalf("destinations-only update: %v", err)
+	}
+	if after.UpdatedAt == "" || after.UpdatedAt == before.UpdatedAt {
+		t.Fatalf("updated_at not bumped: before=%q after=%q", before.UpdatedAt, after.UpdatedAt)
+	}
+	shown, err := storage.GetProfile("bump")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shown.UpdatedAt != after.UpdatedAt {
+		t.Fatalf("persisted updated_at = %q, want %q", shown.UpdatedAt, after.UpdatedAt)
+	}
+}

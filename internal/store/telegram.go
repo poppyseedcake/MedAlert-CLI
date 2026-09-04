@@ -705,6 +705,14 @@ func (s *Store) UpdateProfileWithDestinations(id string, update ProfileUpdate, h
 				return Profile{}, fmt.Errorf("edit profile: %w", err)
 			}
 		}
+		// Link changes must invalidate in-flight runs: observation_runs
+		// captures profiles.updated_at at run start and reconciliation
+		// treats a matching timestamp as current. Without a bump here a
+		// destinations-only edit would leave notification changes invisible.
+		bumpedAt := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := conn.ExecContext(ctx, `UPDATE profiles SET updated_at = ? WHERE id = ?`, bumpedAt, id); err != nil {
+			return Profile{}, fmt.Errorf("edit profile: %w", err)
+		}
 	}
 	var fresh Profile
 	var freshEnabled int
