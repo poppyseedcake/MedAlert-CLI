@@ -534,6 +534,91 @@ func TestIsRetryDueUsesChronologicalLatestRun(t *testing.T) {
 	}
 }
 
+func TestReapExpiredMaxAttemptClaimsFinalizesStuckRow(t *testing.T) {
+	storage := openDeliveryStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	mustDeliveryProfile(t, storage, "reaped", "alice")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("reaped", []string{"one"}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	episode := mustDeliveryEpisode(t, storage, "reaped", base)
+	if _, err := storage.EnsureEpisodeDeliveries("reaped", episode.ID, base); err != nil {
+		t.Fatal(err)
+	}
+	// Drive four full attempts, then stop after the fifth claim without
+	// recording a result, simulating a crash between the two writes.
+	at := base
+	var stuck store.Delivery
+	for attempt := 1; attempt <= 5; attempt++ {
+		due, err := storage.ListDueDeliveries("reaped", at)
+		if err != nil || len(due) != 1 {
+			t.Fatalf("attempt %d due = %#v, %v", attempt, due, err)
+		}
+		claimed, err := storage.BeginDeliveryAttempt(due[0].ID, at)
+		if err != nil {
+			t.Fatalf("attempt %d begin: %v", attempt, err)
+		}
+		if attempt < 5 {
+			if _, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: "temporary"}, at); err != nil {
+				t.Fatalf("attempt %d record: %v", attempt, err)
+			}
+			at = at.Add(time.Minute)
+		} else {
+			stuck = claimed
+		}
+	}
+	if stuck.Attempts != 5 || stuck.Status != store.DeliveryPending {
+		t.Fatalf("stuck claim = %#v, want pending attempts=5", stuck)
+	}
+	// While the lease is held the row is neither due nor reaped: a
+	// concurrent fifth send may still be in flight.
+	if reaped, err := storage.ReapExpiredMaxAttemptClaims("reaped", at.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	} else if len(reaped) != 0 {
+		t.Fatalf("reaped while leased = %#v, want none", reaped)
+	}
+	if held, err := storage.ListDueDeliveries("reaped", at.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	} else if len(held) != 0 {
+		t.Fatalf("due while leased = %#v, want none", held)
+	}
+	// After the lease expires the stuck row is finalized instead of
+	// remaining pending forever.
+	reaped, err := storage.ReapExpiredMaxAttemptClaims("reaped", at.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if len(reaped) != 1 || reaped[0].Status != store.DeliveryPermanentFailure {
+		t.Fatalf("reaped = %#v, want one permanent_failure", reaped)
+	}
+	if !strings.Contains(reaped[0].LastError, "5 attempts") {
+		t.Fatalf("reaped error = %q, want exhaustion message", reaped[0].LastError)
+	}
+	kept, err := storage.GetDelivery(stuck.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.Status != store.DeliveryPermanentFailure {
+		t.Fatalf("stored status = %q, want permanent_failure", kept.Status)
+	}
+	if due, err := storage.ListDueDeliveries("reaped", at.Add(4*time.Minute)); err != nil {
+		t.Fatal(err)
+	} else if len(due) != 0 {
+		t.Fatalf("due after reap = %#v, want none", due)
+	}
+}
+
+func TestGetEpisodeDistinguishesMissingFromStoreFailures(t *testing.T) {
+	storage := openDeliveryStore(t)
+	if _, err := storage.GetEpisode("episode-missing"); !errors.Is(err, store.ErrDeliveryNotFound) {
+		t.Fatalf("missing episode error = %v, want ErrDeliveryNotFound", err)
+	}
+}
+
 func mustListDeliveries(t *testing.T, storage *store.Store, profileID string) []store.Delivery {
 	t.Helper()
 	deliveries, err := storage.ListDeliveriesForProfile(profileID)

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/poppyseedcake/MedAlert/internal/telegram"
 )
@@ -87,6 +88,19 @@ func ProcessAvailabilityDeliveries(ctx context.Context, storage *store.Store, pr
 		}
 	}
 
+	// Recover rows stuck after a stopped final claim before selecting due
+	// work: a pending row with attempts at the budget and an expired lease
+	// would otherwise remain pending forever (ListDue and Begin both
+	// exclude it). Reaped rows are newly terminal budget failures.
+	reaped, err := storage.ReapExpiredMaxAttemptClaims(profile.ID, now)
+	if err != nil {
+		return summary, err
+	}
+	for _, final := range reaped {
+		summary.Failed++
+		summary.Deliveries = append(summary.Deliveries, final)
+	}
+
 	due, err := storage.ListDueDeliveries(profile.ID, now)
 	if err != nil {
 		return summary, err
@@ -95,7 +109,7 @@ func ProcessAvailabilityDeliveries(ctx context.Context, storage *store.Store, pr
 		if ctx != nil && ctx.Err() != nil {
 			break
 		}
-		outcome, err := attemptOneDelivery(ctx, storage, profile, pending, sender, resolveToken, now)
+		outcome, err := attemptOneDelivery(ctx, storage, profile, pending, sender, resolveToken)
 		if err != nil {
 			return summary, err
 		}
@@ -136,31 +150,38 @@ type deliveryOutcome struct {
 	stop          bool
 }
 
-func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store.Profile, pending store.Delivery, sender *telegram.Client, resolveToken func(store.Destination) (telegram.Secret, error), now time.Time) (deliveryOutcome, error) {
+func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store.Profile, pending store.Delivery, sender *telegram.Client, resolveToken func(store.Destination) (telegram.Secret, error)) (deliveryOutcome, error) {
 	// Re-verify the slot remains available with a fresh read. The
 	// reconciliation just completed, so this is cheap defense against sending
 	// stale availability when the episode ended between ListDue and the send.
+	// Only a genuinely missing episode is skipped; other store failures are
+	// returned so the pass surfaces them instead of silently dropping work.
 	episode, err := storage.GetEpisode(pending.EpisodeID)
 	if err != nil {
-		// Episode gone (profile deleted races): skip without consuming more
-		// attempts; cascade cleanup removes the delivery row.
-		return deliveryOutcome{skipped: true}, nil
+		if errors.Is(err, store.ErrDeliveryNotFound) {
+			// Episode gone (profile deleted races): skip without consuming
+			// more attempts; cascade cleanup removes the delivery row.
+			return deliveryOutcome{skipped: true}, nil
+		}
+		return deliveryOutcome{}, err
 	}
 	if !episode.Active {
-		if _, err := storage.CancelDeliveriesForEndedEpisodes(profile.ID, []string{episode.ID}, now); err != nil {
+		staleNow := time.Now().UTC()
+		if _, err := storage.CancelDeliveriesForEndedEpisodes(profile.ID, []string{episode.ID}, staleNow); err != nil {
 			return deliveryOutcome{}, err
 		}
-		cancelled, _ := storage.GetDelivery(pending.ID)
-		if cancelled.ID == "" {
-			cancelled = pending
-			cancelled.Status = store.DeliveryPermanentFailure
-			cancelled.LastError = "slot is no longer available"
+		cancelled, err := storage.GetDelivery(pending.ID)
+		if err != nil {
+			return deliveryOutcome{}, err
 		}
 		return deliveryOutcome{final: cancelled, staleCancelled: true}, nil
 	}
 	destination, err := storage.GetDestination(pending.DestinationID)
 	if err != nil {
-		return deliveryOutcome{skipped: true}, nil
+		if errors.Is(err, store.ErrDestinationNotFound) {
+			return deliveryOutcome{skipped: true}, nil
+		}
+		return deliveryOutcome{}, err
 	}
 	if !destination.Enabled {
 		// Disabled destinations pause without consuming attempts; a later
@@ -176,7 +197,10 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 		}
 		return deliveryOutcome{skipped: true}, nil
 	}
-	claimed, err := storage.BeginDeliveryAttempt(pending.ID, now)
+	// Fresh claim timestamp per attempt: the batch `now` may be stale after
+	// slow Telegram responses earlier in a long batch, which would store an
+	// already-expired lease or backoff.
+	claimed, err := storage.BeginDeliveryAttempt(pending.ID, time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, store.ErrDeliveryNotFound) || errors.Is(err, store.ErrDeliveryInvalid) || errors.Is(err, store.ErrDeliveryNotDue) {
 			// Lost race: claimed by a concurrent process holding the lease,
@@ -188,7 +212,14 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 	}
 	token, err := resolveToken(destination)
 	if err != nil {
-		final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortDeliveryMessage(err)}, now)
+		// Transient secret outages (for example Secret Service temporarily
+		// unavailable) stay retryable within the shared five-attempt budget;
+		// missing or invalid configuration is terminal.
+		status := store.DeliveryPermanentFailure
+		if secrets.IsTransient(err) {
+			status = store.DeliveryRetry
+		}
+		final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: status, LastError: shortDeliveryMessage(err)}, time.Now().UTC())
 		if recordErr != nil {
 			if errors.Is(recordErr, store.ErrDeliveryConflict) {
 				return deliveryOutcome{skipped: true}, nil
@@ -214,15 +245,19 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 		if errors.As(err, &telegramErr) && telegramErr.Code == telegram.CodeCancelled {
 			return deliveryOutcome{stop: true}, nil
 		}
+		// Fresh confirmation timestamp per attempt: retry_after is relative
+		// to the Telegram response, so anchoring it to a stale batch start
+		// after a slow response would store an already-past backoff.
+		recordedAt := time.Now().UTC()
 		if errors.As(err, &telegramErr) {
 			switch {
 			case telegram.IsTemporary(err):
 				next := store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}
 				if telegramErr.Code == telegram.CodeRateLimited && telegramErr.RetryAfter > 0 {
 					next.HasNextRetry = true
-					next.NextAttempt = now.Add(telegramErr.RetryAfter)
+					next.NextAttempt = recordedAt.Add(telegramErr.RetryAfter)
 				}
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, next, now)
+				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, next, recordedAt)
 				if recordErr != nil {
 					if errors.Is(recordErr, store.ErrDeliveryConflict) {
 						return deliveryOutcome{skipped: true}, nil
@@ -231,7 +266,7 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 				}
 				return deliveryOutcome{final: final}, nil
 			case telegram.IsPermanent(err):
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortDeliveryMessage(err)}, now)
+				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortDeliveryMessage(err)}, recordedAt)
 				if recordErr != nil {
 					if errors.Is(recordErr, store.ErrDeliveryConflict) {
 						return deliveryOutcome{skipped: true}, nil
@@ -240,7 +275,7 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 				}
 				return deliveryOutcome{final: final}, nil
 			default:
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, now)
+				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, recordedAt)
 				if recordErr != nil {
 					if errors.Is(recordErr, store.ErrDeliveryConflict) {
 						return deliveryOutcome{skipped: true}, nil
@@ -250,7 +285,7 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 				return deliveryOutcome{final: final}, nil
 			}
 		}
-		final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, now)
+		final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, recordedAt)
 		if recordErr != nil {
 			if errors.Is(recordErr, store.ErrDeliveryConflict) {
 				return deliveryOutcome{skipped: true}, nil
@@ -259,7 +294,7 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 		}
 		return deliveryOutcome{final: final}, nil
 	}
-	final, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: result.MessageID}, now)
+	final, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: result.MessageID}, time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, store.ErrDeliveryConflict) {
 			return deliveryOutcome{skipped: true}, nil

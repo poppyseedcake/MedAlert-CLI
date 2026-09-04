@@ -316,14 +316,16 @@ func (s *Store) GetDelivery(id string) (Delivery, error) {
 	return delivery, nil
 }
 
-// GetEpisode returns one availability episode by id.
+// GetEpisode returns one availability episode by id. A missing row reports
+// ErrDeliveryNotFound so callers can skip it; other store failures are
+// returned for the caller to surface.
 func (s *Store) GetEpisode(id string) (AvailabilityEpisode, error) {
 	if strings.TrimSpace(id) == "" {
 		return AvailabilityEpisode{}, fmt.Errorf("%w: episode id is required", ErrDeliveryInvalid)
 	}
 	episode, err := scanAvailabilityEpisode(s.db.QueryRow(`SELECT id, profile_id, slot_identity, stable_identity, booking_string, appointment_time, clinic, doctor, specialty, visit_type, started_at, ended_at, active FROM availability_episodes WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
-		return AvailabilityEpisode{}, fmt.Errorf("%w: episode %s", ErrDeliveryInvalid, id)
+		return AvailabilityEpisode{}, fmt.Errorf("%w: episode %s", ErrDeliveryNotFound, id)
 	}
 	if err != nil {
 		return AvailabilityEpisode{}, fmt.Errorf("show availability episode: %w", err)
@@ -588,6 +590,80 @@ func (s *Store) RecordDeliveryResult(id string, claimed Delivery, result Deliver
 	current.DeliveredAt = deliveredAt
 	current.MessageID = messageID
 	return current, nil
+}
+
+// ReapExpiredMaxAttemptClaims finalizes pending rows stuck after a stopped
+// fifth claim. If a process stops after BeginDeliveryAttempt consumes the
+// final attempt (or its delivery context is cancelled), the row stays
+// pending with attempts at the budget and a lease timestamp. ListDue
+// excludes it via attempts < MaxDeliveryAttempts and Begin rejects it via
+// the same guard, so without recovery it would remain pending forever.
+// Rows whose lease already expired are transitioned to permanent_failure
+// with an exhaustion message; rows still holding a live lease (a concurrent
+// fifth send in flight) are left alone. Callers run this before selecting
+// due work.
+func (s *Store) ReapExpiredMaxAttemptClaims(profileID string, now time.Time) ([]Delivery, error) {
+	if !profileIDPattern.MatchString(profileID) {
+		return nil, fmt.Errorf("%w: profile id %q", ErrDeliveryInvalid, profileID)
+	}
+	now = deliveryTime(now)
+	rows, err := s.db.Query(`SELECT id, profile_id, episode_id, destination_id, status, attempts, next_attempt_at, last_error, created_at, updated_at, delivered_at, message_id FROM telegram_deliveries WHERE profile_id = ? AND status = ? AND attempts >= ?`, profileID, DeliveryPending, MaxDeliveryAttempts)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return []Delivery{}, nil
+		}
+		return nil, fmt.Errorf("reap telegram deliveries: %w", err)
+	}
+	defer rows.Close()
+	candidates := []Delivery{}
+	for rows.Next() {
+		delivery, err := scanDelivery(rows)
+		if err != nil {
+			return nil, fmt.Errorf("reap telegram deliveries: %w", err)
+		}
+		if strings.TrimSpace(delivery.NextAttemptAt) == "" {
+			candidates = append(candidates, delivery)
+			continue
+		}
+		if next, err := time.Parse(time.RFC3339Nano, delivery.NextAttemptAt); err != nil || !next.After(now) {
+			candidates = append(candidates, delivery)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reap telegram deliveries: %w", err)
+	}
+	reaped := []Delivery{}
+	for _, candidate := range candidates {
+		message := strings.TrimSpace(candidate.LastError)
+		if message == "" {
+			message = "telegram delivery failed after 5 attempts"
+		} else if !strings.Contains(message, "5 attempts") {
+			message = message + " (gave up after 5 attempts)"
+			if len(message) > 2048 {
+				message = message[:2048]
+			}
+		}
+		stamp := now.Format(time.RFC3339Nano)
+		result, err := s.db.Exec(`UPDATE telegram_deliveries SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND status = ? AND attempts >= ?`, DeliveryPermanentFailure, message, stamp, candidate.ID, DeliveryPending, MaxDeliveryAttempts)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+				return reaped, nil
+			}
+			return nil, fmt.Errorf("reap telegram deliveries: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("reap telegram deliveries: %w", err)
+		}
+		if affected == 0 {
+			continue
+		}
+		candidate.Status = DeliveryPermanentFailure
+		candidate.LastError = message
+		candidate.UpdatedAt = stamp
+		reaped = append(reaped, candidate)
+	}
+	return reaped, nil
 }
 
 // CancelDeliveriesForEndedEpisodes stops pending and retry deliveries whose
