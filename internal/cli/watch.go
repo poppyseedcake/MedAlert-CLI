@@ -25,6 +25,10 @@ const (
 	minWatchPollInterval     = 50 * time.Millisecond
 	maxWatchPollInterval     = 5 * time.Minute
 	watchRunTimeout          = 60 * time.Second
+	// authFailureBackoff throttles authentication retries per account so a
+	// profile with a long check interval does not hammer Medicover every
+	// poll when login keeps failing with a temporary error.
+	authFailureBackoff = 60 * time.Second
 )
 
 // watchEvent is one JSON Lines machine event on stdout. Text logs always use
@@ -70,17 +74,19 @@ func runWatch(command string, settings options, stdin *os.File, stdout, stderr i
 	stoppedSignal := make(chan string, 1)
 
 	watcher := &watchLoop{
-		command:    command,
-		storage:    storage,
-		client:     client,
-		backend:    backend,
-		stdin:      stdin,
-		stdout:     stdout,
-		stderr:     stderr,
-		jsonOutput: jsonOutput,
-		lastRuns:   map[string]time.Time{},
-		paused:     map[string]bool{},
-		active:     map[string]bool{},
+		command:     command,
+		storage:     storage,
+		client:      client,
+		backend:     backend,
+		stdin:       stdin,
+		stdout:      stdout,
+		stderr:      stderr,
+		jsonOutput:  jsonOutput,
+		lastRuns:    map[string]time.Time{},
+		paused:      map[string]bool{},
+		active:      map[string]bool{},
+		authActive:  map[string]bool{},
+		authRetryAt: map[string]time.Time{},
 	}
 	go func() {
 		select {
@@ -113,10 +119,7 @@ func runWatch(command string, settings options, stdin *os.File, stdout, stderr i
 		default:
 		}
 		if maxIterations > 0 && iteration >= maxIterations {
-			watcher.waitForBackground()
-			watcher.emitEvent("stopped", stoppedData("", iteration, "completed"))
-			watcher.log("watch completed %d iterations", iteration)
-			return 0
+			return watcher.stopCompleted(ctx, stoppedSignal, iteration)
 		}
 		iteration++
 		if !watcher.launchIteration(ctx) {
@@ -128,10 +131,7 @@ func runWatch(command string, settings options, stdin *os.File, stdout, stderr i
 		// Check the limit before sleeping so the final iteration exits
 		// immediately instead of waiting one extra poll interval.
 		if maxIterations > 0 && iteration >= maxIterations {
-			watcher.waitForBackground()
-			watcher.emitEvent("stopped", stoppedData("", iteration, "completed"))
-			watcher.log("watch completed %d iterations", iteration)
-			return 0
+			return watcher.stopCompleted(ctx, stoppedSignal, iteration)
 		}
 		select {
 		case <-ctx.Done():
@@ -161,6 +161,22 @@ func stoppedData(signalName string, iterations int, reason string) map[string]an
 	return data
 }
 
+// stopCompleted waits for background work and then reports either completion
+// or a signal that arrived while waiting. A SIGINT/SIGTERM during the final
+// waitForBackground must not be misreported as a clean completion.
+func (w *watchLoop) stopCompleted(ctx context.Context, stoppedSignal chan string, iteration int) int {
+	w.waitForBackground()
+	if ctx.Err() != nil {
+		name := stoppedSignalName(stoppedSignal)
+		w.emitEvent("stopped", stoppedData(name, iteration, "signal"))
+		w.log("watch stopped after %d iterations", iteration)
+		return 0
+	}
+	w.emitEvent("stopped", stoppedData("", iteration, "completed"))
+	w.log("watch completed %d iterations", iteration)
+	return 0
+}
+
 type watchLoop struct {
 	command    string
 	storage    *store.Store
@@ -171,19 +187,22 @@ type watchLoop struct {
 	stderr     io.Writer
 	jsonOutput bool
 
-	// mu guards lastRuns and paused. activeMu guards active. writeMu
-	// serializes all stdout/stderr writes so concurrent profile workers can
-	// safely use arbitrary io.Writers (for example bytes.Buffer via
-	// RunWithIO). wg tracks background authentication and check workers so
-	// shutdown and --once wait for active work to finish in a controlled way.
+	// mu guards lastRuns, paused, authActive and authRetryAt. activeMu guards
+	// active. writeMu serializes all stdout/stderr writes so concurrent
+	// profile workers can safely use arbitrary io.Writers (for example
+	// bytes.Buffer via RunWithIO). wg tracks background authentication and
+	// check workers so shutdown and --once wait for active work to finish in
+	// a controlled way.
 	mu       sync.Mutex
 	activeMu sync.Mutex
 	writeMu  sync.Mutex
 	wg       sync.WaitGroup
 
-	lastRuns map[string]time.Time
-	paused   map[string]bool
-	active   map[string]bool
+	lastRuns    map[string]time.Time
+	paused      map[string]bool
+	active      map[string]bool
+	authActive  map[string]bool
+	authRetryAt map[string]time.Time
 }
 
 func (w *watchLoop) waitForBackground() {
@@ -249,9 +268,20 @@ func (w *watchLoop) launchIteration(ctx context.Context) bool {
 	// Group due profiles by account so one authentication attempt serves all
 	// of that account's profiles in this iteration. Paused accounts are
 	// included so a later iteration can retry authentication and resume;
-	// authenticateAccount emits paused/resumed only on transitions.
+	// authenticateAccount emits paused/resumed only on transitions. Accounts
+	// in auth backoff or with an authentication already in flight are
+	// skipped here; the per-account guard in runAccountProfiles re-checks
+	// atomically to close the race between concurrent iterations.
 	byAccount := map[string][]store.Profile{}
+	groupNow := time.Now().UTC()
 	for _, profile := range due {
+		w.mu.Lock()
+		retryAt := w.authRetryAt[profile.AccountID]
+		authBusy := w.authActive[profile.AccountID]
+		w.mu.Unlock()
+		if authBusy || (!retryAt.IsZero() && groupNow.Before(retryAt)) {
+			continue
+		}
 		w.activeMu.Lock()
 		isActive := w.active[profile.ID]
 		w.activeMu.Unlock()
@@ -275,11 +305,30 @@ func (w *watchLoop) launchIteration(ctx context.Context) bool {
 
 // runAccountProfiles authenticates one account and launches its due profiles.
 // It runs in its own goroutine so a slow account never delays other accounts.
+// A per-account guard ensures at most one authentication flow per account is
+// in flight: concurrent iterations for the same account skip instead of
+// stacking up parallel logins.
 func (w *watchLoop) runAccountProfiles(ctx context.Context, accountID string, accountProfiles []store.Profile) {
 	defer w.wg.Done()
 	if ctx.Err() != nil {
 		return
 	}
+	w.mu.Lock()
+	if w.authActive[accountID] {
+		w.mu.Unlock()
+		return
+	}
+	if retryAt, ok := w.authRetryAt[accountID]; ok && time.Now().UTC().Before(retryAt) {
+		w.mu.Unlock()
+		return
+	}
+	w.authActive[accountID] = true
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		delete(w.authActive, accountID)
+		w.mu.Unlock()
+	}()
 	account, err := w.storage.GetAccount(accountID)
 	if err != nil {
 		w.log("cannot load account %s: %s", accountID, shortWatchMessage(err))
@@ -355,10 +404,12 @@ func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Accou
 	} else if errors.Is(err, session.ErrUnsafe) {
 		w.log("account %s session is not safe: %s", account.ID, shortWatchMessage(err))
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": "invalid_arguments", "message": shortWatchMessage(err)})
+		w.setAuthBackoff(account.ID, authFailureBackoff)
 		return "", false
 	} else {
 		w.log("account %s session is temporarily unavailable", account.ID)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": "temporary_failure", "message": "session storage is temporarily unavailable"})
+		w.setAuthBackoff(account.ID, authFailureBackoff)
 		return "", false
 	}
 	authCtx, cancel := context.WithTimeout(ctx, watchRunTimeout)
@@ -368,8 +419,10 @@ func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Accou
 		if saveErr := w.backend.Save(account.ID, auth.Session); saveErr != nil {
 			w.log("account %s cannot save session state", account.ID)
 			w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": "temporary_failure", "message": "cannot save session state"})
+			w.setAuthBackoff(account.ID, authFailureBackoff)
 			return "", false
 		}
+		w.clearAuthBackoff(account.ID)
 		w.mu.Lock()
 		if w.paused[account.ID] {
 			delete(w.paused, account.ID)
@@ -384,14 +437,18 @@ func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Accou
 	if !medicover.IsAuthRequired(err) && !medicover.IsInvalidCredentials(err) {
 		// Temporary, rate-limited, and protocol failures are per-iteration
 		// profile failures, not an account pause. Other accounts continue.
+		// Throttle retries per account so a 30-minute profile does not
+		// re-attempt login every poll; rate_limited respects RetryAfter.
 		code, message := watchMedicoverFailure(err)
 		w.log("account %s authentication %s: %s", account.ID, code, message)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": code, "message": message})
+		w.setAuthBackoff(account.ID, authFailureDelay(err))
 		return "", false
 	}
 	password, resolveErr := secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, w.stdin, w.stderr, true)
 	if resolveErr != nil {
 		w.pauseAccount(account, "authentication_required", "authentication is required")
+		w.setAuthBackoff(account.ID, authFailureBackoff)
 		return "", false
 	}
 	retrySecret := medicover.Secret(password)
@@ -404,18 +461,22 @@ func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Accou
 	if retryErr != nil {
 		if medicover.IsAuthRequired(retryErr) || medicover.IsInvalidCredentials(retryErr) {
 			w.pauseAccount(account, "authentication_required", "authentication is required")
+			w.setAuthBackoff(account.ID, authFailureBackoff)
 			return "", false
 		}
 		code, message := watchMedicoverFailure(retryErr)
 		w.log("account %s authentication %s: %s", account.ID, code, message)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": code, "message": message})
+		w.setAuthBackoff(account.ID, authFailureDelay(retryErr))
 		return "", false
 	}
 	if saveErr := w.backend.Save(account.ID, retry.Session); saveErr != nil {
 		w.log("account %s cannot save session state", account.ID)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": "temporary_failure", "message": "cannot save session state"})
+		w.setAuthBackoff(account.ID, authFailureBackoff)
 		return "", false
 	}
+	w.clearAuthBackoff(account.ID)
 	w.mu.Lock()
 	if w.paused[account.ID] {
 		delete(w.paused, account.ID)
@@ -426,6 +487,36 @@ func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Accou
 		w.mu.Unlock()
 	}
 	return retry.AccessToken, true
+}
+
+// setAuthBackoff delays the next authentication attempt for one account so
+// temporary login failures do not retry on every poll.
+func (w *watchLoop) setAuthBackoff(accountID string, delay time.Duration) {
+	if delay <= 0 {
+		delay = authFailureBackoff
+	}
+	w.mu.Lock()
+	if w.authRetryAt == nil {
+		w.authRetryAt = map[string]time.Time{}
+	}
+	w.authRetryAt[accountID] = time.Now().UTC().Add(delay)
+	w.mu.Unlock()
+}
+
+func (w *watchLoop) clearAuthBackoff(accountID string) {
+	w.mu.Lock()
+	delete(w.authRetryAt, accountID)
+	w.mu.Unlock()
+}
+
+// authFailureDelay respects the server-provided RetryAfter for rate limits
+// and falls back to a fixed backoff otherwise.
+func authFailureDelay(err error) time.Duration {
+	var medicoverErr *medicover.Error
+	if errors.As(err, &medicoverErr) && medicoverErr.Code == medicover.CodeRateLimited && medicoverErr.RetryAfter > 0 {
+		return medicoverErr.RetryAfter
+	}
+	return authFailureBackoff
 }
 
 func (w *watchLoop) pauseAccount(account store.Account, code, message string) {
