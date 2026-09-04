@@ -77,6 +77,13 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 		password = ""
 	}
 	if authErr != nil {
+		now := time.Now().UTC()
+		if recordErr := recordAccountFailure(storage, account, authErr, now); recordErr != nil {
+			return reportStoreError(stderr, command, recordErr, jsonOutput)
+		}
+		if _, processErr := processIncidentDeliveries(ctx, storage, settings, stdin, stderr); processErr != nil {
+			return reportStoreError(stderr, command, processErr, jsonOutput)
+		}
 		return reportMedicoverError(stderr, command, authErr, jsonOutput)
 	}
 	if err := backend.Save(account.ID, auth.Session); err != nil {
@@ -101,12 +108,40 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 	}
 	result, err := monitoring.Check(ctx, storage, profile, account, client, auth.AccessToken, time.Now().UTC())
 	if err != nil {
+		now := time.Now().UTC()
+		if medicover.IsAuthRequired(err) {
+			// A search-phase authentication failure means the account
+			// session is bad. It creates one account-level problem, not
+			// one problem per profile, so only the account incident is
+			// recorded here.
+			if recordErr := recordAccountFailure(storage, account, err, now); recordErr != nil {
+				return reportStoreError(stderr, command, recordErr, jsonOutput)
+			}
+		} else if recordErr := recordProfileFailure(storage, profile, err, now); recordErr != nil {
+			return reportStoreError(stderr, command, recordErr, jsonOutput)
+		}
+		if _, processErr := processIncidentDeliveries(ctx, storage, settings, stdin, stderr); processErr != nil {
+			return reportStoreError(stderr, command, processErr, jsonOutput)
+		}
 		return reportCheckError(stderr, command, err, jsonOutput)
+	}
+	// One complete successful run ends operational incidents. Failed or
+	// partial searches never reach here, so they never end episodes (only
+	// ReconcileObservationRun changes episodes) and never resolve incidents.
+	if err := resolveIncidentsOnSuccess(storage, profile, time.Now().UTC()); err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	// Durable Telegram notifications run after the complete observation run.
 	// Observation success wins: retryable Telegram failures stay pending for
 	// later check and watch cycles and never change the check exit code.
 	deliveries, err := deliverAfterCheck(ctx, storage, profile, result, settings, stdin, stderr)
+	if err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
+	if err := trackDestinationIncidents(storage, profile, deliveries, time.Now().UTC()); err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
+	incidents, err := processIncidentDeliveries(ctx, storage, settings, stdin, stderr)
 	if err != nil {
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
@@ -139,6 +174,10 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 		"delivery_failed":      deliveries.Failed,
 		"delivery_pending":     deliveries.StillRetry,
 		"delivery_cancelled":   deliveries.Cancelled,
+		"incident_deliveries":  incidents.Deliveries,
+		"incident_delivered":   incidents.Delivered,
+		"incident_failed":      incidents.Failed,
+		"incident_pending":     incidents.StillRetry,
 	}
 	if jsonOutput {
 		writeResult(stdout, command, data)
@@ -150,6 +189,9 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 	}
 	if deliveries.Attempted > 0 || deliveries.Cancelled > 0 {
 		fmt.Fprintf(stdout, "Telegram: %d delivered, %d pending, %d failed, %d cancelled.\n", deliveries.Delivered, deliveries.StillRetry, deliveries.Failed, deliveries.Cancelled)
+	}
+	if incidents.Attempted > 0 {
+		fmt.Fprintf(stdout, "Incidents: %d delivered, %d pending, %d failed.\n", incidents.Delivered, incidents.StillRetry, incidents.Failed)
 	}
 	return 0
 }

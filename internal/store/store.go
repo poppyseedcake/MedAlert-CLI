@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion = 6
+	CurrentSchemaVersion = 7
 	backupLimit          = 3
 )
 
@@ -399,6 +399,26 @@ func migrate(database *sql.DB) (err error) {
 		for _, statement := range statements {
 			if _, err = connection.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("apply schema migration 6: %w", err)
+			}
+		}
+	}
+	if fromVersion < 7 {
+		statements := []string{
+			`CREATE TABLE operational_incidents (id TEXT PRIMARY KEY, scope_type TEXT NOT NULL CHECK(scope_type IN ('account','profile','destination')), scope_id TEXT NOT NULL, account_id TEXT NOT NULL DEFAULT '', profile_id TEXT NOT NULL DEFAULT '', destination_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','resolved')), failure_code TEXT NOT NULL DEFAULT '', failure_message TEXT NOT NULL DEFAULT '', consecutive_failures INTEGER NOT NULL DEFAULT 1 CHECK(consecutive_failures >= 0), first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL) STRICT`,
+			"CREATE UNIQUE INDEX idx_operational_incidents_active_unique ON operational_incidents(scope_type, scope_id, profile_id, destination_id) WHERE status = 'active'",
+			"CREATE INDEX idx_operational_incidents_status_scope ON operational_incidents(status, scope_type, scope_id)",
+			"CREATE INDEX idx_operational_incidents_profile ON operational_incidents(profile_id, status)",
+			"CREATE INDEX idx_operational_incidents_account ON operational_incidents(account_id, status)",
+			`CREATE TABLE operational_deliveries (id TEXT PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES operational_incidents(id) ON DELETE CASCADE, destination_id TEXT NOT NULL REFERENCES telegram_destinations(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK(kind IN ('failure','recovery')), status TEXT NOT NULL CHECK(status IN ('pending', 'delivered', 'retry', 'permanent_failure')), attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0), next_attempt_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, delivered_at TEXT NOT NULL DEFAULT '', message_id INTEGER NOT NULL DEFAULT 0 CHECK(message_id >= 0)) STRICT`,
+			"CREATE UNIQUE INDEX idx_operational_deliveries_incident_destination_kind ON operational_deliveries(incident_id, destination_id, kind)",
+			"CREATE INDEX idx_operational_deliveries_incident_status ON operational_deliveries(incident_id, status)",
+			"CREATE INDEX idx_operational_deliveries_destination_status ON operational_deliveries(destination_id, status)",
+			"INSERT INTO schema_migrations (version, applied_at) VALUES (7, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+			"PRAGMA user_version = 7",
+		}
+		for _, statement := range statements {
+			if _, err = connection.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply schema migration 7: %w", err)
 			}
 		}
 	}

@@ -185,7 +185,38 @@ func (s *Store) DeleteAccount(id string) error {
 	if !accountIDPattern.MatchString(id) {
 		return fmt.Errorf("%w: account id %q", ErrAccountInvalid, id)
 	}
-	result, err := s.db.Exec(`DELETE FROM accounts WHERE id = ?`, id)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("delete account: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Remove operational incidents for the account and its profiles. Delivery
+	// rows cascade from incidents when foreign keys are enforced; explicit
+	// deletes keep history consistent otherwise and tolerate older schemas.
+	if _, err := tx.Exec(`DELETE FROM operational_deliveries WHERE incident_id IN (SELECT id FROM operational_incidents WHERE account_id = ?)`, id); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("delete account incidents: %w", err)
+		}
+	}
+	// Destination-scope incidents carry the owning account when recorded, but
+	// older rows may only reference profiles of this account. Clean both via
+	// profile membership as a fallback.
+	if _, err := tx.Exec(`DELETE FROM operational_deliveries WHERE incident_id IN (SELECT i.id FROM operational_incidents i JOIN profiles p ON p.id = i.profile_id WHERE p.account_id = ?)`, id); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("delete account incidents: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM operational_incidents WHERE account_id = ?`, id); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("delete account incidents: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM operational_incidents WHERE profile_id IN (SELECT id FROM profiles WHERE account_id = ?)`, id); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("delete account incidents: %w", err)
+		}
+	}
+	result, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete account: %w", err)
 	}
@@ -195,6 +226,9 @@ func (s *Store) DeleteAccount(id string) error {
 	}
 	if affected == 0 {
 		return fmt.Errorf("%w: %s", ErrAccountNotFound, id)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete account: %w", err)
 	}
 	return nil
 }

@@ -69,7 +69,7 @@ func TestDatabaseInitializeUsesXDGLocationAndPrivatePermissions(t *testing.T) {
 	if result.exitCode != 0 || result.stderr != "" {
 		t.Fatalf("result = %#v", result)
 	}
-	if result.stdout != "Initialized database schema 6.\n" {
+	if result.stdout != "Initialized database schema 7.\n" {
 		t.Fatalf("stdout = %q", result.stdout)
 	}
 	assertProcessFileMode(t, filepath.Join(dataHome, "medalert"), 0o700)
@@ -177,7 +177,7 @@ func TestDoctorReportsRequiredMigrationWithoutChangingDatabase(t *testing.T) {
 	if _, err := os.Stat(databasePath); !os.IsNotExist(err) {
 		t.Fatalf("database exists after doctor: %v", err)
 	}
-	if !strings.Contains(result.stdout, `"required_schema_version":6`) || !strings.Contains(result.stdout, `"migration_required":true`) {
+	if !strings.Contains(result.stdout, `"required_schema_version":7`) || !strings.Contains(result.stdout, `"migration_required":true`) {
 		t.Fatalf("stdout = %q", result.stdout)
 	}
 }
@@ -189,7 +189,7 @@ func TestNewerSchemaReturnsConfigurationErrorWithoutChangingDatabase(t *testing.
 	if initialize.exitCode != 0 {
 		t.Fatalf("initialize = %#v", initialize)
 	}
-	setUserVersion(t, databasePath, 7)
+	setUserVersion(t, databasePath, 8)
 	before, err := os.ReadFile(databasePath)
 	if err != nil {
 		t.Fatal(err)
