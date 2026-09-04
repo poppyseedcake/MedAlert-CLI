@@ -93,6 +93,13 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 	if err != nil {
 		return reportCheckError(stderr, command, err, jsonOutput)
 	}
+	// Durable Telegram notifications run after the complete observation run.
+	// Observation success wins: retryable Telegram failures stay pending for
+	// later check and watch cycles and never change the check exit code.
+	deliveries, err := deliverAfterCheck(ctx, storage, profile, result, settings, stdin, stderr)
+	if err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
 	episodes, err := storage.ListAvailabilityEpisodes(profile.ID)
 	if err != nil {
 		return reportStoreError(stderr, command, err, jsonOutput)
@@ -117,6 +124,11 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 		"newly_available":      len(result.Reconciliation.NewEpisodes),
 		"ended":                len(result.Reconciliation.EndedEpisodes),
 		"active_episode_count": activeEpisodeCount,
+		"deliveries":           deliveries.Deliveries,
+		"delivered":            deliveries.Delivered,
+		"delivery_failed":      deliveries.Failed,
+		"delivery_pending":     deliveries.StillRetry,
+		"delivery_cancelled":   deliveries.Cancelled,
 	}
 	if jsonOutput {
 		writeResult(stdout, command, data)
@@ -125,6 +137,9 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 	fmt.Fprintf(stdout, "Check for profile %s (account %s) found %d available slots; %d newly available, %d ended.\n", profile.ID, account.ID, len(result.Search.Slots), len(result.Reconciliation.NewEpisodes), len(result.Reconciliation.EndedEpisodes))
 	for _, slot := range result.Search.Slots {
 		fmt.Fprintf(stdout, "%s  %s  %s  %s\n", slot.Time, slot.Doctor, slot.Clinic, slot.Identity)
+	}
+	if deliveries.Attempted > 0 || deliveries.Cancelled > 0 {
+		fmt.Fprintf(stdout, "Telegram: %d delivered, %d pending, %d failed, %d cancelled.\n", deliveries.Delivered, deliveries.StillRetry, deliveries.Failed, deliveries.Cancelled)
 	}
 	return 0
 }

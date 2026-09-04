@@ -234,6 +234,14 @@ func (s *Store) DeleteDestination(id string) error {
 			return fmt.Errorf("delete telegram destination links: %w", err)
 		}
 	}
+	// Delivery history belongs to the destination. Foreign keys cascade, but
+	// an explicit delete keeps history consistent when constraints are off
+	// and tolerates databases without the deliveries table.
+	if _, err := tx.Exec(`DELETE FROM telegram_deliveries WHERE destination_id = ?`, id); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("delete telegram destination deliveries: %w", err)
+		}
+	}
 	result, err := tx.Exec(`DELETE FROM telegram_destinations WHERE id = ?`, id)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
