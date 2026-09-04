@@ -213,17 +213,18 @@ func incidentSlot(booking string) map[string]any {
 
 // incidentTelegramFake records Telegram sends and replays per-chat outcomes.
 type incidentTelegramFake struct {
-	mu        sync.Mutex
-	failChats map[string]string // chat -> mode: permanent, temporary
-	global    string            // success, temporary, permanent
-	messageID int64
-	requests  int
-	chats     []string
-	texts     []string
+	mu            sync.Mutex
+	failChats     map[string]string // chat -> mode: permanent, temporary
+	failOnceChats map[string]bool   // chat -> fail only the next request permanently
+	global        string            // success, temporary, permanent
+	messageID     int64
+	requests      int
+	chats         []string
+	texts         []string
 }
 
 func newIncidentTelegramFake() *incidentTelegramFake {
-	return &incidentTelegramFake{failChats: map[string]string{}, global: "success", messageID: 200}
+	return &incidentTelegramFake{failChats: map[string]string{}, failOnceChats: map[string]bool{}, global: "success", messageID: 200}
 }
 
 func (f *incidentTelegramFake) setGlobal(mode string) {
@@ -242,6 +243,15 @@ func (f *incidentTelegramFake) fixChat(chat string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.failChats, chat)
+	delete(f.failOnceChats, chat)
+}
+
+// failChatOnce makes only the next request to a chat fail permanently;
+// later requests follow the chat or global mode again.
+func (f *incidentTelegramFake) failChatOnce(chat string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failOnceChats[chat] = true
 }
 
 func (f *incidentTelegramFake) requestCount() int {
@@ -273,7 +283,10 @@ func (f *incidentTelegramFake) handler() http.Handler {
 		f.chats = append(f.chats, chat)
 		f.texts = append(f.texts, text)
 		mode := f.global
-		if perChat, ok := f.failChats[chat]; ok {
+		if f.failOnceChats[chat] {
+			delete(f.failOnceChats, chat)
+			mode = "permanent"
+		} else if perChat, ok := f.failChats[chat]; ok {
 			mode = perChat
 		}
 		f.messageID++

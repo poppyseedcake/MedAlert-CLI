@@ -504,3 +504,56 @@ func TestIncidentSearchAuthCreatesOnlyAccountIncident(t *testing.T) {
 		t.Fatalf("recoveries = %s, want 1 (not duplicated)", got)
 	}
 }
+
+func TestIncidentMixedPassKeepsDestinationFailure(t *testing.T) {
+	medicoverFake, medicoverCleanup := newIncidentMedicoverFake(t)
+	defer medicoverCleanup()
+	medicoverFake.setSlots(incidentSlot("booking-mixed-a"))
+	telegramFake := newIncidentTelegramFake()
+	// The first phone send fails temporarily, leaving episode A with a
+	// retryable delivery for both destinations.
+	telegramFake.failChat("123456", "temporary")
+	telegramServer := httptest.NewServer(telegramFake.handler())
+	defer telegramServer.Close()
+
+	root := t.TempDir()
+	database, environment, secretDir := createIncidentFixture(t, medicoverFake.baseURL, telegramServer.URL, root, 1)
+	createIncidentDestinations(t, environment, secretDir)
+	createIncidentProfile(t, environment, "mixed", "alice", "204", "phone,backup")
+
+	first := run(t, environment, "check", "--profile", "mixed", "--output", "json", "--non-interactive")
+	if first.exitCode != 0 {
+		t.Fatalf("first check = %#v", first)
+	}
+
+	// The next phone send fails permanently while a new episode delivers
+	// through the same route in the same pass.
+	telegramFake.fixChat("123456")
+	telegramFake.failChatOnce("123456")
+	medicoverFake.setSlots(incidentSlot("booking-mixed-a"), incidentSlot("booking-mixed-b"))
+	second := run(t, environment, "check", "--profile", "mixed", "--output", "json", "--non-interactive")
+	if second.exitCode != 0 {
+		t.Fatalf("second check = %#v", second)
+	}
+	// The permanent phone failure must stay reported even though the same
+	// destination delivered the new episode in the same pass.
+	if got := incidentQuery(t, database, "SELECT status FROM operational_incidents WHERE scope_type = 'destination' AND scope_id = 'phone' ORDER BY first_seen_at DESC LIMIT 1"); got != "active" {
+		t.Fatalf("destination incident = %s, want active (failure wins over same-pass success)", got)
+	}
+	if got := incidentQuery(t, database, "SELECT count(*) FROM operational_deliveries WHERE kind = 'failure' AND status = 'delivered'"); got != "1" {
+		t.Fatalf("failure deliveries = %s, want 1 reported through backup", got)
+	}
+
+	// A later all-success pass resolves the incident with a recovery.
+	medicoverFake.setSlots(incidentSlot("booking-mixed-a"), incidentSlot("booking-mixed-b"), incidentSlot("booking-mixed-c"))
+	third := run(t, environment, "check", "--profile", "mixed", "--output", "json", "--non-interactive")
+	if third.exitCode != 0 {
+		t.Fatalf("third check = %#v", third)
+	}
+	if got := incidentQuery(t, database, "SELECT status FROM operational_incidents WHERE scope_type = 'destination' AND scope_id = 'phone' ORDER BY first_seen_at DESC LIMIT 1"); got != "resolved" {
+		t.Fatalf("destination incident = %s, want resolved", got)
+	}
+	if got := incidentQuery(t, database, "SELECT count(*) FROM operational_deliveries WHERE kind = 'recovery' AND status = 'delivered'"); got != "1" {
+		t.Fatalf("recoveries = %s, want 1", got)
+	}
+}

@@ -34,11 +34,15 @@ type IncidentSummary struct {
 }
 
 // EligibleDestinationsForProfile returns the enabled linked destination ids
-// for a profile, ordered lexicographically.
-func EligibleDestinationsForProfile(storage *store.Store, profileID string) []string {
+// for a profile, ordered lexicographically. Database failures are returned
+// instead of an empty list: treating them as "no destinations" would create
+// an incident without failure deliveries, and later updates can never add
+// the missing routes (one failure notification per destination per
+// incident).
+func EligibleDestinationsForProfile(storage *store.Store, profileID string) ([]string, error) {
 	destinations, err := storage.ListProfileDestinations(profileID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	ids := []string{}
 	for _, destination := range destinations {
@@ -46,16 +50,16 @@ func EligibleDestinationsForProfile(storage *store.Store, profileID string) []st
 			ids = append(ids, destination.ID)
 		}
 	}
-	return ids
+	return ids, nil
 }
 
 // EligibleDestinationsForAccount returns the unique enabled linked
 // destination ids across all profiles of an account. One account incident
 // notifies each unique route once even when many profiles are affected.
-func EligibleDestinationsForAccount(storage *store.Store, accountID string) []string {
+func EligibleDestinationsForAccount(storage *store.Store, accountID string) ([]string, error) {
 	profiles, err := storage.ListProfiles(accountID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	seen := map[string]bool{}
 	result := []string{}
@@ -63,33 +67,43 @@ func EligibleDestinationsForAccount(storage *store.Store, accountID string) []st
 		if !profile.Enabled {
 			continue
 		}
-		for _, id := range EligibleDestinationsForProfile(storage, profile.ID) {
+		ids, err := EligibleDestinationsForProfile(storage, profile.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
 			if !seen[id] {
 				seen[id] = true
 				result = append(result, id)
 			}
 		}
 	}
-	return result
+	return result, nil
 }
 
 // OtherDestinationsForProfile returns the enabled linked destinations of a
 // profile excluding the failed one. Route failures are reported through the
 // other active routes, never the failed route itself.
-func OtherDestinationsForProfile(storage *store.Store, profileID, failedDestinationID string) []string {
-	eligible := EligibleDestinationsForProfile(storage, profileID)
+func OtherDestinationsForProfile(storage *store.Store, profileID, failedDestinationID string) ([]string, error) {
+	eligible, err := EligibleDestinationsForProfile(storage, profileID)
+	if err != nil {
+		return nil, err
+	}
 	result := []string{}
 	for _, id := range eligible {
 		if id != failedDestinationID {
 			result = append(result, id)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // RecordAccountFailure tracks an authentication-phase failure for an account.
 func RecordAccountFailure(storage *store.Store, accountID, failureCode, failureMessage string, now time.Time) (store.Incident, bool, error) {
-	eligible := EligibleDestinationsForAccount(storage, accountID)
+	eligible, err := EligibleDestinationsForAccount(storage, accountID)
+	if err != nil {
+		return store.Incident{}, false, err
+	}
 	incident, _, newly, err := storage.RecordIncidentFailure(store.IncidentScopeAccount, accountID, accountID, "", "", failureCode, failureMessage, now, eligible)
 	return incident, newly, err
 }
@@ -103,7 +117,10 @@ func ResolveAccountIncident(storage *store.Store, accountID string, now time.Tim
 
 // RecordProfileFailure tracks a search-phase failure for a profile.
 func RecordProfileFailure(storage *store.Store, profile store.Profile, failureCode, failureMessage string, now time.Time) (store.Incident, bool, error) {
-	eligible := EligibleDestinationsForProfile(storage, profile.ID)
+	eligible, err := EligibleDestinationsForProfile(storage, profile.ID)
+	if err != nil {
+		return store.Incident{}, false, err
+	}
 	incident, _, newly, err := storage.RecordIncidentFailure(store.IncidentScopeProfile, profile.ID, profile.AccountID, profile.ID, "", failureCode, failureMessage, now, eligible)
 	return incident, newly, err
 }
@@ -118,7 +135,10 @@ func ResolveProfileIncident(storage *store.Store, profile store.Profile, now tim
 // RecordDestinationFailure tracks a permanent Telegram delivery failure for
 // one profile and destination. Notifiers exclude the failed route.
 func RecordDestinationFailure(storage *store.Store, profile store.Profile, failedDestinationID, failureCode, failureMessage string, now time.Time) (store.Incident, bool, error) {
-	notifiers := OtherDestinationsForProfile(storage, profile.ID, failedDestinationID)
+	notifiers, err := OtherDestinationsForProfile(storage, profile.ID, failedDestinationID)
+	if err != nil {
+		return store.Incident{}, false, err
+	}
 	incident, _, newly, err := storage.RecordIncidentFailure(store.IncidentScopeDestination, failedDestinationID, profile.AccountID, profile.ID, failedDestinationID, failureCode, failureMessage, now, notifiers)
 	return incident, newly, err
 }

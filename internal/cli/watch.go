@@ -679,6 +679,7 @@ func (w *watchLoop) resolveWatchIncidentsOnSuccess(ctx context.Context, profile 
 // that delivered successfully. It never stops other profiles.
 func (w *watchLoop) trackWatchDestinationIncidents(ctx context.Context, profile store.Profile, summary monitoring.DeliverySummary) error {
 	now := time.Now().UTC()
+	failed := map[string]bool{}
 	for _, delivery := range summary.Deliveries {
 		if delivery.Status != store.DeliveryPermanentFailure {
 			continue
@@ -692,6 +693,7 @@ func (w *watchLoop) trackWatchDestinationIncidents(ctx context.Context, profile 
 		if strings.Contains(strings.ToLower(delivery.LastError), "5 attempts") {
 			continue
 		}
+		failed[delivery.DestinationID] = true
 		incident, newly, err := monitoring.RecordDestinationFailure(w.storage, profile, delivery.DestinationID, "permanent_failure", delivery.LastError, now)
 		if err != nil {
 			return err
@@ -703,6 +705,13 @@ func (w *watchLoop) trackWatchDestinationIncidents(ctx context.Context, profile 
 	}
 	for _, delivery := range summary.Deliveries {
 		if delivery.Status != store.DeliveryDelivered {
+			continue
+		}
+		// Destinations that also failed in this same pass keep their
+		// incident: the route is still broken, and resolving now would
+		// cancel the just-created failure notification before it is
+		// reported.
+		if failed[delivery.DestinationID] {
 			continue
 		}
 		if incident, _, _, err := w.storage.ResolveIncident(store.IncidentScopeDestination, delivery.DestinationID, profile.ID, delivery.DestinationID, now); err != nil {

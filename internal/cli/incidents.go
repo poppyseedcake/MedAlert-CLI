@@ -154,6 +154,7 @@ func resolveIncidentsOnSuccess(storage *store.Store, profile store.Profile, now 
 // destination configuration problem, and stay as delivery history without a
 // separate incident to avoid notification storms when all routes fail.
 func trackDestinationIncidents(storage *store.Store, profile store.Profile, summary monitoring.DeliverySummary, now time.Time) error {
+	failed := map[string]store.Delivery{}
 	for _, delivery := range summary.Deliveries {
 		if delivery.Status != store.DeliveryPermanentFailure {
 			continue
@@ -169,15 +170,21 @@ func trackDestinationIncidents(storage *store.Store, profile store.Profile, summ
 		}
 		// Only availability permanent failures reach here; incident summary
 		// deliveries are handled separately and never create incidents.
+		failed[delivery.DestinationID] = delivery
 		if _, _, err := monitoring.RecordDestinationFailure(storage, profile, delivery.DestinationID, "permanent_failure", delivery.LastError, now); err != nil {
 			return err
 		}
 	}
 	// A later successful delivery to a previously failed destination ends its
 	// destination incident; recovery goes through the routes that delivered
-	// the failure.
+	// the failure. Destinations that also failed in this same pass are
+	// skipped: the route is still broken, and resolving now would cancel the
+	// just-created failure notification before it is reported.
 	for _, delivery := range summary.Deliveries {
 		if delivery.Status != store.DeliveryDelivered {
+			continue
+		}
+		if _, ok := failed[delivery.DestinationID]; ok {
 			continue
 		}
 		if _, err := monitoring.ResolveDestinationIncident(storage, profile, delivery.DestinationID, now); err != nil {
