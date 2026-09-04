@@ -39,6 +39,16 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 	if err != nil {
 		return reportProfileError(stderr, command, err, jsonOutput)
 	}
+	// Maintenance: finalize rows stuck after an interrupted final claim.
+	// Stuck rows cannot schedule work by themselves (see watch
+	// launchIteration), so a manual check finalizes them too — including
+	// for disabled profiles, whose exhausted budget is terminal regardless
+	// of enabled state. Dry runs never touch durable state.
+	if !settings.dry {
+		if _, err := storage.ReapExpiredMaxAttemptClaims(profile.ID, time.Now().UTC()); err != nil {
+			return reportStoreError(stderr, command, err, jsonOutput)
+		}
+	}
 	if !settings.dry && !profile.Enabled {
 		return reportCheckError(stderr, command, fmt.Errorf("%w: %s", store.ErrProfileDisabled, profile.ID), jsonOutput)
 	}

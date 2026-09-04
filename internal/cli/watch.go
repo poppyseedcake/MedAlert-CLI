@@ -262,6 +262,19 @@ func (w *watchLoop) launchIteration(ctx context.Context) bool {
 			w.mu.Unlock()
 		}
 	}
+	// Maintenance: finalize rows stuck after an interrupted final claim.
+	// Stuck rows (pending at the attempt budget with an expired lease) are
+	// excluded from due selection, so they cannot schedule a run by
+	// themselves and would otherwise wait for another successful run — or
+	// linger indefinitely for profiles that never run (long intervals,
+	// disabled or paused profiles). Reaping needs no observation or
+	// authentication and is a single indexed SELECT when empty, so it runs
+	// for every listed profile on every iteration.
+	for _, profile := range profiles {
+		if _, err := w.storage.ReapExpiredMaxAttemptClaims(profile.ID, now); err != nil {
+			w.log("cannot reap telegram deliveries for profile %s: %s", profile.ID, shortWatchMessage(err))
+		}
+	}
 	w.mu.Lock()
 	due := monitoring.DueProfiles(profiles, w.lastRuns, now)
 	w.mu.Unlock()

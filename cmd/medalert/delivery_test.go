@@ -586,6 +586,108 @@ func TestDeliverySkipsUnlinkedDestination(t *testing.T) {
 	}
 }
 
+// craftStuckDeliveries rewrites every delivery row into the state left by a
+// crash after a fifth claim: pending at the attempt budget with an expired
+// lease. Such rows are excluded from due selection, so only maintenance
+// reaping (never a send) may finalize them.
+func craftStuckDeliveries(t *testing.T, database string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	expired := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := db.Exec(`UPDATE telegram_deliveries SET status = 'pending', attempts = 5, next_attempt_at = ?`, expired); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeliveryReapsStuckClaimWithoutObservation(t *testing.T) {
+	medicoverFake, medicoverCleanup := newDurableCheckFake(t)
+	defer medicoverCleanup()
+	medicoverFake.setSlots(durableSlot("booking-reap"))
+	telegramFake := newDeliveryTelegramFake()
+	telegramServer := httptest.NewServer(telegramFake.handler())
+	defer telegramServer.Close()
+
+	root := t.TempDir()
+	database, environment, _ := createDeliveryFixture(t, medicoverFake.baseURL, telegramServer.URL, root, 30)
+
+	first := runDeliveryCheck(t, environment)
+	if first.exitCode != 0 {
+		t.Fatalf("first check = %#v", first)
+	}
+	if got := telegramFake.requestCount(); got != 2 {
+		t.Fatalf("requests after first check = %d, want 2", got)
+	}
+	craftStuckDeliveries(t, database)
+
+	// The profile is not due (30-minute interval just ran) and stuck rows
+	// cannot schedule it, so a correct watch performs no observation run —
+	// yet maintenance must still finalize the stuck rows without sending.
+	watched := run(t, environment, "watch", "--once", "--poll-interval", "100ms", "--output", "json", "--non-interactive")
+	if watched.exitCode != 0 {
+		t.Fatalf("watch --once = %#v", watched)
+	}
+	if got := telegramFake.requestCount(); got != 2 {
+		t.Fatalf("requests after reap watch = %d, want still 2 (no sends)", got)
+	}
+	if got := deliveryQuery(t, database, "SELECT count(*) FROM observation_runs"); got != "1" {
+		t.Fatalf("observation runs = %s, want 1 (no observation ran)", got)
+	}
+	if got := deliveryQuery(t, database, "SELECT count(*) FROM telegram_deliveries WHERE status = 'permanent_failure'"); got != "2" {
+		t.Fatalf("reaped permanent = %s, want 2", got)
+	}
+	db, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var reason string
+	if err := db.QueryRow("SELECT last_error FROM telegram_deliveries LIMIT 1").Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reason, "5 attempts") {
+		t.Fatalf("reaped reason = %q, want exhaustion message", reason)
+	}
+}
+
+func TestDeliveryReapsStuckClaimForDisabledProfile(t *testing.T) {
+	medicoverFake, medicoverCleanup := newDurableCheckFake(t)
+	defer medicoverCleanup()
+	medicoverFake.setSlots(durableSlot("booking-reap-disabled"))
+	telegramFake := newDeliveryTelegramFake()
+	telegramServer := httptest.NewServer(telegramFake.handler())
+	defer telegramServer.Close()
+
+	root := t.TempDir()
+	database, environment, _ := createDeliveryFixture(t, medicoverFake.baseURL, telegramServer.URL, root, 30)
+
+	first := runDeliveryCheck(t, environment)
+	if first.exitCode != 0 {
+		t.Fatalf("first check = %#v", first)
+	}
+	disabled := run(t, environment, "profile", "disable", "--profile", "morning")
+	if disabled.exitCode != 0 {
+		t.Fatalf("disable profile = %#v", disabled)
+	}
+	craftStuckDeliveries(t, database)
+
+	// The disabled check still refuses observation, but maintenance must
+	// finalize the exhausted rows instead of leaving them pending forever.
+	result := runDeliveryCheck(t, environment)
+	if result.exitCode != 2 || !strings.Contains(result.stderr, `"code":"profile_disabled"`) {
+		t.Fatalf("disabled check = %#v, want profile_disabled", result)
+	}
+	if got := telegramFake.requestCount(); got != 2 {
+		t.Fatalf("requests = %d, want still 2 (no sends)", got)
+	}
+	if got := deliveryQuery(t, database, "SELECT count(*) FROM telegram_deliveries WHERE status = 'permanent_failure'"); got != "2" {
+		t.Fatalf("reaped permanent = %s, want 2", got)
+	}
+}
+
 func TestDeliveryRetriesUnknownThenSends(t *testing.T) {
 	medicoverFake, medicoverCleanup := newDurableCheckFake(t)
 	defer medicoverCleanup()
