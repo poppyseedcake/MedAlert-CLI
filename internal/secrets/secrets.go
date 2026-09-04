@@ -275,6 +275,31 @@ func Resolve(source, ref, accountID string, stdin *os.File, stderr io.Writer, no
 	}
 }
 
+// IsTransient reports whether a secret resolution failure may succeed on a
+// later attempt without configuration changes, for example when Secret
+// Service is temporarily unavailable. Missing references, unsafe files,
+// missing interactive input, and unknown sources are permanent
+// configuration errors that need operator action.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrMissingInput) || errors.Is(err, ErrSecretNotFound) || errors.Is(err, ErrSecretUnsafe) {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "secret service is unavailable") {
+		return true
+	}
+	if strings.Contains(message, "temporarily unavailable") {
+		return true
+	}
+	if strings.Contains(message, "timed out") || strings.Contains(message, "timeout") {
+		return true
+	}
+	return false
+}
+
 // ResolveTelegramToken returns the bot token for a destination without ever
 // logging the value. source is one of secret-service, file, prompt. ref is
 // the file path for file sources and is ignored otherwise. destinationID

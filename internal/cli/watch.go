@@ -18,6 +18,7 @@ import (
 	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
+	"github.com/poppyseedcake/MedAlert/internal/telegram"
 )
 
 const (
@@ -74,19 +75,20 @@ func runWatch(command string, settings options, stdin *os.File, stdout, stderr i
 	stoppedSignal := make(chan string, 1)
 
 	watcher := &watchLoop{
-		command:     command,
-		storage:     storage,
-		client:      client,
-		backend:     backend,
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
-		jsonOutput:  jsonOutput,
-		lastRuns:    map[string]time.Time{},
-		paused:      map[string]bool{},
-		active:      map[string]bool{},
-		authActive:  map[string]bool{},
-		authRetryAt: map[string]time.Time{},
+		command:         command,
+		storage:         storage,
+		client:          client,
+		backend:         backend,
+		stdin:           stdin,
+		stdout:          stdout,
+		stderr:          stderr,
+		jsonOutput:      jsonOutput,
+		telegramBaseURL: settings.telegramBaseURL,
+		lastRuns:        map[string]time.Time{},
+		paused:          map[string]bool{},
+		active:          map[string]bool{},
+		authActive:      map[string]bool{},
+		authRetryAt:     map[string]time.Time{},
 	}
 	go func() {
 		select {
@@ -178,14 +180,15 @@ func (w *watchLoop) stopCompleted(ctx context.Context, stoppedSignal chan string
 }
 
 type watchLoop struct {
-	command    string
-	storage    *store.Store
-	client     *medicover.Client
-	backend    session.Store
-	stdin      *os.File
-	stdout     io.Writer
-	stderr     io.Writer
-	jsonOutput bool
+	command         string
+	storage         *store.Store
+	client          *medicover.Client
+	backend         session.Store
+	stdin           *os.File
+	stdout          io.Writer
+	stderr          io.Writer
+	jsonOutput      bool
+	telegramBaseURL string
 
 	// mu guards lastRuns, paused, authActive and authRetryAt. activeMu guards
 	// active. writeMu serializes all stdout/stderr writes so concurrent
@@ -259,9 +262,47 @@ func (w *watchLoop) launchIteration(ctx context.Context) bool {
 			w.mu.Unlock()
 		}
 	}
+	// Maintenance: finalize rows stuck after an interrupted final claim.
+	// Stuck rows (pending at the attempt budget with an expired lease) are
+	// excluded from due selection, so they cannot schedule a run by
+	// themselves and would otherwise wait for another successful run — or
+	// linger indefinitely for profiles that never run (long intervals,
+	// disabled or paused profiles). Reaping needs no observation or
+	// authentication and is a single indexed SELECT when empty, so it runs
+	// for every listed profile on every iteration.
+	for _, profile := range profiles {
+		if _, err := w.storage.ReapExpiredMaxAttemptClaims(profile.ID, now); err != nil {
+			w.log("cannot reap telegram deliveries for profile %s: %s", profile.ID, shortWatchMessage(err))
+		}
+	}
 	w.mu.Lock()
 	due := monitoring.DueProfiles(profiles, w.lastRuns, now)
 	w.mu.Unlock()
+	// Retry-due: profiles with pending Telegram work whose latest observation
+	// was complete become due for a fresh observation run before the repeated
+	// delivery, even before their interval elapses. Failed runs respect the
+	// interval so persistent Medicover failures do not hammer the portal
+	// every poll while pending exists. Valid retry_after values already gate
+	// ListDueDeliveries through next_attempt_at.
+	if ctx.Err() == nil {
+		dueIDs := map[string]bool{}
+		for _, profile := range due {
+			dueIDs[profile.ID] = true
+		}
+		for _, profile := range profiles {
+			if !profile.Enabled || dueIDs[profile.ID] {
+				continue
+			}
+			retryDue, err := w.storage.IsRetryDue(profile.ID, now)
+			if err != nil {
+				w.log("cannot check telegram retry for profile %s: %s", profile.ID, shortWatchMessage(err))
+				continue
+			}
+			if retryDue {
+				due = append(due, profile)
+			}
+		}
+	}
 	if len(due) == 0 {
 		return ctx.Err() == nil
 	}
@@ -351,13 +392,17 @@ func (w *watchLoop) runAccountProfiles(ctx context.Context, accountID string, ac
 		// Re-evaluate due status against the refreshed configuration and the
 		// current schedule. An operator may have lengthened the interval
 		// while authentication was in progress; the saved configuration wins
-		// over the snapshot taken before authentication.
+		// over the snapshot taken before authentication. Retry-due profiles
+		// stay due for a fresh observation before the repeated delivery.
 		w.mu.Lock()
 		last := w.lastRuns[fresh.ID]
 		stillDue := monitoring.IsProfileDue(fresh, last, time.Now().UTC())
 		w.mu.Unlock()
 		if !stillDue {
-			continue
+			retryDue, err := w.storage.IsRetryDue(fresh.ID, time.Now().UTC())
+			if err != nil || !retryDue {
+				continue
+			}
 		}
 		w.activeMu.Lock()
 		if w.active[fresh.ID] {
@@ -571,6 +616,10 @@ func (w *watchLoop) checkOne(ctx context.Context, profile store.Profile, account
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "profile": profile.ID, "code": code, "message": message})
 		return
 	}
+	deliveries := w.deliverAfterWatchCheck(ctx, profile, result)
+	if deliveries.Attempted > 0 || deliveries.Cancelled > 0 || deliveries.Failed > 0 {
+		w.log("profile %s telegram: %d delivered, %d pending, %d failed, %d cancelled", profile.ID, deliveries.Delivered, deliveries.StillRetry, deliveries.Failed, deliveries.Cancelled)
+	}
 	w.log("profile %s completed: %d slots, %d newly available, %d ended", profile.ID, len(result.Search.Slots), len(result.Reconciliation.NewEpisodes), len(result.Reconciliation.EndedEpisodes))
 	w.emitEvent("run_completed", map[string]any{
 		"account":              account.ID,
@@ -580,7 +629,36 @@ func (w *watchLoop) checkOne(ctx context.Context, profile store.Profile, account
 		"newly_available":      len(result.Reconciliation.NewEpisodes),
 		"ended":                len(result.Reconciliation.EndedEpisodes),
 		"active_episode_count": countActiveEpisodes(w.storage, profile.ID),
+		"delivered":            deliveries.Delivered,
+		"delivery_failed":      deliveries.Failed,
+		"delivery_pending":     deliveries.StillRetry,
+		"delivery_cancelled":   deliveries.Cancelled,
 	})
+}
+
+// deliverAfterWatchCheck runs durable Telegram notifications after a complete
+// watch run. Observation success wins: delivery store errors are logged but
+// still report run_completed, and Telegram retryable failures stay pending
+// for later cycles. Token resolution never prompts so automation never blocks.
+func (w *watchLoop) deliverAfterWatchCheck(ctx context.Context, profile store.Profile, result monitoring.CheckResult) monitoring.DeliverySummary {
+	sender := telegramSenderFor(options{telegramBaseURL: w.telegramBaseURL})
+	resolve := func(destination store.Destination) (telegram.Secret, error) {
+		token, err := secrets.ResolveTelegramToken(destination.TokenSource, destination.TokenRef, destination.ID, w.stdin, w.stderr, true)
+		if err != nil {
+			return "", err
+		}
+		secret := telegram.Secret(token)
+		token = ""
+		return secret, nil
+	}
+	deliveryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	summary, err := monitoring.ProcessAvailabilityDeliveries(deliveryCtx, w.storage, profile, result.Reconciliation, sender, resolve, time.Now().UTC())
+	if err != nil {
+		w.log("profile %s delivery error: %s", profile.ID, shortWatchMessage(err))
+		return monitoring.DeliverySummary{Deliveries: []store.Delivery{}}
+	}
+	return summary
 }
 
 func countActiveEpisodes(storage *store.Store, profileID string) int {

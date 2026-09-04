@@ -1,6 +1,7 @@
 package secrets_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,10 @@ import (
 	"github.com/zalando/go-keyring"
 	"golang.org/x/sys/unix"
 )
+
+func wrapSecretError(message string) error {
+	return fmt.Errorf("resolve telegram token: %s", message)
+}
 
 func TestSecretFileRoundTripAndRedaction(t *testing.T) {
 	keyring.MockInit()
@@ -175,5 +180,33 @@ func TestTelegramTokenSeparateNamespaceDoesNotLeak(t *testing.T) {
 	}
 	if _, err := secrets.GetTelegramToken("phone"); err == nil {
 		t.Fatal("deleted token still readable")
+	}
+}
+
+func TestIsTransientDistinguishesOutageFromConfigErrors(t *testing.T) {
+	keyring.MockInit()
+	if secrets.IsTransient(nil) {
+		t.Fatal("nil is transient")
+	}
+	for _, err := range []error{
+		secrets.ErrMissingInput,
+		secrets.ErrSecretNotFound,
+		secrets.ErrSecretUnsafe,
+	} {
+		if secrets.IsTransient(err) {
+			t.Fatalf("%v is transient, want permanent", err)
+		}
+	}
+	for _, err := range []error{
+		wrapSecretError("read telegram secret: secret service is unavailable"),
+		wrapSecretError("Secret Service Is Unavailable, try again"),
+		wrapSecretError("telegram send timed out"),
+	} {
+		if !secrets.IsTransient(err) {
+			t.Fatalf("%v is permanent, want transient", err)
+		}
+	}
+	if secrets.IsTransient(wrapSecretError("unknown token source")) {
+		t.Fatal("unknown source is transient, want permanent")
 	}
 }
