@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/zalando/go-keyring"
 )
 
@@ -171,5 +172,38 @@ func TestTelegramProfileLinkingValidation(t *testing.T) {
 	stderr.Reset()
 	if code := RunWithIO([]string{"profile", "edit", "--database", database, "--non-interactive", "--profile", "bad", "--telegram", "one", "--clear-telegram"}, os.Stdin, &stdout, &stderr, getenv); code != 2 {
 		t.Fatalf("conflicting link flags = %d %q", code, stderr.String())
+	}
+}
+
+func TestWriteProfileWithDestinationsSurfacesReadErrors(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{ID: "alice", Username: "a@example.com", PasswordSource: store.PasswordSourcePrompt}); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := storage.CreateProfile(store.Profile{ID: "p1", AccountID: "alice", RegionIDs: "204", SpecialtyIDs: "132", CheckIntervalMinutes: 30, Enabled: true, SearchType: store.SearchTypeStandard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Closing the handle forces the destination lookup to fail. The writer
+	// must return the failure instead of silently reporting no links.
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := writeProfileWithDestinations(&stdout, "profile show", storage, profile, "", true); err == nil {
+		t.Fatal("write succeeded with closed store, want destination read error")
+	} else if stdout.String() != "" {
+		t.Fatalf("write produced output despite read failure: %q", stdout.String())
 	}
 }

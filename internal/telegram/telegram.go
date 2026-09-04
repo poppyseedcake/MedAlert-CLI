@@ -179,7 +179,7 @@ func (c *Client) SendMessage(ctx context.Context, token Secret, chatID, text str
 		}
 		return Result{}, &Error{Code: CodeTemporary, Message: "cannot read telegram response", Diagnostic: diagnosticWithStatus(diagnostic, response.StatusCode)}
 	}
-	return classifyResponse(response.StatusCode, response.Header.Get("Retry-After"), body, diagnostic)
+	return classifyResponse(response.StatusCode, response.Header.Get("Retry-After"), body, diagnostic, rawToken)
 }
 
 // RedactURL replaces the token segment of a Telegram Bot API URL with
@@ -253,7 +253,7 @@ type telegramResponse struct {
 	} `json:"parameters"`
 }
 
-func classifyResponse(status int, retryAfterHeader string, body []byte, diagnostic string) (Result, error) {
+func classifyResponse(status int, retryAfterHeader string, body []byte, diagnostic, token string) (Result, error) {
 	withStatus := diagnosticWithStatus(diagnostic, status)
 	if status == http.StatusTooManyRequests {
 		delay := parseRetryAfterBody(body, retryAfterHeader)
@@ -302,13 +302,13 @@ func classifyResponse(status int, retryAfterHeader string, body []byte, diagnost
 		delay := parseRetryAfterBody(body, retryAfterHeader)
 		return Result{}, &Error{Code: CodeRateLimited, Message: "telegram rate limit was reached", RetryAfter: delay, Diagnostic: withStatus}
 	case code == 400, code == 401, code == 403, code == 404:
-		return Result{}, &Error{Code: CodePermanent, Message: safeDescription(envelope.Description), Diagnostic: withStatus}
+		return Result{}, &Error{Code: CodePermanent, Message: sanitizeDescription(envelope.Description, token), Diagnostic: withStatus}
 	case code >= 500:
 		return Result{}, &Error{Code: CodeTemporary, Message: "telegram is temporarily unavailable", Diagnostic: withStatus}
 	case code == 408:
 		return Result{}, &Error{Code: CodeTimeout, Message: "telegram send timed out", Diagnostic: withStatus}
 	case code >= 400 && code < 500:
-		return Result{}, &Error{Code: CodePermanent, Message: safeDescription(envelope.Description), Diagnostic: withStatus}
+		return Result{}, &Error{Code: CodePermanent, Message: sanitizeDescription(envelope.Description, token), Diagnostic: withStatus}
 	default:
 		return Result{}, &Error{Code: CodeUnknown, Message: "unknown telegram delivery", Diagnostic: withStatus}
 	}
@@ -341,8 +341,13 @@ func parseRetryAfterBody(body []byte, header string) time.Duration {
 	return 0
 }
 
-func safeDescription(description string) string {
-	trimmed := strings.TrimSpace(description)
+// sanitizeDescription redacts the bot token from an endpoint-controlled
+// description before it crosses the seam. A malicious or buggy endpoint could
+// echo the token-bearing request URL in description; without redaction that
+// value would be persisted in last_test_error and exposed via telegram show.
+func sanitizeDescription(description, token string) string {
+	redacted := RedactURL(description, token)
+	trimmed := strings.TrimSpace(redacted)
 	if trimmed == "" {
 		return "telegram rejected the message"
 	}

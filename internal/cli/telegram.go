@@ -389,7 +389,7 @@ func telegramTest(command string, settings options, stdin *os.File, stdout, stde
 		detail := shortTelegramMessage(sendErr)
 		if errors.As(sendErr, &telegramErr) {
 			status = telegramErr.Code
-			detail = shortTelegramMessage(sendErr)
+			detail = telegramDetailWithRetry(sendErr, telegramErr)
 		}
 		_, _ = storage.RecordDestinationTest(id, status, detail, time.Now().UTC())
 		return reportTelegramSendError(stderr, command, sendErr, jsonOutput)
@@ -509,13 +509,19 @@ func reportTelegramSendError(stderr io.Writer, command string, err error, jsonOu
 			writeError(stderr, command, "cancelled", telegramErr.Message, jsonOutput)
 			return 6
 		case telegram.CodeRateLimited:
-			writeError(stderr, command, "rate_limited", telegramErr.Message, jsonOutput)
+			writeRateLimitError(stderr, command, telegramErr.Message, telegramErr.RetryAfter, jsonOutput)
 			return 4
 		case telegram.CodeTimeout:
 			writeError(stderr, command, "timeout", telegramErr.Message, jsonOutput)
 			return 4
-		case telegram.CodeTemporary, telegram.CodeUnknown:
+		case telegram.CodeTemporary:
 			writeError(stderr, command, "temporary_failure", telegramErr.Message, jsonOutput)
+			return 4
+		case telegram.CodeUnknown:
+			// Unknown means the server may or may not have accepted the
+			// message, so a retry may duplicate it. Report a distinct code
+			// instead of collapsing to temporary_failure.
+			writeError(stderr, command, "unknown_delivery", telegramErr.Message, jsonOutput)
 			return 4
 		}
 	}
@@ -536,6 +542,22 @@ func shortTelegramMessage(err error) string {
 		return "telegram send failed"
 	}
 	return message
+}
+
+// telegramDetailWithRetry keeps the server-requested backoff in the persisted
+// test detail so history shows when to retry. Without it a 429 leaves no
+// backoff for operators or automation.
+func telegramDetailWithRetry(sendErr error, telegramErr *telegram.Error) string {
+	base := shortTelegramMessage(sendErr)
+	if telegramErr == nil || telegramErr.Code != telegram.CodeRateLimited || telegramErr.RetryAfter <= 0 {
+		return base
+	}
+	seconds := int(telegramErr.RetryAfter / time.Second)
+	suffixed := fmt.Sprintf("%s (retry after %ds)", base, seconds)
+	if len(suffixed) > 500 {
+		return suffixed[:500]
+	}
+	return suffixed
 }
 
 func writeDestination(stdout io.Writer, command string, destination store.Destination, textTemplate string, jsonOutput bool) {

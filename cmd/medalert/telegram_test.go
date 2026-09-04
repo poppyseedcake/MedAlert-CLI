@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func createTelegramDestination(t *testing.T, databasePath, id, name, chatID, tokenFile string, extra ...string) {
@@ -291,6 +294,115 @@ func TestTelegramTestClassifiesPermanentFailure(t *testing.T) {
 		t.Fatal("failure leaks token")
 	}
 	assertProcessQueryValue(t, databasePath, "SELECT last_test_status FROM telegram_destinations WHERE id = 'bad'", "permanent_failure")
+}
+
+func TestTelegramTestRedactsTokenEchoedInDescription(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tokenMarker := "MARKER-ECHO-TOKEN-unique-456"
+	tokenFile := writeProcessSecretFile(t, secretDir, "token", tokenMarker)
+	createTelegramDestination(t, databasePath, "echo", "Echo", "777", tokenFile)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		// Endpoint echoes the token-bearing URL in description.
+		body := `{"ok":false,"error_code":400,"description":"Bad Request: https://api.telegram.org/bot` + tokenMarker + `/sendMessage failed"}`
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+	env := []string{"MEDALERT_TELEGRAM_BASE_URL=" + server.URL}
+
+	failed := run(t, env, "telegram", "test", "--database", databasePath, "--telegram", "echo", "--output", "json")
+	if failed.exitCode != 2 || !strings.Contains(failed.stderr, `"code":"permanent_failure"`) {
+		t.Fatalf("echo failure = %#v", failed)
+	}
+	if strings.Contains(failed.stdout, tokenMarker) || strings.Contains(failed.stderr, tokenMarker) {
+		t.Fatalf("echoed description leaks token: stdout=%q stderr=%q", failed.stdout, failed.stderr)
+	}
+	if !strings.Contains(failed.stderr, "[REDACTED]") {
+		t.Fatalf("echoed description not redacted: %q", failed.stderr)
+	}
+	raw, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), tokenMarker) {
+		t.Fatal("database contains echoed token")
+	}
+	shown := run(t, nil, "telegram", "show", "--database", databasePath, "--telegram", "echo", "--output", "json")
+	if strings.Contains(shown.stdout, tokenMarker) {
+		t.Fatalf("show leaks echoed token: %q", shown.stdout)
+	}
+}
+
+func TestTelegramTestSurfacesRetryAfter(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tokenFile := writeProcessSecretFile(t, secretDir, "token", "rate-token")
+	createTelegramDestination(t, databasePath, "limited", "Limit", "555", tokenFile)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":31}}`))
+	}))
+	defer server.Close()
+	env := []string{"MEDALERT_TELEGRAM_BASE_URL=" + server.URL}
+
+	limited := run(t, env, "telegram", "test", "--database", databasePath, "--telegram", "limited", "--output", "json")
+	if limited.exitCode != 4 || !strings.Contains(limited.stderr, `"code":"rate_limited"`) {
+		t.Fatalf("rate limited = %#v", limited)
+	}
+	if !strings.Contains(limited.stderr, `"retry_after":31`) {
+		t.Fatalf("rate limited missing retry_after: %q", limited.stderr)
+	}
+	assertProcessQueryValue(t, databasePath, "SELECT last_test_status FROM telegram_destinations WHERE id = 'limited'", "rate_limited")
+	// Persisted detail keeps the backoff for operators.
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var detail string
+	if err := db.QueryRow("SELECT last_test_error FROM telegram_destinations WHERE id = 'limited'").Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(detail, "31") {
+		t.Fatalf("persisted detail missing retry_after: %q", detail)
+	}
+}
+
+func TestTelegramTestReportsUnknownDeliveryDistinctly(t *testing.T) {
+	root := privateTempDir(t)
+	databasePath := filepath.Join(root, "medalert.db")
+	secretDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tokenFile := writeProcessSecretFile(t, secretDir, "token", "unknown-token")
+	createTelegramDestination(t, databasePath, "mystery", "Mystery", "666", tokenFile)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`not json`))
+	}))
+	defer server.Close()
+	env := []string{"MEDALERT_TELEGRAM_BASE_URL=" + server.URL}
+
+	unknown := run(t, env, "telegram", "test", "--database", databasePath, "--telegram", "mystery", "--output", "json")
+	if unknown.exitCode != 4 || !strings.Contains(unknown.stderr, `"code":"unknown_delivery"`) {
+		t.Fatalf("unknown = %#v", unknown)
+	}
+	assertProcessQueryValue(t, databasePath, "SELECT last_test_status FROM telegram_destinations WHERE id = 'mystery'", "unknown_delivery")
 }
 
 func TestTelegramPolishAvailabilityFormatting(t *testing.T) {

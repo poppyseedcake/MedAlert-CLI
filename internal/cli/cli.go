@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/poppyseedcake/MedAlert/internal/buildinfo"
 	"github.com/poppyseedcake/MedAlert/internal/store"
@@ -71,8 +72,9 @@ type options struct {
 }
 
 type errorBody struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	RetryAfter *int   `json:"retry_after,omitempty"`
 }
 
 func Run(arguments []string, stdout, stderr io.Writer, getenv func(string) string) int {
@@ -1058,6 +1060,24 @@ func writeError(writer io.Writer, command, code, message string, jsonOutput bool
 		return
 	}
 	fmt.Fprintf(writer, "Error: %s\n", message)
+}
+
+// writeRateLimitError reports a 429 with the server-requested backoff so
+// automation can honor Retry-After instead of polling blindly. The retry
+// value is omitted when the server did not provide a valid one.
+func writeRateLimitError(writer io.Writer, command, message string, retryAfter time.Duration, jsonOutput bool) {
+	seconds := int(retryAfter / time.Second)
+	var retryField *int
+	display := message
+	if seconds > 0 {
+		retryField = &seconds
+		display = fmt.Sprintf("%s (retry after %ds)", message, seconds)
+	}
+	if jsonOutput {
+		writeJSON(writer, map[string]any{"schema_version": resultSchemaVersion, "command": command, "error": errorBody{Code: "rate_limited", Message: display, RetryAfter: retryField}})
+		return
+	}
+	fmt.Fprintf(writer, "Error: %s\n", display)
 }
 
 func writeJSON(writer io.Writer, value any) {

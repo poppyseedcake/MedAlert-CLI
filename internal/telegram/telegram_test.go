@@ -190,3 +190,29 @@ func TestPolishTestMessageIsSafe(t *testing.T) {
 		t.Fatal("test message contains marker")
 	}
 }
+
+func TestSendRedactsTokenEchoedInDescription(t *testing.T) {
+	token := "SECRET-ECHO-TOKEN-unique-789"
+	// A buggy or malicious endpoint echoes the token-bearing URL in description.
+	body := `{"ok":false,"error_code":400,"description":"Bad Request: https://api.telegram.org/bot` + token + `/sendMessage failed"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+	_, err := testClient(server).SendMessage(context.Background(), telegram.Secret(token), "1", "hi")
+	typed, ok := err.(*telegram.Error)
+	if !ok {
+		t.Fatalf("error type = %T (%v)", err, err)
+	}
+	if typed.Code != telegram.CodePermanent {
+		t.Fatalf("code = %q, want permanent", typed.Code)
+	}
+	if strings.Contains(err.Error(), token) || strings.Contains(typed.Message, token) || strings.Contains(typed.Diagnostic, token) {
+		t.Fatalf("error leaks token: err=%q message=%q diagnostic=%q", err.Error(), typed.Message, typed.Diagnostic)
+	}
+	if !strings.Contains(typed.Message, "[REDACTED]") {
+		t.Fatalf("message = %q, want redacted URL segment", typed.Message)
+	}
+}

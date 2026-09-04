@@ -271,3 +271,58 @@ func TestMigrateV4ToV5KeepsProfiles(t *testing.T) {
 		t.Fatalf("create destination after migrate: %v", err)
 	}
 }
+
+func TestCreateProfileWithDestinationsIsAtomic(t *testing.T) {
+	storage := openTelegramStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	// Missing destination leaves no orphan profile behind, so a retry with a
+	// valid list succeeds.
+	_, err := storage.CreateProfileWithDestinations(validProfile("atomic", "alice"), []string{"one", "missing"})
+	if err == nil {
+		t.Fatal("create with missing destination succeeded")
+	}
+	if _, err := storage.GetProfile("atomic"); err == nil {
+		t.Fatal("partial profile left behind after failed atomic create")
+	}
+	created, err := storage.CreateProfileWithDestinations(validProfile("atomic", "alice"), []string{"one"})
+	if err != nil {
+		t.Fatalf("retry after failed atomic create: %v", err)
+	}
+	ids, err := storage.ListProfileDestinationIDs(created.ID)
+	if err != nil || len(ids) != 1 || ids[0] != "one" {
+		t.Fatalf("links after retry = %#v, %v", ids, err)
+	}
+}
+
+func TestUpdateProfileWithDestinationsIsAtomic(t *testing.T) {
+	storage := openTelegramStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	if _, err := storage.CreateDestination(validDestination("one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateProfile(validProfile("edit-atomic", "alice")); err != nil {
+		t.Fatal(err)
+	}
+	clinic := "10"
+	_, err := storage.UpdateProfileWithDestinations("edit-atomic", store.ProfileUpdate{ClinicIDs: &clinic}, true, []string{"missing"}, true)
+	if err == nil {
+		t.Fatal("update with missing destination succeeded")
+	}
+	shown, err := storage.GetProfile("edit-atomic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shown.ClinicIDs == "10" {
+		t.Fatalf("criteria changed despite failed atomic update: %#v", shown)
+	}
+	links, err := storage.ListProfileDestinationIDs("edit-atomic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 0 {
+		t.Fatalf("links changed despite failed atomic update: %#v", links)
+	}
+}

@@ -6,6 +6,8 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
@@ -457,6 +459,270 @@ func ValidateDestination(destination Destination) error {
 		return fmt.Errorf("%w: test result is too long", ErrDestinationInvalid)
 	}
 	return nil
+}
+
+// CreateProfileWithDestinations stores a new profile and its Telegram links
+// atomically. If any destination is missing the profile is not created, so a
+// retry does not hit a partial orphan row.
+func (s *Store) CreateProfileWithDestinations(profile Profile, destinationIDs []string) (Profile, error) {
+	normalizedProfile, err := normalizeProfile(profile)
+	if err != nil {
+		return Profile{}, err
+	}
+	profile = normalizedProfile
+	normalizedDestinations, err := normalizeDestinationIDs(destinationIDs)
+	if err != nil {
+		return Profile{}, err
+	}
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return Profile{}, fmt.Errorf("create profile: %w", err)
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return Profile{}, fmt.Errorf("create profile: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	var accountCount int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM accounts WHERE id = ?`, profile.AccountID).Scan(&accountCount); err != nil {
+		return Profile{}, fmt.Errorf("create profile: %w", err)
+	}
+	if accountCount == 0 {
+		return Profile{}, fmt.Errorf("%w: %s", ErrAccountNotFound, profile.AccountID)
+	}
+	for _, id := range normalizedDestinations {
+		var count int
+		if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM telegram_destinations WHERE id = ?`, id).Scan(&count); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+				return Profile{}, fmt.Errorf("%w: %s", ErrDestinationNotFound, id)
+			}
+			return Profile{}, fmt.Errorf("create profile: %w", err)
+		}
+		if count == 0 {
+			return Profile{}, fmt.Errorf("%w: %s", ErrDestinationNotFound, id)
+		}
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	profile.CreatedAt = now
+	profile.UpdatedAt = now
+	enabled := 0
+	if profile.Enabled {
+		enabled = 1
+	}
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO profiles (id, account_id, region_ids, specialty_ids, clinic_ids, doctor_ids, language_ids, visit_type, search_type, start_date, end_date, check_interval_minutes, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		profile.ID, profile.AccountID, profile.RegionIDs, profile.SpecialtyIDs, profile.ClinicIDs, profile.DoctorIDs, profile.LanguageIDs, profile.VisitType, profile.SearchType, profile.StartDate, profile.EndDate, profile.CheckIntervalMinutes, enabled, profile.CreatedAt, profile.UpdatedAt,
+	); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "primary") {
+			return Profile{}, fmt.Errorf("%w: %s", ErrProfileExists, profile.ID)
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "foreign key") {
+			return Profile{}, fmt.Errorf("%w: %s", ErrAccountNotFound, profile.AccountID)
+		}
+		return Profile{}, fmt.Errorf("create profile: %w", err)
+	}
+	for _, id := range normalizedDestinations {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO profile_telegram_destinations (profile_id, destination_id) VALUES (?, ?)`, profile.ID, id); err != nil {
+			return Profile{}, fmt.Errorf("create profile: %w", err)
+		}
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return Profile{}, fmt.Errorf("create profile: %w", err)
+	}
+	committed = true
+	return profile, nil
+}
+
+// UpdateProfileWithDestinations changes search criteria and/or Telegram links
+// atomically. destinationIDs nil means keep current links; non-nil (including
+// empty) replaces them. If any destination is missing neither criteria nor
+// links are changed.
+func (s *Store) UpdateProfileWithDestinations(id string, update ProfileUpdate, hasCriteria bool, destinationIDs []string, hasDestinations bool) (Profile, error) {
+	if !profileIDPattern.MatchString(id) {
+		return Profile{}, fmt.Errorf("%w: profile id %q", ErrProfileInvalid, id)
+	}
+	var normalizedDestinations []string
+	if hasDestinations {
+		normalized, err := normalizeDestinationIDs(destinationIDs)
+		if err != nil {
+			return Profile{}, err
+		}
+		normalizedDestinations = normalized
+	}
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	var current Profile
+	var enabledFlag int
+	err = conn.QueryRowContext(ctx,
+		`SELECT id, account_id, region_ids, specialty_ids, clinic_ids, doctor_ids, language_ids, visit_type, search_type, start_date, end_date, check_interval_minutes, enabled, created_at, updated_at FROM profiles WHERE id = ?`, id,
+	).Scan(&current.ID, &current.AccountID, &current.RegionIDs, &current.SpecialtyIDs, &current.ClinicIDs, &current.DoctorIDs, &current.LanguageIDs, &current.VisitType, &current.SearchType, &current.StartDate, &current.EndDate, &current.CheckIntervalMinutes, &enabledFlag, &current.CreatedAt, &current.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return Profile{}, fmt.Errorf("%w: %s", ErrProfileNotFound, id)
+		}
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	current.Enabled = enabledFlag == 1
+	merged := current
+	if hasCriteria {
+		if update.RegionIDs != nil {
+			merged.RegionIDs = *update.RegionIDs
+		}
+		if update.SpecialtyIDs != nil {
+			merged.SpecialtyIDs = *update.SpecialtyIDs
+		}
+		if update.ClinicIDs != nil {
+			merged.ClinicIDs = *update.ClinicIDs
+		}
+		if update.DoctorIDs != nil {
+			merged.DoctorIDs = *update.DoctorIDs
+		}
+		if update.LanguageIDs != nil {
+			merged.LanguageIDs = *update.LanguageIDs
+		}
+		if update.VisitType != nil {
+			merged.VisitType = *update.VisitType
+		}
+		if update.SearchType != nil {
+			merged.SearchType = *update.SearchType
+		}
+		if update.StartDate != nil {
+			merged.StartDate = *update.StartDate
+		}
+		if update.EndDate != nil {
+			merged.EndDate = *update.EndDate
+		}
+		if update.CheckIntervalMinutes != nil {
+			merged.CheckIntervalMinutes = *update.CheckIntervalMinutes
+		}
+		normalized, err := normalizeProfile(merged)
+		if err != nil {
+			return Profile{}, err
+		}
+		merged = normalized
+	}
+	if hasDestinations {
+		for _, destID := range normalizedDestinations {
+			var count int
+			if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM telegram_destinations WHERE id = ?`, destID).Scan(&count); err != nil {
+				if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+					return Profile{}, fmt.Errorf("%w: %s", ErrDestinationNotFound, destID)
+				}
+				return Profile{}, fmt.Errorf("edit profile: %w", err)
+			}
+			if count == 0 {
+				return Profile{}, fmt.Errorf("%w: %s", ErrDestinationNotFound, destID)
+			}
+		}
+	}
+	if hasCriteria {
+		sets := make([]string, 0, 11)
+		args := make([]any, 0, 12)
+		if update.RegionIDs != nil {
+			sets = append(sets, "region_ids = ?")
+			args = append(args, merged.RegionIDs)
+		}
+		if update.SpecialtyIDs != nil {
+			sets = append(sets, "specialty_ids = ?")
+			args = append(args, merged.SpecialtyIDs)
+		}
+		if update.ClinicIDs != nil {
+			sets = append(sets, "clinic_ids = ?")
+			args = append(args, merged.ClinicIDs)
+		}
+		if update.DoctorIDs != nil {
+			sets = append(sets, "doctor_ids = ?")
+			args = append(args, merged.DoctorIDs)
+		}
+		if update.LanguageIDs != nil {
+			sets = append(sets, "language_ids = ?")
+			args = append(args, merged.LanguageIDs)
+		}
+		if update.VisitType != nil {
+			sets = append(sets, "visit_type = ?")
+			args = append(args, merged.VisitType)
+		}
+		if update.SearchType != nil {
+			sets = append(sets, "search_type = ?")
+			args = append(args, merged.SearchType)
+		}
+		if update.StartDate != nil {
+			sets = append(sets, "start_date = ?")
+			args = append(args, merged.StartDate)
+		}
+		if update.EndDate != nil {
+			sets = append(sets, "end_date = ?")
+			args = append(args, merged.EndDate)
+		}
+		if update.CheckIntervalMinutes != nil {
+			sets = append(sets, "check_interval_minutes = ?")
+			args = append(args, merged.CheckIntervalMinutes)
+		}
+		updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+		sets = append(sets, "updated_at = ?")
+		args = append(args, updatedAt)
+		args = append(args, id)
+		result, err := conn.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE profiles SET %s WHERE id = ?`, strings.Join(sets, ", ")),
+			args...,
+		)
+		if err != nil {
+			return Profile{}, fmt.Errorf("edit profile: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return Profile{}, fmt.Errorf("edit profile: %w", err)
+		}
+		if affected == 0 {
+			return Profile{}, fmt.Errorf("%w: %s", ErrProfileNotFound, id)
+		}
+	}
+	if hasDestinations {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM profile_telegram_destinations WHERE profile_id = ?`, id); err != nil {
+			return Profile{}, fmt.Errorf("edit profile: %w", err)
+		}
+		for _, destID := range normalizedDestinations {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO profile_telegram_destinations (profile_id, destination_id) VALUES (?, ?)`, id, destID); err != nil {
+				return Profile{}, fmt.Errorf("edit profile: %w", err)
+			}
+		}
+	}
+	var fresh Profile
+	var freshEnabled int
+	err = conn.QueryRowContext(ctx,
+		`SELECT id, account_id, region_ids, specialty_ids, clinic_ids, doctor_ids, language_ids, visit_type, search_type, start_date, end_date, check_interval_minutes, enabled, created_at, updated_at FROM profiles WHERE id = ?`, id,
+	).Scan(&fresh.ID, &fresh.AccountID, &fresh.RegionIDs, &fresh.SpecialtyIDs, &fresh.ClinicIDs, &fresh.DoctorIDs, &fresh.LanguageIDs, &fresh.VisitType, &fresh.SearchType, &fresh.StartDate, &fresh.EndDate, &fresh.CheckIntervalMinutes, &freshEnabled, &fresh.CreatedAt, &fresh.UpdatedAt)
+	if err != nil {
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	fresh.Enabled = freshEnabled == 1
+	if err := ValidateProfile(fresh); err != nil {
+		return Profile{}, err
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return Profile{}, fmt.Errorf("edit profile: %w", err)
+	}
+	committed = true
+	return fresh, nil
 }
 
 func isNoRows(err error) bool {
