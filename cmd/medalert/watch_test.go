@@ -291,7 +291,22 @@ func watchQueryCount(t *testing.T, database, query string) string {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		t.Fatal(err)
+	}
 	var value string
+	// A concurrent watch may hold a short write lock during Begin/Reconcile;
+	// retry instead of failing the poll on SQLITE_BUSY.
+	for attempt := 0; attempt < 20; attempt++ {
+		if err := db.QueryRow(query).Scan(&value); err == nil {
+			return value
+		} else if strings.Contains(strings.ToLower(err.Error()), "locked") || strings.Contains(strings.ToLower(err.Error()), "busy") {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		} else {
+			t.Fatal(err)
+		}
+	}
 	if err := db.QueryRow(query).Scan(&value); err != nil {
 		t.Fatal(err)
 	}

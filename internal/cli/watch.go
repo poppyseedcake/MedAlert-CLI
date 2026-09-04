@@ -68,6 +68,20 @@ func runWatch(command string, settings options, stdin *os.File, stdout, stderr i
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	stoppedSignal := make(chan string, 1)
+
+	watcher := &watchLoop{
+		command:    command,
+		storage:    storage,
+		client:     client,
+		backend:    backend,
+		stdin:      stdin,
+		stdout:     stdout,
+		stderr:     stderr,
+		jsonOutput: jsonOutput,
+		lastRuns:   map[string]time.Time{},
+		paused:     map[string]bool{},
+		active:     map[string]bool{},
+	}
 	go func() {
 		select {
 		case received := <-signals:
@@ -79,60 +93,53 @@ func runWatch(command string, settings options, stdin *os.File, stdout, stderr i
 			case stoppedSignal <- name:
 			default:
 			}
-			logWatch(stderr, "received %s, shutting down", name)
+			watcher.log("received %s, shutting down", name)
 			cancel()
 		case <-ctx.Done():
 		}
 	}()
 
-	watcher := &watchLoop{
-		command:    command,
-		storage:    storage,
-		client:     client,
-		backend:    backend,
-		stdin:      stdin,
-		stdout:     stdout,
-		stderr:     stderr,
-		jsonOutput: jsonOutput,
-	}
-	emitStarted(watcher, pollInterval, maxIterations)
-	logWatch(stderr, "watching enabled profiles (poll every %s)", pollInterval)
-
-	lastRuns := map[string]time.Time{}
-	paused := map[string]bool{}
-	var activeMu sync.Mutex
-	active := map[string]bool{}
+	watcher.emitEvent("started", map[string]any{"poll_interval_ms": pollInterval.Milliseconds(), "max_iterations": maxIterations})
+	watcher.log("watching enabled profiles (poll every %s)", pollInterval)
 
 	iteration := 0
 	for {
 		select {
 		case <-ctx.Done():
-			emitStopped(watcher, stoppedSignalName(stoppedSignal), iteration, "signal")
-			logWatch(stderr, "watch stopped after %d iterations", iteration)
+			watcher.waitForBackground()
+			watcher.emitEvent("stopped", stoppedData(stoppedSignalName(stoppedSignal), iteration, "signal"))
+			watcher.log("watch stopped after %d iterations", iteration)
 			return 0
 		default:
 		}
 		if maxIterations > 0 && iteration >= maxIterations {
-			emitStopped(watcher, "", iteration, "completed")
-			logWatch(stderr, "watch completed %d iterations", iteration)
+			watcher.waitForBackground()
+			watcher.emitEvent("stopped", stoppedData("", iteration, "completed"))
+			watcher.log("watch completed %d iterations", iteration)
 			return 0
 		}
 		iteration++
-		completed := watcher.runIteration(ctx, iteration, lastRuns, paused, &activeMu, active)
-		if completed {
-			// runIteration returns true when its work finished without an
-			// early shutdown; the loop then waits for the next poll.
-			select {
-			case <-ctx.Done():
-				emitStopped(watcher, stoppedSignalName(stoppedSignal), iteration, "signal")
-				logWatch(stderr, "watch stopped after %d iterations", iteration)
-				return 0
-			case <-time.After(pollInterval):
-			}
-		} else {
-			emitStopped(watcher, stoppedSignalName(stoppedSignal), iteration, "signal")
-			logWatch(stderr, "watch stopped after %d iterations", iteration)
+		if !watcher.launchIteration(ctx) {
+			watcher.waitForBackground()
+			watcher.emitEvent("stopped", stoppedData(stoppedSignalName(stoppedSignal), iteration, "signal"))
+			watcher.log("watch stopped after %d iterations", iteration)
 			return 0
+		}
+		// Check the limit before sleeping so the final iteration exits
+		// immediately instead of waiting one extra poll interval.
+		if maxIterations > 0 && iteration >= maxIterations {
+			watcher.waitForBackground()
+			watcher.emitEvent("stopped", stoppedData("", iteration, "completed"))
+			watcher.log("watch completed %d iterations", iteration)
+			return 0
+		}
+		select {
+		case <-ctx.Done():
+			watcher.waitForBackground()
+			watcher.emitEvent("stopped", stoppedData(stoppedSignalName(stoppedSignal), iteration, "signal"))
+			watcher.log("watch stopped after %d iterations", iteration)
+			return 0
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -146,6 +153,14 @@ func stoppedSignalName(channel chan string) string {
 	}
 }
 
+func stoppedData(signalName string, iterations int, reason string) map[string]any {
+	data := map[string]any{"iterations": iterations, "reason": reason}
+	if signalName != "" {
+		data["signal"] = signalName
+	}
+	return data
+}
+
 type watchLoop struct {
 	command    string
 	storage    *store.Store
@@ -155,48 +170,79 @@ type watchLoop struct {
 	stdout     io.Writer
 	stderr     io.Writer
 	jsonOutput bool
+
+	// mu guards lastRuns and paused. activeMu guards active. writeMu
+	// serializes all stdout/stderr writes so concurrent profile workers can
+	// safely use arbitrary io.Writers (for example bytes.Buffer via
+	// RunWithIO). wg tracks background authentication and check workers so
+	// shutdown and --once wait for active work to finish in a controlled way.
+	mu       sync.Mutex
+	activeMu sync.Mutex
+	writeMu  sync.Mutex
+	wg       sync.WaitGroup
+
+	lastRuns map[string]time.Time
+	paused   map[string]bool
+	active   map[string]bool
 }
 
-// runIteration reloads saved configuration, selects due profiles, and runs
-// them concurrently with per-profile isolation. It returns false when the
-// watch context was cancelled and the caller should stop without sleeping.
-func (w *watchLoop) runIteration(ctx context.Context, iteration int, lastRuns map[string]time.Time, paused map[string]bool, activeMu *sync.Mutex, active map[string]bool) bool {
+func (w *watchLoop) waitForBackground() {
+	w.wg.Wait()
+}
+
+// launchIteration reloads saved configuration, selects due profiles, and
+// launches their work in the background without waiting for it. Slow
+// authentication or a slow profile check never blocks configuration reload
+// or other accounts/profiles: each account authenticates in its own
+// goroutine and each profile checks in its own goroutine, with per-profile
+// active guards and SQLite leases preventing duplicates. It returns false
+// only when the watch context was already cancelled and the caller should
+// stop without sleeping.
+func (w *watchLoop) launchIteration(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return false
 	}
 	profiles, err := w.storage.ListProfiles("")
 	if err != nil {
-		logWatch(w.stderr, "cannot reload profiles: %s", shortWatchMessage(err))
+		w.log("cannot reload profiles: %s", shortWatchMessage(err))
 		return ctx.Err() == nil
 	}
 	now := time.Now().UTC()
-	// Drop tracking for deleted or disabled profiles so a reload takes
-	// effect between planned runs without a restart.
 	alive := map[string]store.Profile{}
 	for _, profile := range profiles {
 		if !profile.Enabled {
-			delete(lastRuns, profile.ID)
 			continue
 		}
 		alive[profile.ID] = profile
 	}
-	for id := range lastRuns {
+	w.mu.Lock()
+	for id := range w.lastRuns {
 		if _, ok := alive[id]; !ok {
-			delete(lastRuns, id)
+			delete(w.lastRuns, id)
 		}
 	}
+	missing := []string{}
+	for id := range alive {
+		if _, known := w.lastRuns[id]; !known {
+			missing = append(missing, id)
+		}
+	}
+	w.mu.Unlock()
 	// Backfill last-run times from durable history so a restart respects
-	// intervals instead of checking everything immediately.
-	for id, profile := range alive {
-		if _, known := lastRuns[id]; known {
-			continue
-		}
+	// intervals instead of checking everything immediately. DB reads run
+	// outside the lock so background completions are not blocked.
+	for _, id := range missing {
 		if last, ok := latestRunStart(w.storage, id); ok {
-			lastRuns[id] = last
-			_ = profile
+			w.mu.Lock()
+			if _, known := w.lastRuns[id]; !known {
+				w.lastRuns[id] = last
+			}
+			w.mu.Unlock()
 		}
 	}
-	due := monitoring.DueProfiles(profiles, lastRuns, now)
+	w.mu.Lock()
+	due := monitoring.DueProfiles(profiles, w.lastRuns, now)
+	w.mu.Unlock()
 	if len(due) == 0 {
 		return ctx.Err() == nil
 	}
@@ -206,9 +252,9 @@ func (w *watchLoop) runIteration(ctx context.Context, iteration int, lastRuns ma
 	// authenticateAccount emits paused/resumed only on transitions.
 	byAccount := map[string][]store.Profile{}
 	for _, profile := range due {
-		activeMu.Lock()
-		isActive := active[profile.ID]
-		activeMu.Unlock()
+		w.activeMu.Lock()
+		isActive := w.active[profile.ID]
+		w.activeMu.Unlock()
 		if isActive {
 			continue
 		}
@@ -217,94 +263,101 @@ func (w *watchLoop) runIteration(ctx context.Context, iteration int, lastRuns ma
 	if len(byAccount) == 0 {
 		return ctx.Err() == nil
 	}
-	var group sync.WaitGroup
-	var stateMu sync.Mutex
 	for accountID, accountProfiles := range byAccount {
 		if ctx.Err() != nil {
-			break
+			return false
 		}
-		account, err := w.storage.GetAccount(accountID)
-		if err != nil {
-			logWatch(w.stderr, "cannot load account %s: %s", accountID, shortWatchMessage(err))
-			continue
-		}
-		token, ok := w.authenticateAccount(ctx, account, paused)
-		if !ok {
-			continue
-		}
-		for _, profile := range accountProfiles {
-			if ctx.Err() != nil {
-				break
-			}
-			activeMu.Lock()
-			if active[profile.ID] {
-				activeMu.Unlock()
-				continue
-			}
-			active[profile.ID] = true
-			activeMu.Unlock()
-			// Refresh the profile row after authentication: another process
-			// may have edited it while authentication was in flight.
-			fresh, err := w.storage.GetProfile(profile.ID)
-			if err != nil || !fresh.Enabled {
-				activeMu.Lock()
-				delete(active, profile.ID)
-				activeMu.Unlock()
-				continue
-			}
-			group.Add(1)
-			go func(selected store.Profile, accountValue store.Account, accessToken string) {
-				defer group.Done()
-				defer func() {
-					activeMu.Lock()
-					delete(active, selected.ID)
-					activeMu.Unlock()
-				}()
-				started := time.Now().UTC()
-				w.checkOne(ctx, selected, accountValue, accessToken, started)
-				stateMu.Lock()
-				// A cancelled shutdown must not reschedule: the process is
-				// leaving and the next start backfills from durable history.
-				if ctx.Err() == nil {
-					lastRuns[selected.ID] = started
-				}
-				stateMu.Unlock()
-			}(fresh, account, token)
-		}
+		w.wg.Add(1)
+		go w.runAccountProfiles(ctx, accountID, accountProfiles)
 	}
-	done := make(chan struct{})
-	go func() {
-		group.Wait()
-		close(done)
+	return ctx.Err() == nil
+}
+
+// runAccountProfiles authenticates one account and launches its due profiles.
+// It runs in its own goroutine so a slow account never delays other accounts.
+func (w *watchLoop) runAccountProfiles(ctx context.Context, accountID string, accountProfiles []store.Profile) {
+	defer w.wg.Done()
+	if ctx.Err() != nil {
+		return
+	}
+	account, err := w.storage.GetAccount(accountID)
+	if err != nil {
+		w.log("cannot load account %s: %s", accountID, shortWatchMessage(err))
+		return
+	}
+	token, ok := w.authenticateAccount(ctx, account)
+	if !ok {
+		return
+	}
+	for _, profile := range accountProfiles {
+		if ctx.Err() != nil {
+			return
+		}
+		// Refresh the profile row after authentication: another process may
+		// have edited it while authentication was in flight.
+		fresh, err := w.storage.GetProfile(profile.ID)
+		if err != nil || !fresh.Enabled {
+			continue
+		}
+		// Re-evaluate due status against the refreshed configuration and the
+		// current schedule. An operator may have lengthened the interval
+		// while authentication was in progress; the saved configuration wins
+		// over the snapshot taken before authentication.
+		w.mu.Lock()
+		last := w.lastRuns[fresh.ID]
+		stillDue := monitoring.IsProfileDue(fresh, last, time.Now().UTC())
+		w.mu.Unlock()
+		if !stillDue {
+			continue
+		}
+		w.activeMu.Lock()
+		if w.active[fresh.ID] {
+			w.activeMu.Unlock()
+			continue
+		}
+		w.active[fresh.ID] = true
+		w.activeMu.Unlock()
+		w.wg.Add(1)
+		go w.runSingleProfile(ctx, fresh, account, token)
+	}
+}
+
+// runSingleProfile runs one profile check in the background and records its
+// start time for future scheduling.
+func (w *watchLoop) runSingleProfile(ctx context.Context, profile store.Profile, account store.Account, accessToken string) {
+	defer w.wg.Done()
+	defer func() {
+		w.activeMu.Lock()
+		delete(w.active, profile.ID)
+		w.activeMu.Unlock()
 	}()
-	select {
-	case <-ctx.Done():
-		// Cancel active work in a controlled way: monitoring.Check records a
-		// cancelled run without touching availability episodes, then the
-		// goroutines release their in-process guards.
-		group.Wait()
-		return false
-	case <-done:
-		return ctx.Err() == nil
+	started := time.Now().UTC()
+	w.checkOne(ctx, profile, account, accessToken, started)
+	w.mu.Lock()
+	// A cancelled shutdown must not reschedule: the process is leaving and
+	// the next start backfills from durable history.
+	if ctx.Err() == nil {
+		w.lastRuns[profile.ID] = started
 	}
+	w.mu.Unlock()
 }
 
 // authenticateAccount returns an access token for one account, reusing the
 // trusted session when possible. Authentication Required pauses only that
 // account; other accounts continue. It returns false when the account must
 // be skipped this iteration.
-func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Account, paused map[string]bool) (string, bool) {
+func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Account) (string, bool) {
 	var saved *medicover.SessionState
 	if state, err := w.backend.Load(account.ID); err == nil {
 		saved = state
 	} else if errors.Is(err, session.ErrNotFound) || isSessionCorrupt(err) {
 		saved = nil
 	} else if errors.Is(err, session.ErrUnsafe) {
-		logWatch(w.stderr, "account %s session is not safe: %s", account.ID, shortWatchMessage(err))
+		w.log("account %s session is not safe: %s", account.ID, shortWatchMessage(err))
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": "invalid_arguments", "message": shortWatchMessage(err)})
 		return "", false
 	} else {
-		logWatch(w.stderr, "account %s session is temporarily unavailable", account.ID)
+		w.log("account %s session is temporarily unavailable", account.ID)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": "temporary_failure", "message": "session storage is temporarily unavailable"})
 		return "", false
 	}
@@ -313,14 +366,18 @@ func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Accou
 	auth, err := w.client.Authenticate(authCtx, medicover.AuthRequest{Session: saved})
 	if err == nil {
 		if saveErr := w.backend.Save(account.ID, auth.Session); saveErr != nil {
-			logWatch(w.stderr, "account %s cannot save session state", account.ID)
+			w.log("account %s cannot save session state", account.ID)
 			w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": "temporary_failure", "message": "cannot save session state"})
 			return "", false
 		}
-		if paused[account.ID] {
-			delete(paused, account.ID)
-			logWatch(w.stderr, "account %s authentication recovered", account.ID)
+		w.mu.Lock()
+		if w.paused[account.ID] {
+			delete(w.paused, account.ID)
+			w.mu.Unlock()
+			w.log("account %s authentication recovered", account.ID)
 			w.emitEvent("auth_resumed", map[string]any{"account": account.ID})
+		} else {
+			w.mu.Unlock()
 		}
 		return auth.AccessToken, true
 	}
@@ -328,13 +385,13 @@ func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Accou
 		// Temporary, rate-limited, and protocol failures are per-iteration
 		// profile failures, not an account pause. Other accounts continue.
 		code, message := watchMedicoverFailure(err)
-		logWatch(w.stderr, "account %s authentication %s: %s", account.ID, code, message)
+		w.log("account %s authentication %s: %s", account.ID, code, message)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": code, "message": message})
 		return "", false
 	}
 	password, resolveErr := secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, w.stdin, w.stderr, true)
 	if resolveErr != nil {
-		pauseWatchAccount(w, paused, account, "authentication_required", "authentication is required")
+		w.pauseAccount(account, "authentication_required", "authentication is required")
 		return "", false
 	}
 	retrySecret := medicover.Secret(password)
@@ -346,31 +403,40 @@ func (w *watchLoop) authenticateAccount(ctx context.Context, account store.Accou
 	})
 	if retryErr != nil {
 		if medicover.IsAuthRequired(retryErr) || medicover.IsInvalidCredentials(retryErr) {
-			pauseWatchAccount(w, paused, account, "authentication_required", "authentication is required")
+			w.pauseAccount(account, "authentication_required", "authentication is required")
 			return "", false
 		}
 		code, message := watchMedicoverFailure(retryErr)
-		logWatch(w.stderr, "account %s authentication %s: %s", account.ID, code, message)
+		w.log("account %s authentication %s: %s", account.ID, code, message)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": code, "message": message})
 		return "", false
 	}
 	if saveErr := w.backend.Save(account.ID, retry.Session); saveErr != nil {
-		logWatch(w.stderr, "account %s cannot save session state", account.ID)
+		w.log("account %s cannot save session state", account.ID)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "code": "temporary_failure", "message": "cannot save session state"})
 		return "", false
 	}
-	if paused[account.ID] {
-		delete(paused, account.ID)
-		logWatch(w.stderr, "account %s authentication recovered", account.ID)
+	w.mu.Lock()
+	if w.paused[account.ID] {
+		delete(w.paused, account.ID)
+		w.mu.Unlock()
+		w.log("account %s authentication recovered", account.ID)
 		w.emitEvent("auth_resumed", map[string]any{"account": account.ID})
+	} else {
+		w.mu.Unlock()
 	}
 	return retry.AccessToken, true
 }
 
-func pauseWatchAccount(w *watchLoop, paused map[string]bool, account store.Account, code, message string) {
-	if !paused[account.ID] {
-		paused[account.ID] = true
-		logWatch(w.stderr, "account %s requires authentication, pausing its profiles", account.ID)
+func (w *watchLoop) pauseAccount(account store.Account, code, message string) {
+	w.mu.Lock()
+	already := w.paused[account.ID]
+	if !already {
+		w.paused[account.ID] = true
+	}
+	w.mu.Unlock()
+	if !already {
+		w.log("account %s requires authentication, pausing its profiles", account.ID)
 		w.emitEvent("auth_paused", map[string]any{"account": account.ID, "code": code, "message": message})
 	}
 }
@@ -380,41 +446,41 @@ func pauseWatchAccount(w *watchLoop, paused map[string]bool, account store.Accou
 // them as failures.
 func (w *watchLoop) checkOne(ctx context.Context, profile store.Profile, account store.Account, accessToken string, started time.Time) {
 	w.emitEvent("run_started", map[string]any{"account": account.ID, "profile": profile.ID})
-	logWatch(w.stderr, "checking profile %s (account %s)", profile.ID, account.ID)
+	w.log("checking profile %s (account %s)", profile.ID, account.ID)
 	runCtx, cancel := context.WithTimeout(ctx, watchRunTimeout)
 	defer cancel()
 	result, err := monitoring.Check(runCtx, w.storage, profile, account, w.client, accessToken, started)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrObservationRunActive):
-			logWatch(w.stderr, "profile %s skipped: observation run is already active", profile.ID)
+			w.log("profile %s skipped: observation run is already active", profile.ID)
 			w.emitEvent("run_skipped", map[string]any{"account": account.ID, "profile": profile.ID, "code": "run_active", "message": "observation run is already active"})
 			return
 		case errors.Is(err, store.ErrObservationRunStale):
-			logWatch(w.stderr, "profile %s skipped: %s", profile.ID, shortWatchMessage(err))
+			w.log("profile %s skipped: %s", profile.ID, shortWatchMessage(err))
 			w.emitEvent("run_failed", map[string]any{"account": account.ID, "profile": profile.ID, "code": "stale_result", "message": shortWatchMessage(err)})
 			return
 		case errors.Is(err, store.ErrObservationRunConflicting):
-			logWatch(w.stderr, "profile %s conflicting result: %s", profile.ID, shortWatchMessage(err))
+			w.log("profile %s conflicting result: %s", profile.ID, shortWatchMessage(err))
 			w.emitEvent("run_failed", map[string]any{"account": account.ID, "profile": profile.ID, "code": "conflicting_result", "message": shortWatchMessage(err)})
 			return
 		case errors.Is(err, store.ErrProfileDisabled):
-			logWatch(w.stderr, "profile %s is disabled, skipping", profile.ID)
+			w.log("profile %s is disabled, skipping", profile.ID)
 			return
 		}
 		code, message := watchMedicoverFailure(err)
 		// A shutdown race reports cancelled, never a failure: the run was
 		// recorded without touching availability episodes.
 		if ctx.Err() != nil && code == "cancelled" {
-			logWatch(w.stderr, "profile %s cancelled during shutdown", profile.ID)
+			w.log("profile %s cancelled during shutdown", profile.ID)
 			w.emitEvent("run_failed", map[string]any{"account": account.ID, "profile": profile.ID, "code": code, "message": message})
 			return
 		}
-		logWatch(w.stderr, "profile %s check %s: %s", profile.ID, code, message)
+		w.log("profile %s check %s: %s", profile.ID, code, message)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "profile": profile.ID, "code": code, "message": message})
 		return
 	}
-	logWatch(w.stderr, "profile %s completed: %d slots, %d newly available, %d ended", profile.ID, len(result.Search.Slots), len(result.Reconciliation.NewEpisodes), len(result.Reconciliation.EndedEpisodes))
+	w.log("profile %s completed: %d slots, %d newly available, %d ended", profile.ID, len(result.Search.Slots), len(result.Reconciliation.NewEpisodes), len(result.Reconciliation.EndedEpisodes))
 	w.emitEvent("run_completed", map[string]any{
 		"account":              account.ID,
 		"profile":              profile.ID,
@@ -506,6 +572,8 @@ func shortWatchMessage(err error) string {
 	return message
 }
 
+// emitEvent writes one JSON Lines machine event. Writes are serialized so
+// concurrent profile workers can safely share arbitrary io.Writers.
 func (w *watchLoop) emitEvent(event string, data map[string]any) {
 	if !w.jsonOutput {
 		return
@@ -513,6 +581,8 @@ func (w *watchLoop) emitEvent(event string, data map[string]any) {
 	if data == nil {
 		data = map[string]any{}
 	}
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
 	writeJSON(w.stdout, watchEvent{
 		SchemaVersion: resultSchemaVersion,
 		Command:       "watch",
@@ -522,21 +592,13 @@ func (w *watchLoop) emitEvent(event string, data map[string]any) {
 	})
 }
 
-func emitStarted(w *watchLoop, pollInterval time.Duration, maxIterations int) {
-	w.emitEvent("started", map[string]any{"poll_interval_ms": pollInterval.Milliseconds(), "max_iterations": maxIterations})
-}
-
-func emitStopped(w *watchLoop, signalName string, iterations int, reason string) {
-	data := map[string]any{"iterations": iterations, "reason": reason}
-	if signalName != "" {
-		data["signal"] = signalName
-	}
-	w.emitEvent("stopped", data)
-}
-
-func logWatch(stderr io.Writer, format string, args ...any) {
+// log writes one text log line to standard error. Writes are serialized for
+// the same reason as machine events.
+func (w *watchLoop) log(format string, args ...any) {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
 	stamp := time.Now().UTC().Format(time.RFC3339)
-	fmt.Fprintf(stderr, "%s watch: %s\n", stamp, fmt.Sprintf(format, args...))
+	fmt.Fprintf(w.stderr, "%s watch: %s\n", stamp, fmt.Sprintf(format, args...))
 }
 
 func resolveWatchPollInterval(settings options) (time.Duration, error) {
