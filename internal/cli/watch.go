@@ -278,6 +278,12 @@ func (w *watchLoop) launchIteration(ctx context.Context) bool {
 	if _, err := w.storage.ReapExpiredIncidentClaims(now); err != nil {
 		w.log("cannot reap incident deliveries: %s", shortWatchMessage(err))
 	}
+	// Automatic history retention: old terminal records are removed on every
+	// iteration according to the saved policy. Failures are logged but never
+	// stop monitoring.
+	if _, err := w.storage.PruneHistory(now); err != nil {
+		w.log("cannot prune history: %s", shortWatchMessage(err))
+	}
 	// Incident retries need no observation run, so due incident deliveries
 	// are sent directly from the iteration. Otherwise a retry whose backoff
 	// passed (including a Telegram retry_after) would wait for the next due
