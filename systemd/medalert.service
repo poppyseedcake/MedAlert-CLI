@@ -1,0 +1,20 @@
+[Unit]
+Description=MedAlert continuous monitoring
+Documentation=https://github.com/poppyseedcake/MedAlert/blob/main/docs/install.md
+ConditionArchitecture=x86-64
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/medalert watch --non-interactive
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=90s
+Environment=HOME=%h
+Environment=MEDALERT_OUTPUT=text
+UnsetEnvironment=MEDALERT_DATABASE MEDALERT_SESSION_DIR
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
