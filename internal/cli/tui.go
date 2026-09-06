@@ -35,6 +35,7 @@ func runTUI(settings options, stdin *os.File, stdout, stderr io.Writer) int {
 // Command output stays in memory. Only safe fields and Polish messages reach
 // the display model; raw errors, secret references and session data do not.
 func terminalAction(ctx context.Context, settings options, request tui.Request, prompt tui.Prompt) tui.Result {
+	ctx = contextOrBackground(ctx)
 	settings.output, settings.nonInteractive = "json", true
 	settings.accountID, settings.username, settings.passwordFile = request.ID, request.Username, request.PasswordFile
 	var stdout, stderr bytes.Buffer
@@ -46,15 +47,15 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		if request.Action == "create" && request.PasswordFile == "" {
 			settings.noStoredPassword = true
 		}
-		code = runAccount("account "+request.Action, settings, nil, &stdout, &stderr)
+		code = runAccountWithContext(ctx, "account "+request.Action, settings, nil, &stdout, &stderr)
 	case "delete":
 		// Session cleanup is best effort here. The database account and its
 		// dependent records must still be deleted when Secret Service is down.
-		logoutCode := accountLogout("account logout", settings, &stdout, &stderr, true)
-		code = accountDelete("account delete", settings, &stdout, &stderr, true)
+		logoutCode := accountLogoutWithContext(ctx, "account logout", settings, &stdout, &stderr, true)
+		code = accountDeleteWithContext(ctx, "account delete", settings, &stdout, &stderr, true)
 		sessionCleanupFailed = logoutCode != 0 && code == 0
 	case "logout":
-		code = accountLogout("account logout", settings, &stdout, &stderr, true)
+		code = accountLogoutWithContext(ctx, "account logout", settings, &stdout, &stderr, true)
 	case "login":
 		code = accountLoginWithPrompt(ctx, "account login", settings, nil, &stdout, &stderr, true, prompt)
 	default:
@@ -73,6 +74,9 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 	snapshot, err := terminalSnapshot(settings)
 	if err != nil {
 		return tui.Result{Failed: true, Message: "Nie można odczytać stanu. Sprawdź dostęp do bazy. R: ponów."}
+	}
+	if ctx.Err() != nil {
+		return tui.Result{Failed: true, Message: "Anulowano operację. Odśwież stan."}
 	}
 	message := "Stan odświeżony."
 	switch request.Action {

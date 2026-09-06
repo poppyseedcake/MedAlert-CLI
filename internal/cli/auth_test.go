@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -305,6 +306,56 @@ func TestLoginRequiresMFAFileWhenNonInteractive(t *testing.T) {
 	code = RunWithIO([]string{"account", "login", "--database", database, "--session-dir", sessionDir, "--medicover-base-url", fake.baseURL, "--account", "mfa", "--non-interactive", "--mfa-code-file", mfaFile}, os.Stdin, &stdout, &stderr, getenv)
 	if code != 0 {
 		t.Fatalf("MFA login: code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestPasswordPromptTimeoutUsesTimeoutError(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{
+		ID:             "alice",
+		Username:       "alice@example.com",
+		PasswordSource: store.PasswordSourcePrompt,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := accountLoginWithPrompt(context.Background(), "account login", options{
+		database:   database,
+		accountID:  "alice",
+		sessionDir: filepath.Join(root, "sessions"),
+	}, nil, &stdout, &stderr, true, func(context.Context, string) (string, error) {
+		return "", context.DeadlineExceeded
+	})
+	if code != 4 {
+		t.Fatalf("code = %d, want timeout code 4; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var envelope struct {
+		Error errorBody `json:"error"`
+	}
+	if err := json.Unmarshal(stderr.Bytes(), &envelope); err != nil {
+		t.Fatalf("timeout error is not JSON: %v; stderr=%q", err, stderr.String())
+	}
+	if envelope.Error.Code != "timeout" {
+		t.Fatalf("error code = %q, want timeout; stderr=%q", envelope.Error.Code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "secret_error") {
+		t.Fatalf("timeout was reported as secret error: %q", stderr.String())
 	}
 }
 

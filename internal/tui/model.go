@@ -54,6 +54,7 @@ type Model struct {
 	cancel                        context.CancelFunc
 	events                        chan tea.Msg
 	generation                    int
+	activeGeneration              int
 }
 
 type form struct {
@@ -96,6 +97,7 @@ func (m *Model) start(request Request) tea.Cmd {
 	m.notice = "Trwa operacja. Esc: anuluj oczekiwanie."
 	m.generation++
 	generation := m.generation
+	m.activeGeneration = generation
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.cancel = cancel
 	return func() tea.Msg {
@@ -135,10 +137,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.waitPrompt()
 	case finishedMsg:
-		if msg.generation != m.generation {
+		if msg.generation != m.activeGeneration {
 			return m, nil
 		}
+		cancelled := msg.generation != m.generation
 		m.busy, m.cancel = false, nil
+		m.activeGeneration = 0
+		if cancelled {
+			// A cancelled operation may have completed after Esc. Its result
+			// must not replace the current snapshot or restore an old form.
+			return m, nil
+		}
 		if !msg.result.Failed {
 			selectedID := m.selectedID()
 			m.snapshot = msg.result.Snapshot
@@ -255,7 +264,8 @@ func (m *Model) stop() {
 		m.cancel()
 	}
 	m.generation++
-	m.busy = false
+	// Keep busy until the cancelled command returns. The command may be
+	// waiting in SQLite or Secret Service and can still finish a side effect.
 	m.form = nil
 	m.pendingForm = nil
 	m.cancel = nil

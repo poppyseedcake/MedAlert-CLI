@@ -4,6 +4,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -80,13 +81,19 @@ func (s *Store) Close() error {
 
 // CreateAccount stores a new account reference. Secret values must never reach this layer.
 func (s *Store) CreateAccount(account Account) (Account, error) {
+	return s.CreateAccountContext(context.Background(), account)
+}
+
+// CreateAccountContext stores a new account reference and observes ctx while
+// waiting for SQLite. Secret values must never reach this layer.
+func (s *Store) CreateAccountContext(ctx context.Context, account Account) (Account, error) {
 	if err := ValidateAccount(account); err != nil {
 		return Account{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	account.CreatedAt = now
 	account.UpdatedAt = now
-	_, err := s.db.Exec(
+	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO accounts (id, username, password_source, password_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		account.ID, account.Username, account.PasswordSource, account.PasswordRef, account.CreatedAt, account.UpdatedAt,
 	)
@@ -122,11 +129,17 @@ func (s *Store) ListAccounts() ([]Account, error) {
 
 // GetAccount returns one account by id.
 func (s *Store) GetAccount(id string) (Account, error) {
+	return s.GetAccountContext(context.Background(), id)
+}
+
+// GetAccountContext returns one account by id and observes ctx while waiting
+// for SQLite.
+func (s *Store) GetAccountContext(ctx context.Context, id string) (Account, error) {
 	if !accountIDPattern.MatchString(id) {
 		return Account{}, fmt.Errorf("%w: account id %q", ErrAccountInvalid, id)
 	}
 	var account Account
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT id, username, password_source, password_ref, created_at, updated_at FROM accounts WHERE id = ?`, id,
 	).Scan(&account.ID, &account.Username, &account.PasswordSource, &account.PasswordRef, &account.CreatedAt, &account.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -140,7 +153,13 @@ func (s *Store) GetAccount(id string) (Account, error) {
 
 // UpdateAccount changes username and/or secret reference. Secret values never reach this layer.
 func (s *Store) UpdateAccount(id string, update AccountUpdate) (Account, error) {
-	current, err := s.GetAccount(id)
+	return s.UpdateAccountContext(context.Background(), id, update)
+}
+
+// UpdateAccountContext changes username and/or secret reference and observes
+// ctx while waiting for SQLite. Secret values never reach this layer.
+func (s *Store) UpdateAccountContext(ctx context.Context, id string, update AccountUpdate) (Account, error) {
+	current, err := s.GetAccountContext(ctx, id)
 	if err != nil {
 		return Account{}, err
 	}
@@ -162,7 +181,7 @@ func (s *Store) UpdateAccount(id string, update AccountUpdate) (Account, error) 
 		return Account{}, err
 	}
 	current.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.Exec(
+	result, err := s.db.ExecContext(ctx,
 		`UPDATE accounts SET username = ?, password_source = ?, password_ref = ?, updated_at = ? WHERE id = ?`,
 		current.Username, current.PasswordSource, current.PasswordRef, current.UpdatedAt, id,
 	)
@@ -182,10 +201,17 @@ func (s *Store) UpdateAccount(id string, update AccountUpdate) (Account, error) 
 // DeleteAccount removes one account row. Secret values live outside SQLite,
 // so callers remove the Secret Service entry separately when needed.
 func (s *Store) DeleteAccount(id string) error {
+	return s.DeleteAccountContext(context.Background(), id)
+}
+
+// DeleteAccountContext removes one account row and observes ctx while
+// waiting for SQLite. Secret values live outside SQLite, so callers remove
+// the Secret Service entry separately when needed.
+func (s *Store) DeleteAccountContext(ctx context.Context, id string) error {
 	if !accountIDPattern.MatchString(id) {
 		return fmt.Errorf("%w: account id %q", ErrAccountInvalid, id)
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("delete account: %w", err)
 	}
@@ -193,7 +219,7 @@ func (s *Store) DeleteAccount(id string) error {
 	// Remove operational incidents for the account and its profiles. Delivery
 	// rows cascade from incidents when foreign keys are enforced; explicit
 	// deletes keep history consistent otherwise and tolerate older schemas.
-	if _, err := tx.Exec(`DELETE FROM operational_deliveries WHERE incident_id IN (SELECT id FROM operational_incidents WHERE account_id = ?)`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM operational_deliveries WHERE incident_id IN (SELECT id FROM operational_incidents WHERE account_id = ?)`, id); err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 			return fmt.Errorf("delete account incidents: %w", err)
 		}
@@ -201,22 +227,22 @@ func (s *Store) DeleteAccount(id string) error {
 	// Destination-scope incidents carry the owning account when recorded, but
 	// older rows may only reference profiles of this account. Clean both via
 	// profile membership as a fallback.
-	if _, err := tx.Exec(`DELETE FROM operational_deliveries WHERE incident_id IN (SELECT i.id FROM operational_incidents i JOIN profiles p ON p.id = i.profile_id WHERE p.account_id = ?)`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM operational_deliveries WHERE incident_id IN (SELECT i.id FROM operational_incidents i JOIN profiles p ON p.id = i.profile_id WHERE p.account_id = ?)`, id); err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 			return fmt.Errorf("delete account incidents: %w", err)
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM operational_incidents WHERE account_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM operational_incidents WHERE account_id = ?`, id); err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 			return fmt.Errorf("delete account incidents: %w", err)
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM operational_incidents WHERE profile_id IN (SELECT id FROM profiles WHERE account_id = ?)`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM operational_incidents WHERE profile_id IN (SELECT id FROM profiles WHERE account_id = ?)`, id); err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 			return fmt.Errorf("delete account incidents: %w", err)
 		}
 	}
-	result, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id)
+	result, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete account: %w", err)
 	}
@@ -226,6 +252,9 @@ func (s *Store) DeleteAccount(id string) error {
 	}
 	if affected == 0 {
 		return fmt.Errorf("%w: %s", ErrAccountNotFound, id)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("delete account: %w", err)

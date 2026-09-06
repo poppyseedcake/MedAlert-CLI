@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/poppyseedcake/MedAlert/internal/tui"
@@ -93,6 +94,59 @@ func TestAccountFormRequiresSaveAndConfirmsDiscard(t *testing.T) {
 	key(m, "esc")
 	if len(requests) != 1 {
 		t.Fatal("delete ran before confirmation")
+	}
+}
+
+func TestEscKeepsBusyUntilCancelledOperationReturns(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	calls := 0
+	m := tui.New(context.Background(), func(ctx context.Context, _ tui.Request, _ tui.Prompt) tui.Result {
+		calls++
+		close(started)
+		<-ctx.Done()
+		<-release
+		return tui.Result{Failed: true, Message: "Anulowano operację."}
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	key(m, "2")
+	key(m, "a")
+	key(m, "home")
+	key(m, "tab")
+	key(m, "patient")
+	key(m, "tab")
+	key(m, "tab")
+	cmd := key(m, "enter")
+	if cmd == nil {
+		t.Fatal("save did not start")
+	}
+
+	finished := make(chan tea.Msg, 1)
+	go func() { finished <- cmd() }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("operation did not start")
+	}
+
+	key(m, "esc")
+	if cmd := key(m, "a"); cmd != nil || strings.Contains(m.View(), "Dodaj konto") {
+		t.Fatal("TUI accepted a new operation before the cancelled one returned")
+	}
+	if calls != 1 {
+		t.Fatalf("execute calls = %d, want 1", calls)
+	}
+
+	close(release)
+	select {
+	case msg := <-finished:
+		m.Update(msg)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled operation did not return")
+	}
+	key(m, "a")
+	if !strings.Contains(m.View(), "Dodaj konto") {
+		t.Fatal("TUI stayed busy after the operation returned")
 	}
 }
 

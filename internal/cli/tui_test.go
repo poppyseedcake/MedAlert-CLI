@@ -48,6 +48,27 @@ func (d *terminalDriver) schedule(cmd tea.Cmd) {
 		}
 	}()
 }
+func (d *terminalDriver) update(msg tea.Msg) {
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, cmd := range batch {
+			d.schedule(cmd)
+		}
+		return
+	}
+	_, cmd := d.model.Update(msg)
+	d.schedule(cmd)
+}
+func (d *terminalDriver) next() {
+	d.t.Helper()
+	timeout := time.NewTimer(3 * time.Second)
+	defer timeout.Stop()
+	select {
+	case msg := <-d.messages:
+		d.update(msg)
+	case <-timeout.C:
+		d.t.Fatal("timed out waiting for TUI operation")
+	}
+}
 func (d *terminalDriver) until(text string) {
 	d.t.Helper()
 	timeout := time.NewTimer(3 * time.Second)
@@ -55,14 +76,7 @@ func (d *terminalDriver) until(text string) {
 	for !strings.Contains(d.model.View(), text) {
 		select {
 		case msg := <-d.messages:
-			if batch, ok := msg.(tea.BatchMsg); ok {
-				for _, cmd := range batch {
-					d.schedule(cmd)
-				}
-			} else {
-				_, cmd := d.model.Update(msg)
-				d.schedule(cmd)
-			}
+			d.update(msg)
 		case <-timeout.C:
 			d.t.Fatalf("missing %q: %s", text, d.model.View())
 		}
@@ -163,6 +177,7 @@ func TestTerminalStateAccountLifecycleAndSecretRedaction(t *testing.T) {
 	}
 	d.press(tea.KeyEsc)
 	d.until("Anulowano logowanie.")
+	d.next()
 	d.text("e")
 	d.until("Edytuj konto")
 	d.press(tea.KeyCtrlA)
@@ -285,6 +300,60 @@ func TestTerminalDeleteRemovesAccountWhenSessionCleanupFails(t *testing.T) {
 	}
 	if _, err := storage.GetProfile("morning"); !errors.Is(err, store.ErrProfileNotFound) {
 		t.Fatalf("profile after delete = %v, want not found", err)
+	}
+}
+
+func TestTerminalActionCancellationDoesNotMutateAccounts(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{
+		ID:             "alice",
+		Username:       "alice@example.com",
+		PasswordSource: store.PasswordSourcePrompt,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if result := terminalAction(ctx, options{database: database}, tui.Request{
+		Action:   "create",
+		ID:       "bob",
+		Username: "bob@example.com",
+	}, nil); !result.Failed {
+		t.Fatal("cancelled create succeeded")
+	}
+	if result := terminalAction(ctx, options{database: database}, tui.Request{
+		Action: "delete",
+		ID:     "alice",
+	}, nil); !result.Failed {
+		t.Fatal("cancelled delete succeeded")
+	}
+
+	storage, err = store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if _, err := storage.GetAccount("alice"); err != nil {
+		t.Fatalf("account after cancelled delete = %v, want present", err)
+	}
+	if _, err := storage.GetAccount("bob"); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("account after cancelled create = %v, want not found", err)
 	}
 }
 
