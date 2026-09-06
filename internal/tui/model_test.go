@@ -97,7 +97,7 @@ func TestAccountFormRequiresSaveAndConfirmsDiscard(t *testing.T) {
 	}
 }
 
-func TestEscKeepsBusyUntilCancelledOperationReturns(t *testing.T) {
+func TestEscReleasesBusyBeforeCancelledOperationReturns(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	calls := 0
@@ -130,12 +130,14 @@ func TestEscKeepsBusyUntilCancelledOperationReturns(t *testing.T) {
 	}
 
 	key(m, "esc")
-	if cmd := key(m, "a"); cmd != nil || strings.Contains(m.View(), "Dodaj konto") {
-		t.Fatal("TUI accepted a new operation before the cancelled one returned")
+	key(m, "a")
+	if !strings.Contains(m.View(), "Dodaj konto") {
+		t.Fatal("TUI stayed busy while the cancelled operation was blocked")
 	}
 	if calls != 1 {
 		t.Fatalf("execute calls = %d, want 1", calls)
 	}
+	key(m, "esc")
 
 	close(release)
 	select {
@@ -147,6 +149,73 @@ func TestEscKeepsBusyUntilCancelledOperationReturns(t *testing.T) {
 	key(m, "a")
 	if !strings.Contains(m.View(), "Dodaj konto") {
 		t.Fatal("TUI stayed busy after the operation returned")
+	}
+}
+
+func TestCancelledOperationSerializesTheSameAccount(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	loginCalls := 0
+	snapshot := tui.Snapshot{Accounts: []tui.Row{{ID: "home", Label: "patient", Detail: "Wymaga logowania"}}}
+	m := tui.New(context.Background(), func(ctx context.Context, request tui.Request, _ tui.Prompt) tui.Result {
+		switch request.Action {
+		case "refresh":
+			return tui.Result{Snapshot: snapshot, Message: "Stan odświeżony."}
+		case "login":
+			loginCalls++
+			if loginCalls == 1 {
+				close(started)
+				<-ctx.Done()
+				<-release
+				return tui.Result{Failed: true, Message: "Anulowano operację."}
+			}
+			return tui.Result{Snapshot: snapshot, Message: "Zalogowano konto."}
+		default:
+			t.Fatalf("unexpected request: %+v", request)
+			return tui.Result{}
+		}
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if cmd == nil {
+		t.Fatal("refresh did not start")
+	}
+	m.Update(cmd())
+	key(m, "2")
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if cmd == nil {
+		t.Fatal("login did not start")
+	}
+
+	finished := make(chan tea.Msg, 1)
+	go func() { finished <- cmd() }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("login did not start")
+	}
+
+	key(m, "esc")
+	_, retry := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if retry != nil || loginCalls != 1 || !strings.Contains(m.View(), "nadal się kończy") {
+		t.Fatalf("same-account operation was not serialized: calls=%d view=%s", loginCalls, m.View())
+	}
+
+	close(release)
+	select {
+	case msg := <-finished:
+		m.Update(msg)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled login did not return")
+	}
+	_, retry = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if retry == nil {
+		t.Fatal("same-account operation was not released")
+	}
+	m.Update(retry())
+	if loginCalls != 2 || !strings.Contains(m.View(), "Zalogowano konto.") {
+		t.Fatalf("retry did not run after the cancelled operation returned: calls=%d view=%s", loginCalls, m.View())
 	}
 }
 

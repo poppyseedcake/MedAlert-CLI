@@ -55,6 +55,8 @@ type Model struct {
 	events                        chan tea.Msg
 	generation                    int
 	activeGeneration              int
+	operations                    map[int]string
+	runningKeys                   map[string]struct{}
 }
 
 type form struct {
@@ -93,11 +95,22 @@ func (m *Model) start(request Request) tea.Cmd {
 	if m.execute == nil {
 		return nil
 	}
+	key := operationKey(request)
+	if _, running := m.runningKeys[key]; running {
+		m.notice = "Poprzednia operacja nadal się kończy. Spróbuj ponownie później."
+		return nil
+	}
+	if m.operations == nil {
+		m.operations = make(map[int]string)
+		m.runningKeys = make(map[string]struct{})
+	}
 	m.busy = true
 	m.notice = "Trwa operacja. Esc: anuluj oczekiwanie."
 	m.generation++
 	generation := m.generation
 	m.activeGeneration = generation
+	m.operations[generation] = key
+	m.runningKeys[key] = struct{}{}
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.cancel = cancel
 	return func() tea.Msg {
@@ -125,7 +138,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case promptMsg:
-		if msg.generation == m.generation && m.busy {
+		if msg.generation == m.activeGeneration && m.busy {
 			title := "Podaj hasło"
 			if msg.kind == "mfa" {
 				title = "Podaj kod MFA"
@@ -137,7 +150,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.waitPrompt()
 	case finishedMsg:
+		key, running := m.operations[msg.generation]
+		if !running {
+			return m, nil
+		}
+		delete(m.operations, msg.generation)
+		delete(m.runningKeys, key)
 		if msg.generation != m.activeGeneration {
+			// A cancelled operation can finish after a new operation starts.
+			// Its result must not replace the newer state.
 			return m, nil
 		}
 		cancelled := msg.generation != m.generation
@@ -264,11 +285,21 @@ func (m *Model) stop() {
 		m.cancel()
 	}
 	m.generation++
-	// Keep busy until the cancelled command returns. The command may be
-	// waiting in SQLite or Secret Service and can still finish a side effect.
+	// Release the foreground UI immediately. The worker remains in operations
+	// until it returns, so another operation for the same account cannot race
+	// with its late side effect.
+	m.busy = false
+	m.activeGeneration = 0
 	m.form = nil
 	m.pendingForm = nil
 	m.cancel = nil
+}
+
+func operationKey(request Request) string {
+	if id := strings.TrimSpace(request.ID); id != "" {
+		return "account:" + id
+	}
+	return "action:" + request.Action
 }
 func (m *Model) selectedID() string {
 	rows := m.rows()
@@ -380,6 +411,9 @@ func (m *Model) updateForm(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 		cmd := m.start(request)
+		if cmd == nil {
+			return nil
+		}
 		m.pendingForm = m.form
 		m.form = nil
 		return cmd
