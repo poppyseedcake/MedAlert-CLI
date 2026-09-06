@@ -21,7 +21,7 @@ func runAuth(command string, settings options, stdin *os.File, stdout, stderr io
 	case "account login", "account authenticate":
 		return accountLogin(command, settings, stdin, stdout, stderr, jsonOutput)
 	case "account logout":
-		return accountLogout(command, settings, stdout, stderr, jsonOutput)
+		return accountLogoutWithContext(context.Background(), command, settings, stdout, stderr, jsonOutput)
 	case "account status":
 		return accountStatus(command, settings, stdout, stderr, jsonOutput)
 	default:
@@ -61,6 +61,13 @@ func isNonInteractive(settings options, stdin *os.File) bool {
 }
 
 func accountLogin(command string, settings options, stdin *os.File, stdout, stderr io.Writer, jsonOutput bool) int {
+	return accountLoginWithPrompt(context.Background(), command, settings, stdin, stdout, stderr, jsonOutput, nil)
+}
+
+// accountLoginWithPrompt is shared by CLI login and the terminal adapter.
+// The optional callback supplies hidden input without writing terminal output.
+func accountLoginWithPrompt(parent context.Context, command string, settings options, stdin *os.File, stdout, stderr io.Writer, jsonOutput bool, prompt func(context.Context, string) (string, error)) int {
+	parent = contextOrBackground(parent)
 	id, ok := checkAccountPositionals(command, settings, true, stderr, jsonOutput)
 	if !ok {
 		return 2
@@ -69,18 +76,34 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 		writeError(stderr, command, "invalid_arguments", "account id is required (use --account or a positional id)", jsonOutput)
 		return 2
 	}
+	if err := parent.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 	storage, err := ensureStore(settings.database)
 	if err != nil {
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
-	account, err := storage.GetAccount(id)
+	account, err := storage.GetAccountContext(parent, id)
 	if err != nil {
+		if isContextError(err) {
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 
+	timeout := 60 * time.Second
+	if prompt != nil {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
 	storeBackend := sessionStoreFor(settings)
 	var saved *medicover.SessionState
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 	if loaded, loadErr := storeBackend.Load(id); loadErr == nil {
 		saved = loaded
 	} else if !errors.Is(loadErr, session.ErrNotFound) && !isSessionCorrupt(loadErr) {
@@ -92,16 +115,20 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 			return 4
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 
 	client := medicoverClientFor(settings)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
 
 	mfaCode := ""
 	if strings.TrimSpace(settings.mfaCodeFile) != "" {
 		value, readErr := secrets.ReadSecretFile(settings.mfaCodeFile)
 		if readErr != nil {
 			return reportSecretError(stderr, command, readErr, jsonOutput)
+		}
+		if err := ctx.Err(); err != nil {
+			return reportContextError(stderr, command, err, jsonOutput)
 		}
 		mfaCode = strings.TrimSpace(value)
 	}
@@ -111,6 +138,9 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 	// saved session is still valid.
 	if saved != nil {
 		if reused, reuseErr := client.Authenticate(ctx, medicover.AuthRequest{Session: saved}); reuseErr == nil {
+			if err := ctx.Err(); err != nil {
+				return reportContextError(stderr, command, err, jsonOutput)
+			}
 			if saveErr := storeBackend.Save(id, reused.Session); saveErr != nil {
 				if errors.Is(saveErr, session.ErrUnsafe) {
 					writeError(stderr, command, "invalid_arguments", saveErr.Error(), jsonOutput)
@@ -149,8 +179,20 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 	// Resolve the password through the account's configured secret source.
 	// check/watch never prompt; only login may prompt when interactive.
 	nonInteractive := isNonInteractive(settings, stdin)
-	password, err := secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, stdin, stderr, nonInteractive)
+	var password string
+	if prompt != nil && account.PasswordSource == "prompt" {
+		password, err = prompt(ctx, "password")
+	} else {
+		password, err = secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, stdin, stderr, nonInteractive)
+	}
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			writeError(stderr, command, "timeout", "authentication timed out", jsonOutput)
+			return 4
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return reportContextError(stderr, command, ctxErr, jsonOutput)
+		}
 		return reportSecretError(stderr, command, err, jsonOutput)
 	}
 	// Drop the raw password reference as soon as the request is built; the
@@ -158,16 +200,42 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 	passwordSecret := medicover.Secret(password)
 	password = ""
 
+	var requestMFA func(context.Context) (medicover.Secret, error)
+	if prompt != nil {
+		requestMFA = func(ctx context.Context) (medicover.Secret, error) {
+			value, err := prompt(ctx, "mfa")
+			return medicover.Secret(value), err
+		}
+	}
 	result, err := client.Authenticate(ctx, medicover.AuthRequest{
-		Username: medicover.Secret(account.Username),
-		Password: passwordSecret,
-		MFACode:  medicover.Secret(mfaCode),
-		Session:  saved,
+		Username:   medicover.Secret(account.Username),
+		Password:   passwordSecret,
+		MFACode:    medicover.Secret(mfaCode),
+		RequestMFA: requestMFA,
+		Session:    saved,
 	})
 	// Clear MFA material immediately.
 	mfaCode = ""
 	if err != nil {
+		var medicoverErr *medicover.Error
+		if errors.As(err, &medicoverErr) {
+			return reportMedicoverError(stderr, command, err, jsonOutput)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if errors.Is(ctxErr, context.DeadlineExceeded) {
+				writeError(stderr, command, "timeout", "authentication timed out", jsonOutput)
+				return 4
+			}
+			return reportContextError(stderr, command, ctxErr, jsonOutput)
+		}
 		return reportMedicoverError(stderr, command, err, jsonOutput)
+	}
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			writeError(stderr, command, "timeout", "authentication timed out", jsonOutput)
+			return 4
+		}
+		return reportContextError(stderr, command, err, jsonOutput)
 	}
 	if err := storeBackend.Save(id, result.Session); err != nil {
 		// A failed save after a successful exchange keeps the in-memory
@@ -200,6 +268,14 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 }
 
 func accountLogout(command string, settings options, stdout, stderr io.Writer, jsonOutput bool) int {
+	return accountLogoutWithContext(context.Background(), command, settings, stdout, stderr, jsonOutput)
+}
+
+func accountLogoutWithContext(ctx context.Context, command string, settings options, stdout, stderr io.Writer, jsonOutput bool) int {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 	id, ok := checkAccountPositionals(command, settings, true, stderr, jsonOutput)
 	if !ok {
 		return 2
@@ -213,12 +289,21 @@ func accountLogout(command string, settings options, stdout, stderr io.Writer, j
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
-	account, err := storage.GetAccount(id)
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
+	account, err := storage.GetAccountContext(ctx, id)
 	if err != nil {
+		if isContextError(err) {
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 	_ = account
 	storeBackend := sessionStoreFor(settings)
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 	// Logging out removes only this account's session state. Other accounts
 	// are untouched because every backend keys state by account id.
 	if err := storeBackend.Delete(id); err != nil {
@@ -228,6 +313,9 @@ func accountLogout(command string, settings options, stdout, stderr io.Writer, j
 		}
 		writeError(stderr, command, "temporary_failure", "cannot remove session state", jsonOutput)
 		return 4
+	}
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
 	}
 	if settings.forgetSecret {
 		// DeletePassword already ignores missing entries; any other error
@@ -323,6 +411,9 @@ func reportMedicoverError(stderr io.Writer, command string, err error, jsonOutpu
 		case medicover.CodeProtocolChanged:
 			writeError(stderr, command, "protocol_changed", medicoverErr.Message, jsonOutput)
 			return 5
+		case medicover.CodeTimeout:
+			writeError(stderr, command, "timeout", medicoverErr.Message, jsonOutput)
+			return 4
 		case medicover.CodeCancelled, medicover.CodePartial, medicover.CodeConflicting, medicover.CodeStale:
 			writeError(stderr, command, medicoverErr.Code, medicoverErr.Message, jsonOutput)
 			return 6

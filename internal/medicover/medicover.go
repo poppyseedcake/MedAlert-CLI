@@ -49,6 +49,7 @@ const (
 	CodeRateLimited        = "rate_limited"
 	CodeMFARequired        = "mfa_required"
 	CodeCancelled          = "cancelled"
+	CodeTimeout            = "timeout"
 	CodePartial            = "partial_result"
 	CodeConflicting        = "conflicting_result"
 	CodeStale              = "stale_result"
@@ -151,7 +152,10 @@ type AuthRequest struct {
 	Username Secret
 	Password Secret
 	MFACode  Secret
-	Session  *SessionState
+	// RequestMFA is used only after the server returns an MFA form.
+	// It continues that challenge without another password request.
+	RequestMFA func(context.Context) (Secret, error)
+	Session    *SessionState
 }
 
 // AuthResult reports a successful authentication. Session must be saved by
@@ -520,7 +524,7 @@ func (c *Client) fullLogin(ctx context.Context, authorizeEndpoint, tokenEndpoint
 	}
 	// A redirect to an MFA page continues the flow.
 	if isMFARedirect(loginResponse.location) {
-		return c.handleMFA(ctx, tokenEndpoint, loginResponse, cookies, session, state, verifier, req.MFACode.Expose())
+		return c.handleMFA(ctx, tokenEndpoint, loginResponse, cookies, session, state, verifier, req.MFACode.Expose(), req.RequestMFA)
 	}
 	// Medicover can intermediate through /connect/authorize/callback before
 	// reaching the registered callback. Follow one allowed redirect chain
@@ -579,7 +583,7 @@ func (c *Client) followPostRedirect(ctx context.Context, tokenEndpoint, location
 	return AuthResult{}, false, nil
 }
 
-func (c *Client) handleMFA(ctx context.Context, tokenEndpoint string, loginResponse *formResponse, cookies *cookieStore, session *SessionState, state, verifier, mfaCode string) (AuthResult, error) {
+func (c *Client) handleMFA(ctx context.Context, tokenEndpoint string, loginResponse *formResponse, cookies *cookieStore, session *SessionState, state, verifier, mfaCode string, requestMFA func(context.Context) (Secret, error)) (AuthResult, error) {
 	mfaURL := loginResponse.location
 	if mfaURL == "" {
 		return AuthResult{}, protocolChanged("missing MFA location")
@@ -625,6 +629,16 @@ func (c *Client) handleMFA(ctx context.Context, tokenEndpoint string, loginRespo
 	mfaForm, err := parseMFAForm(mfaPage.body, mfaPage.url)
 	if err != nil {
 		return AuthResult{}, err
+	}
+	if strings.TrimSpace(mfaCode) == "" && requestMFA != nil {
+		value, promptErr := requestMFA(ctx)
+		if promptErr != nil {
+			if errors.Is(promptErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return AuthResult{}, &Error{Code: CodeTimeout, Message: "authentication timed out"}
+			}
+			return AuthResult{}, &Error{Code: CodeCancelled, Message: "authentication was cancelled"}
+		}
+		mfaCode = value.Expose()
 	}
 	if strings.TrimSpace(mfaCode) == "" {
 		return AuthResult{}, &Error{Code: CodeMFARequired, Message: "multi-factor authentication is required"}

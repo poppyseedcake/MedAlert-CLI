@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,22 +13,47 @@ import (
 )
 
 func runAccount(command string, settings options, stdin *os.File, stdout, stderr io.Writer) int {
+	return runAccountWithContext(context.Background(), command, settings, stdin, stdout, stderr)
+}
+
+func runAccountWithContext(ctx context.Context, command string, settings options, stdin *os.File, stdout, stderr io.Writer) int {
+	ctx = contextOrBackground(ctx)
 	jsonOutput := settings.output == "json"
 	switch command {
 	case "account list":
 		return accountList(command, settings, stdout, stderr, jsonOutput)
 	case "account create":
-		return accountCreate(command, settings, stdin, stdout, stderr, jsonOutput)
+		return accountCreateWithContext(ctx, command, settings, stdin, stdout, stderr, jsonOutput)
 	case "account show":
 		return accountShow(command, settings, stdout, stderr, jsonOutput)
 	case "account edit":
-		return accountEdit(command, settings, stdin, stdout, stderr, jsonOutput)
+		return accountEditWithContext(ctx, command, settings, stdin, stdout, stderr, jsonOutput)
 	case "account delete":
-		return accountDelete(command, settings, stdout, stderr, jsonOutput)
+		return accountDeleteWithContext(ctx, command, settings, stdout, stderr, jsonOutput)
 	default:
 		writeError(stderr, command, "invalid_arguments", "a supported account command is required", jsonOutput)
 		return 2
 	}
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func reportContextError(stderr io.Writer, command string, err error, jsonOutput bool) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		writeError(stderr, command, "timeout", "operation timed out", jsonOutput)
+		return 4
+	}
+	writeError(stderr, command, "cancelled", "operation was cancelled", jsonOutput)
+	return 6
 }
 
 func resolveAccountID(settings options) string {
@@ -94,6 +120,14 @@ func accountList(command string, settings options, stdout, stderr io.Writer, jso
 }
 
 func accountCreate(command string, settings options, stdin *os.File, stdout, stderr io.Writer, jsonOutput bool) int {
+	return accountCreateWithContext(context.Background(), command, settings, stdin, stdout, stderr, jsonOutput)
+}
+
+func accountCreateWithContext(ctx context.Context, command string, settings options, stdin *os.File, stdout, stderr io.Writer, jsonOutput bool) int {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 	id, ok := checkAccountPositionals(command, settings, true, stderr, jsonOutput)
 	if !ok {
 		return 2
@@ -122,12 +156,18 @@ func accountCreate(command string, settings options, stdin *os.File, stdout, std
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 	// Check for duplicates before prompting or saving anything: a failed
 	// create must not replace the existing account's Secret Service entry.
-	if _, err := storage.GetAccount(id); err == nil {
+	if _, err := storage.GetAccountContext(ctx, id); err == nil {
 		writeError(stderr, command, "account_exists", fmt.Sprintf("account %q already exists", id), jsonOutput)
 		return 2
 	} else if !errors.Is(err, store.ErrAccountNotFound) {
+		if isContextError(err) {
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		if errors.Is(err, store.ErrAccountInvalid) {
 			return reportAccountError(stderr, command, err, jsonOutput)
 		}
@@ -137,13 +177,19 @@ func accountCreate(command string, settings options, stdin *os.File, stdout, std
 	if secretErr != nil {
 		return reportSecretError(stderr, command, secretErr, jsonOutput)
 	}
-	created, err := storage.CreateAccount(store.Account{
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
+	created, err := storage.CreateAccountContext(ctx, store.Account{
 		ID:             id,
 		Username:       username,
 		PasswordSource: source,
 		PasswordRef:    ref,
 	})
 	if err != nil {
+		if isContextError(err) {
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		// A failed create after a Secret Service save is possible only
 		// through a concurrent duplicate. The orphaned entry is left alone:
 		// deleting it could remove the concurrent winner's password. The
@@ -177,6 +223,14 @@ func accountShow(command string, settings options, stdout, stderr io.Writer, jso
 }
 
 func accountEdit(command string, settings options, stdin *os.File, stdout, stderr io.Writer, jsonOutput bool) int {
+	return accountEditWithContext(context.Background(), command, settings, stdin, stdout, stderr, jsonOutput)
+}
+
+func accountEditWithContext(ctx context.Context, command string, settings options, stdin *os.File, stdout, stderr io.Writer, jsonOutput bool) int {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 	id, ok := checkAccountPositionals(command, settings, true, stderr, jsonOutput)
 	if !ok {
 		return 2
@@ -194,8 +248,14 @@ func accountEdit(command string, settings options, stdin *os.File, stdout, stder
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
-	current, err := storage.GetAccount(id)
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
+	current, err := storage.GetAccountContext(ctx, id)
 	if err != nil {
+		if isContextError(err) {
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 	update := store.AccountUpdate{}
@@ -230,14 +290,27 @@ func accountEdit(command string, settings options, stdin *os.File, stdout, stder
 		if secretErr != nil {
 			return reportSecretError(stderr, command, secretErr, jsonOutput)
 		}
+		if err := ctx.Err(); err != nil {
+			restoreSecretAfterFailedUpdate(id, oldSource, source, stashedPassword, stashed, stashKnown)
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		newSource, newRef = source, ref
 		update.PasswordSource = &newSource
 		update.PasswordRef = &newRef
 		needsSecretUpdate = true
 	}
-	updated, err := storage.UpdateAccount(id, update)
+	if err := ctx.Err(); err != nil {
+		if needsSecretUpdate {
+			restoreSecretAfterFailedUpdate(id, oldSource, newSource, stashedPassword, stashed, stashKnown)
+		}
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
+	updated, err := storage.UpdateAccountContext(ctx, id, update)
 	if err != nil {
 		restoreSecretAfterFailedUpdate(id, oldSource, newSource, stashedPassword, stashed, stashKnown)
+		if isContextError(err) {
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 	if needsSecretUpdate && oldSource == store.PasswordSourceSecretService && newSource != store.PasswordSourceSecretService {
@@ -250,6 +323,14 @@ func accountEdit(command string, settings options, stdin *os.File, stdout, stder
 }
 
 func accountDelete(command string, settings options, stdout, stderr io.Writer, jsonOutput bool) int {
+	return accountDeleteWithContext(context.Background(), command, settings, stdout, stderr, jsonOutput)
+}
+
+func accountDeleteWithContext(ctx context.Context, command string, settings options, stdout, stderr io.Writer, jsonOutput bool) int {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
 	id, ok := checkAccountPositionals(command, settings, true, stderr, jsonOutput)
 	if !ok {
 		return 2
@@ -263,11 +344,23 @@ func accountDelete(command string, settings options, stdout, stderr io.Writer, j
 		return reportStoreError(stderr, command, err, jsonOutput)
 	}
 	defer storage.Close()
-	current, err := storage.GetAccount(id)
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
+	current, err := storage.GetAccountContext(ctx, id)
 	if err != nil {
+		if isContextError(err) {
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
-	if err := storage.DeleteAccount(id); err != nil {
+	if err := ctx.Err(); err != nil {
+		return reportContextError(stderr, command, err, jsonOutput)
+	}
+	if err := storage.DeleteAccountContext(ctx, id); err != nil {
+		if isContextError(err) {
+			return reportContextError(stderr, command, err, jsonOutput)
+		}
 		return reportAccountError(stderr, command, err, jsonOutput)
 	}
 	if current.PasswordSource == store.PasswordSourceSecretService {

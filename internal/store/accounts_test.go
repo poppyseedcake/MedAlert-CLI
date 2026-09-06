@@ -1,6 +1,8 @@
 package store_test
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -102,6 +104,51 @@ func TestCreateDuplicateAccountFails(t *testing.T) {
 	}
 	if _, err := storage.CreateAccount(account); err == nil {
 		t.Fatal("duplicate create succeeded")
+	}
+}
+
+func TestAccountContextCancellationDoesNotWrite(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if _, err := storage.CreateAccount(store.Account{
+		ID:             "alice",
+		Username:       "alice@example.com",
+		PasswordSource: store.PasswordSourcePrompt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := storage.CreateAccountContext(ctx, store.Account{
+		ID:             "bob",
+		Username:       "bob@example.com",
+		PasswordSource: store.PasswordSourcePrompt,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled create error = %v, want context.Canceled", err)
+	}
+	if _, err := storage.UpdateAccountContext(ctx, "alice", store.AccountUpdate{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled update error = %v, want context.Canceled", err)
+	}
+	if err := storage.DeleteAccountContext(ctx, "alice"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled delete error = %v, want context.Canceled", err)
+	}
+	if _, err := storage.GetAccount("alice"); err != nil {
+		t.Fatalf("account after cancellation = %v, want present", err)
+	}
+	if _, err := storage.GetAccount("bob"); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("created account after cancellation = %v, want not found", err)
 	}
 }
 
