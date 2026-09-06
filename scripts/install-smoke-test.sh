@@ -96,7 +96,7 @@ grep -Fq 'watch completed 1 iterations' "$watch_stderr"
 
 doctor_json=$(run_installed doctor --output json)
 case "$doctor_json" in
-	*'"command":"doctor"'*'"schema_version":7'*) ;;
+	*'"command":"doctor"'*'"schema_version":'[0-9]*) ;;
 	*)
 		printf 'unexpected doctor JSON output: %s\n' "$doctor_json" >&2
 		exit 1

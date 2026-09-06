@@ -184,7 +184,11 @@ case ${XDG_DATA_HOME:-} in
   /*) data_dir="$XDG_DATA_HOME/medalert" ;;
   *) data_dir="$HOME/.local/share/medalert" ;;
 esac
-backup=$(ls -1t "$data_dir"/backups/medalert-schema-*.sqlite3 | head -n 1)
+backup=$(ls -1t "$data_dir"/backups/medalert-schema-*.sqlite3 2>/dev/null | head -n 1)
+if [ -z "$backup" ] || [ ! -r "$backup" ]; then
+	printf '%s\n' 'no readable migration backup found' >&2
+	exit 1
+fi
 mv "$data_dir/medalert.db" "$data_dir/medalert.db.failed"
 install -m 0600 "$backup" "$data_dir/medalert.db"
 "$HOME/.local/bin/medalert" doctor
