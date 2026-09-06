@@ -346,6 +346,9 @@ func reportMedicoverError(stderr io.Writer, command string, err error, jsonOutpu
 		case medicover.CodeProtocolChanged:
 			writeError(stderr, command, "protocol_changed", medicoverErr.Message, jsonOutput)
 			return 5
+		case medicover.CodeTimeout:
+			writeError(stderr, command, "timeout", medicoverErr.Message, jsonOutput)
+			return 4
 		case medicover.CodeCancelled, medicover.CodePartial, medicover.CodeConflicting, medicover.CodeStale:
 			writeError(stderr, command, medicoverErr.Code, medicoverErr.Message, jsonOutput)
 			return 6

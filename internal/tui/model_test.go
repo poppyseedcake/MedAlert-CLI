@@ -135,3 +135,35 @@ func TestLongInputKeepsCursorAndEditedTailVisible(t *testing.T) {
 		t.Fatalf("edited tail hidden: %s", m.View())
 	}
 }
+
+func TestRequiredHistoryActionSelectsMatchingHistoryRow(t *testing.T) {
+	snapshot := tui.Snapshot{
+		Actions: []tui.Row{{ID: "delivery-1", Label: "! Sprawdź błąd dostarczenia: delivery-1", Target: 5}},
+		History: []tui.Row{
+			{ID: "run-1", Label: "niezwiązany przebieg", Detail: "run"},
+			{ID: "delivery-1", Label: "wymagane dostarczenie", Detail: "delivery details"},
+		},
+	}
+	m := tui.New(context.Background(), func(_ context.Context, r tui.Request, _ tui.Prompt) tui.Result {
+		if r.Action != "refresh" {
+			t.Fatalf("request = %+v, want refresh", r)
+		}
+		return tui.Result{Snapshot: snapshot, Message: "Stan odświeżony."}
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if cmd == nil {
+		t.Fatal("refresh did not start")
+	}
+	m.Update(cmd())
+
+	key(m, "enter")
+	if !strings.Contains(m.View(), "> wymagane dostarczenie") {
+		t.Fatalf("required action selected the wrong history row: %s", m.View())
+	}
+	key(m, "enter")
+	view := m.View()
+	if !strings.Contains(view, "delivery details") || strings.Contains(view, "niezwiązany przebieg") {
+		t.Fatalf("history detail is unrelated: %s", view)
+	}
+}

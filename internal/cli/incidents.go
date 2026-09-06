@@ -65,7 +65,7 @@ func shouldRecordProfileIncident(err error) bool {
 	var medicoverErr *medicover.Error
 	if errors.As(err, &medicoverErr) {
 		switch medicoverErr.Code {
-		case medicover.CodeCancelled:
+		case medicover.CodeCancelled, medicover.CodeTimeout:
 			return false
 		case medicover.CodeConflicting, medicover.CodeStale:
 			return false
@@ -95,7 +95,7 @@ func shouldRecordAccountIncident(err error) bool {
 	}
 	var medicoverErr *medicover.Error
 	if errors.As(err, &medicoverErr) {
-		if medicoverErr.Code == medicover.CodeCancelled {
+		if medicoverErr.Code == medicover.CodeCancelled || medicoverErr.Code == medicover.CodeTimeout {
 			return false
 		}
 		return true

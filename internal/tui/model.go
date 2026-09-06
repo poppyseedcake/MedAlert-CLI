@@ -27,6 +27,7 @@ type Snapshot struct {
 	Accounts                     []Row
 	Actions                      []Row
 	Profiles, Destinations, Runs []Row
+	History                      []Row
 	Summary                      string
 }
 type Request struct{ Action, ID, Username, PasswordFile string }
@@ -277,6 +278,9 @@ func (m *Model) rows() []Row {
 	case 3:
 		return m.snapshot.Destinations
 	case 5:
+		if m.snapshot.History != nil {
+			return m.snapshot.History
+		}
 		return m.snapshot.Runs
 	}
 	return nil

@@ -39,6 +39,7 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 	settings.accountID, settings.username, settings.passwordFile = request.ID, request.Username, request.PasswordFile
 	var stdout, stderr bytes.Buffer
 	code := 0
+	sessionCleanupFailed := false
 	switch request.Action {
 	case "refresh":
 	case "create", "edit":
@@ -47,10 +48,11 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		}
 		code = runAccount("account "+request.Action, settings, nil, &stdout, &stderr)
 	case "delete":
-		code = accountLogout("account logout", settings, &stdout, &stderr, true)
-		if code == 0 {
-			code = accountDelete("account delete", settings, &stdout, &stderr, true)
-		}
+		// Session cleanup is best effort here. The database account and its
+		// dependent records must still be deleted when Secret Service is down.
+		logoutCode := accountLogout("account logout", settings, &stdout, &stderr, true)
+		code = accountDelete("account delete", settings, &stdout, &stderr, true)
+		sessionCleanupFailed = logoutCode != 0 && code == 0
 	case "logout":
 		code = accountLogout("account logout", settings, &stdout, &stderr, true)
 	case "login":
@@ -78,6 +80,9 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		message = "Zapisano konto."
 	case "delete":
 		message = "Usunięto konto, jego profile i historię."
+		if sessionCleanupFailed {
+			message += " Nie udało się usunąć zapisanej sesji; sprawdź magazyn sesji."
+		}
 	case "logout":
 		message = "Wylogowano konto."
 	case "login":
@@ -119,6 +124,13 @@ func terminalSnapshot(settings options) (tui.Snapshot, error) {
 			label = "Sprawdź stan"
 		}
 		snapshot.Actions = append(snapshot.Actions, tui.Row{ID: action.ID, Label: "! " + label + ": " + action.ID, Detail: label, Target: map[string]int{"account": 1, "profile": 2, "destination": 3, "delivery": 5, "operational_delivery": 5, "history": 5}[action.Scope]})
+		if action.Code == "invalid_retention" {
+			snapshot.History = append(snapshot.History, tui.Row{
+				ID:     action.ID,
+				Label:  "Nieprawidłowy okres historii",
+				Detail: "Ustaw prawidłowy okres w poleceniu history retention.",
+			})
+		}
 	}
 	if len(status.Accounts) == 0 {
 		snapshot.Actions = append(snapshot.Actions, tui.Row{Label: "! Dodaj konto w obszarze Konta (2, A).", Target: 1})
@@ -151,7 +163,25 @@ func terminalSnapshot(settings options) (tui.Snapshot, error) {
 	}
 	for _, run := range runs {
 		state := map[string]string{"running": "w toku", "complete": "ukończony", "failed": "błąd", "partial": "częściowy", "cancelled": "anulowany", "conflicting": "konflikt", "stale": "nieaktualny"}[run.Status]
-		snapshot.Runs = append(snapshot.Runs, tui.Row{ID: run.ID, Label: run.ProfileID + " — " + state, Detail: run.StartedAt})
+		row := tui.Row{ID: run.ID, Label: run.ProfileID + " — " + state, Detail: run.StartedAt}
+		snapshot.Runs = append(snapshot.Runs, row)
+		snapshot.History = append(snapshot.History, row)
+	}
+	for _, delivery := range status.PermanentFailures {
+		snapshot.History = append(snapshot.History, tui.Row{
+			ID:    delivery.ID,
+			Label: delivery.ProfileID + " — trwały błąd dostarczenia",
+			Detail: fmt.Sprintf("Telegram: %s · Próby: %d · Utworzono: %s",
+				delivery.DestinationID, delivery.Attempts, delivery.CreatedAt),
+		})
+	}
+	for _, delivery := range status.OperationalDeliveries {
+		snapshot.History = append(snapshot.History, tui.Row{
+			ID:    delivery.ID,
+			Label: "Operacyjne dostarczenie — trwały błąd",
+			Detail: fmt.Sprintf("Incydent: %s · Telegram: %s · Typ: %s · Próby: %d · Utworzono: %s",
+				delivery.IncidentID, delivery.DestinationID, delivery.Kind, delivery.Attempts, delivery.CreatedAt),
+		})
 	}
 	snapshot.Summary = fmt.Sprintf("Konta: %d · Profile: %d · Problemy: %d", len(snapshot.Accounts), len(snapshot.Profiles), len(status.ActiveIncidents))
 	return snapshot, nil
@@ -173,6 +203,8 @@ func terminalError(code string) string {
 		return "Medicover zmienił sposób logowania. Sprawdź aktualizację programu."
 	case "secret_error", "missing_input":
 		return "Brak dostępu do hasła. Sprawdź plik lub magazyn haseł."
+	case "timeout":
+		return "Logowanie przekroczyło limit czasu. L: ponów."
 	default:
 		return "Operacja nie powiodła się. Sprawdź połączenie i magazyn sesji. R: odśwież."
 	}

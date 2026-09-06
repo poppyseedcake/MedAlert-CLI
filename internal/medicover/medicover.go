@@ -49,6 +49,7 @@ const (
 	CodeRateLimited        = "rate_limited"
 	CodeMFARequired        = "mfa_required"
 	CodeCancelled          = "cancelled"
+	CodeTimeout            = "timeout"
 	CodePartial            = "partial_result"
 	CodeConflicting        = "conflicting_result"
 	CodeStale              = "stale_result"
@@ -632,6 +633,9 @@ func (c *Client) handleMFA(ctx context.Context, tokenEndpoint string, loginRespo
 	if strings.TrimSpace(mfaCode) == "" && requestMFA != nil {
 		value, promptErr := requestMFA(ctx)
 		if promptErr != nil {
+			if errors.Is(promptErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return AuthResult{}, &Error{Code: CodeTimeout, Message: "authentication timed out"}
+			}
 			return AuthResult{}, &Error{Code: CodeCancelled, Message: "authentication was cancelled"}
 		}
 		mfaCode = value.Expose()

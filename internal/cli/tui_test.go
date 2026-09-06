@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/poppyseedcake/MedAlert/internal/tui"
 )
 
@@ -224,5 +226,70 @@ func TestTerminalStateKeepsFailedFormAndHidesProviderErrors(t *testing.T) {
 	d.until("Nieprawidłowe dane logowania")
 	if strings.Contains(d.model.View(), "PROVIDER_SECRET_MARKER_32") {
 		t.Fatal("provider error leaked password")
+	}
+}
+
+func TestTerminalDeleteRemovesAccountWhenSessionCleanupFails(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{
+		ID: "alice", Username: "alice@example.com", PasswordSource: store.PasswordSourcePrompt,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateProfile(store.Profile{
+		ID: "morning", AccountID: "alice", RegionIDs: "204", SpecialtyIDs: "132",
+		SearchType: store.SearchTypeStandard, CheckIntervalMinutes: 30, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A regular file cannot act as the session directory. This models a
+	// session backend failure without requiring a live Secret Service.
+	sessionPath := filepath.Join(root, "session-store")
+	if err := os.WriteFile(sessionPath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := terminalAction(context.Background(), options{
+		database: database, sessionDir: sessionPath,
+	}, tui.Request{Action: "delete", ID: "alice"}, nil)
+	if result.Failed {
+		t.Fatalf("delete failed: %+v", result)
+	}
+	if !strings.Contains(result.Message, "Nie udało się usunąć zapisanej sesji") {
+		t.Fatalf("delete message = %q, want session warning", result.Message)
+	}
+
+	storage, err = store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if _, err := storage.GetAccount("alice"); !errors.Is(err, store.ErrAccountNotFound) {
+		t.Fatalf("account after delete = %v, want not found", err)
+	}
+	if _, err := storage.GetProfile("morning"); !errors.Is(err, store.ErrProfileNotFound) {
+		t.Fatalf("profile after delete = %v, want not found", err)
+	}
+}
+
+func TestTerminalTimeoutMessage(t *testing.T) {
+	if message := terminalError("timeout"); !strings.Contains(message, "przekroczyło limit czasu") {
+		t.Fatalf("timeout message = %q", message)
 	}
 }
