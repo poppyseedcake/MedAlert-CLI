@@ -61,23 +61,23 @@ type options struct {
 	pollIntervalRaw  string
 	// Telegram Destination fields. telegramIDsRaw stays a string so the CLI
 	// can tell "flag missing" apart from "flag empty" (clear).
-	telegramIDsRaw   string
-	telegramName     string
-	chatID           string
-	tokenFile        string
-	tokenPrompt      bool
-	noStoredToken    bool
-	telegramBaseURL  string
-	clearTelegram    bool
+	telegramIDsRaw  string
+	telegramName    string
+	chatID          string
+	tokenFile       string
+	tokenPrompt     bool
+	noStoredToken   bool
+	telegramBaseURL string
+	clearTelegram   bool
 	// History inspection. historyLimitRaw caps list output; historyStatus
 	// filters by record status; historyScope filters incidents by scope;
 	// historyIncidentID selects incident deliveries; retentionDaysRaw sets
 	// the saved retention policy for history retention.
-	historyLimitRaw    string
-	historyStatus      string
-	historyScope       string
-	historyIncidentID  string
-	retentionDaysRaw   string
+	historyLimitRaw   string
+	historyStatus     string
+	historyScope      string
+	historyIncidentID string
+	retentionDaysRaw  string
 }
 
 type errorBody struct {
@@ -111,6 +111,9 @@ func RunWithIO(arguments []string, stdin *os.File, stdout, stderr io.Writer, get
 	if err := checkCommandFlags(commandName, settings); err != nil {
 		writeError(stderr, commandName, "invalid_arguments", err.Error(), settings.output == "json")
 		return 2
+	}
+	if commandName == "" && !settings.nonInteractive && settings.output == "text" && terminalPair(stdin, stdout) {
+		return runTUI(settings, stdin, stdout, stderr)
 	}
 	switch commandName {
 	case "version":
@@ -482,7 +485,7 @@ func checkCommandFlags(command string, settings options) error {
 		return err
 	}
 	switch command {
-	case "version", "doctor", "database initialize":
+	case "", "version", "doctor", "database initialize":
 		switch {
 		case hasAccountID:
 			return fmt.Errorf("--account is not supported for %s", command)

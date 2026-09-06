@@ -61,6 +61,12 @@ func isNonInteractive(settings options, stdin *os.File) bool {
 }
 
 func accountLogin(command string, settings options, stdin *os.File, stdout, stderr io.Writer, jsonOutput bool) int {
+	return accountLoginWithPrompt(context.Background(), command, settings, stdin, stdout, stderr, jsonOutput, nil)
+}
+
+// accountLoginWithPrompt is shared by CLI login and the terminal adapter.
+// The optional callback supplies hidden input without writing terminal output.
+func accountLoginWithPrompt(parent context.Context, command string, settings options, stdin *os.File, stdout, stderr io.Writer, jsonOutput bool, prompt func(context.Context, string) (string, error)) int {
 	id, ok := checkAccountPositionals(command, settings, true, stderr, jsonOutput)
 	if !ok {
 		return 2
@@ -94,7 +100,11 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 	}
 
 	client := medicoverClientFor(settings)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	timeout := 60 * time.Second
+	if prompt != nil {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	mfaCode := ""
@@ -149,7 +159,12 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 	// Resolve the password through the account's configured secret source.
 	// check/watch never prompt; only login may prompt when interactive.
 	nonInteractive := isNonInteractive(settings, stdin)
-	password, err := secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, stdin, stderr, nonInteractive)
+	var password string
+	if prompt != nil && account.PasswordSource == "prompt" {
+		password, err = prompt(ctx, "password")
+	} else {
+		password, err = secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, stdin, stderr, nonInteractive)
+	}
 	if err != nil {
 		return reportSecretError(stderr, command, err, jsonOutput)
 	}
@@ -158,11 +173,19 @@ func accountLogin(command string, settings options, stdin *os.File, stdout, stde
 	passwordSecret := medicover.Secret(password)
 	password = ""
 
+	var requestMFA func(context.Context) (medicover.Secret, error)
+	if prompt != nil {
+		requestMFA = func(ctx context.Context) (medicover.Secret, error) {
+			value, err := prompt(ctx, "mfa")
+			return medicover.Secret(value), err
+		}
+	}
 	result, err := client.Authenticate(ctx, medicover.AuthRequest{
-		Username: medicover.Secret(account.Username),
-		Password: passwordSecret,
-		MFACode:  medicover.Secret(mfaCode),
-		Session:  saved,
+		Username:   medicover.Secret(account.Username),
+		Password:   passwordSecret,
+		MFACode:    medicover.Secret(mfaCode),
+		RequestMFA: requestMFA,
+		Session:    saved,
 	})
 	// Clear MFA material immediately.
 	mfaCode = ""

@@ -975,3 +975,15 @@ func TestIntermediateAuthorizeCallbackIsFollowed(t *testing.T) {
 		t.Fatal("empty access token")
 	}
 }
+
+func TestMFAPromptContinuesCurrentChallenge(t *testing.T) {
+	fake := newFake(t)
+	client := medicover.NewClient(fake.clientConfig())
+	result, err := client.Authenticate(context.Background(), medicover.AuthRequest{
+		Username: "user-mfa@example.com", Password: "pass-mfa-123",
+		RequestMFA: func(ctx context.Context) (medicover.Secret, error) { return "123456", nil },
+	})
+	if err != nil || !result.MFAUsed || result.Session == nil {
+		t.Fatalf("MFA prompt failed: %v", err)
+	}
+}
