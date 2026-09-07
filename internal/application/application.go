@@ -14,16 +14,18 @@ import (
 
 	"github.com/poppyseedcake/MedAlert/internal/medicover"
 	"github.com/poppyseedcake/MedAlert/internal/monitoring"
+	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 )
 
-// Config selects the durable application resources used by the terminal
-// status query.
+// Config selects the durable application resources used by the application
+// service.
 type Config struct {
 	Database         string
 	SessionDir       string
 	MedicoverBaseURL string
+	TelegramBaseURL  string
 }
 
 // Application is the concrete application service. The project has one
@@ -78,15 +80,44 @@ type ProfileRequest struct {
 type OperationError struct {
 	Code    string
 	Message string
+	Cause   error
 }
 
 func (e *OperationError) Error() string { return e.Message }
+
+func (e *OperationError) Unwrap() error { return e.Cause }
 
 // ErrorInfo returns the stable code and safe detail for an application error.
 func ErrorInfo(err error) (string, string) {
 	var operationErr *OperationError
 	if errors.As(err, &operationErr) {
 		return operationErr.Code, operationErr.Message
+	}
+	var medicoverErr *medicover.Error
+	if errors.As(err, &medicoverErr) {
+		return medicoverErr.Code, medicoverErr.Message
+	}
+	switch {
+	case errors.Is(err, store.ErrProfileNotFound):
+		return "profile_not_found", err.Error()
+	case errors.Is(err, store.ErrAccountNotFound):
+		return "account_not_found", err.Error()
+	case errors.Is(err, store.ErrProfileDisabled):
+		return "profile_disabled", err.Error()
+	case errors.Is(err, store.ErrObservationRunActive):
+		return "run_active", err.Error()
+	case errors.Is(err, store.ErrObservationRunConflicting):
+		return "conflicting_result", err.Error()
+	case errors.Is(err, store.ErrObservationRunStale):
+		return "stale_result", err.Error()
+	case errors.Is(err, store.ErrObservationRunInvalid), errors.Is(err, store.ErrObservationRunNotFound):
+		return "invalid_arguments", err.Error()
+	case errors.Is(err, secrets.ErrMissingInput):
+		return "missing_input", err.Error()
+	case errors.Is(err, context.Canceled):
+		return "cancelled", "operation was cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout", "operation timed out"
 	}
 	return "database_error", err.Error()
 }
@@ -111,7 +142,7 @@ func (a *Application) Profile(ctx context.Context, request ProfileRequest) (stor
 		if buildErr != nil {
 			return store.Profile{}, &OperationError{Code: "invalid_arguments", Message: buildErr.Error()}
 		}
-		profile.Enabled = true
+		profile.Enabled = request.Values.Enabled
 		created, createErr := storage.CreateProfile(profile)
 		if createErr != nil {
 			return store.Profile{}, profileOperationError(createErr)
@@ -137,13 +168,14 @@ func (a *Application) Profile(ctx context.Context, request ProfileRequest) (stor
 		}
 		return updated, nil
 	case "delete":
-		if _, getErr := storage.GetProfile(id); getErr != nil {
+		current, getErr := storage.GetProfile(id)
+		if getErr != nil {
 			return store.Profile{}, profileOperationError(getErr)
 		}
 		if deleteErr := storage.DeleteProfile(id); deleteErr != nil {
 			return store.Profile{}, profileOperationError(deleteErr)
 		}
-		return store.Profile{ID: id}, nil
+		return current, nil
 	default:
 		return store.Profile{}, &OperationError{Code: "invalid_arguments", Message: "unsupported profile action"}
 	}
@@ -396,6 +428,14 @@ func (a *Application) readStatus(storage *store.Store) (statusData, error) {
 			id = incident.ID
 		}
 		data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "active_incident", Scope: incident.ScopeType, ID: id})
+		if incident.ScopeType == store.IncidentScopeAccount && accountPauseIncident(incident) {
+			for index := range data.Accounts {
+				if data.Accounts[index].ID == incident.ScopeID {
+					data.Accounts[index].AuthRequired = true
+					data.Accounts[index].Authenticated = false
+				}
+			}
+		}
 	}
 	data.PermanentFailures, err = storage.ListRecentDeliveries("", store.DeliveryPermanentFailure, 1000)
 	if err != nil {
@@ -439,14 +479,7 @@ func latestRunStart(storage *store.Store, profileID string) (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
-	latest := time.Time{}
-	for _, run := range runs {
-		parsed, err := time.Parse(time.RFC3339Nano, run.StartedAt)
-		if err == nil && parsed.After(latest) {
-			latest = parsed
-		}
-	}
-	return latest, !latest.IsZero()
+	return monitoring.LatestRunStart(runs)
 }
 
 func profileValues(profile store.Profile) ProfileValues {
@@ -467,7 +500,7 @@ func incidentScopeLabel(scope string) string {
 	case store.IncidentScopeDestination:
 		return "Telegram"
 	default:
-		return scope
+		return "obszar"
 	}
 }
 
@@ -486,7 +519,19 @@ func incidentFailureLabel(code string) string {
 	case "permanent_failure":
 		return "Trwały błąd"
 	default:
-		return code
+		return "Aktywny problem"
+	}
+}
+
+func accountPauseIncident(incident store.Incident) bool {
+	if incident.Kind == store.IncidentKindAuth {
+		return true
+	}
+	switch strings.TrimSpace(incident.FailureCode) {
+	case "authentication_required", "mfa_required", "invalid_credentials":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -683,7 +728,7 @@ func profileOperationError(err error) error {
 	case errors.Is(err, store.ErrProfileInvalid):
 		code = "invalid_arguments"
 	}
-	return &OperationError{Code: code, Message: err.Error()}
+	return &OperationError{Code: code, Message: err.Error(), Cause: err}
 }
 
 func openStore(database string) (*store.Store, error) {

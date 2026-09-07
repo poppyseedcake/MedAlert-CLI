@@ -87,10 +87,15 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		}
 	case "profile-dry-check":
 		settings.dry = true
-		code = runCheckWithPrompt(ctx, "check", settings, nil, &stdout, &stderr, prompt)
-		checkResultMessage = dryCheckMessage(request.ID, stdout.Bytes())
+		checked, err := terminalCheckApplication(ctx, settings, request, prompt)
+		if err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
+		checkResultMessage = fmt.Sprintf("Sucha kontrola profilu %s znalazła %d terminów. Historia i dostarczanie nie zostały zmienione.", request.ID, len(checked.Search.Slots))
 	case "profile-check":
-		code = runCheckWithPrompt(ctx, "check", settings, nil, &stdout, &stderr, prompt)
+		if _, err := terminalCheckApplication(ctx, settings, request, prompt); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
 		checkResultMessage = "Wykonano trwałą kontrolę profilu."
 	default:
 		return tui.Result{Failed: true, Message: "Nieznana operacja."}
@@ -173,6 +178,15 @@ func terminalApplicationFailure(ctx context.Context, err error) tui.Result {
 	return tui.Result{Failed: true, Message: terminalErrorDetails(code, detail)}
 }
 
+func terminalCheckApplication(ctx context.Context, settings options, request tui.Request, prompt tui.Prompt) (application.CheckResult, error) {
+	return application.New(application.Config{
+		Database:         settings.database,
+		SessionDir:       settings.sessionDir,
+		MedicoverBaseURL: settings.medicoverBaseURL,
+		TelegramBaseURL:  settings.telegramBaseURL,
+	}).Check(ctx, application.CheckRequest{ProfileID: request.ID, Dry: settings.dry, Prompt: prompt})
+}
+
 func applyProfileRequest(settings *options, request tui.Request) {
 	settings.profileID = request.ID
 	settings.accountID = request.Profile.AccountID
@@ -204,18 +218,6 @@ func applyProfileRequest(settings *options, request tui.Request) {
 			settings.clearEndDate = true
 		}
 	}
-}
-
-func dryCheckMessage(profileID string, raw []byte) string {
-	var envelope struct {
-		Data struct {
-			SlotCount int `json:"slot_count"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err == nil {
-		return fmt.Sprintf("Sucha kontrola profilu %s znalazła %d terminów. Historia i dostarczanie nie zostały zmienione.", profileID, envelope.Data.SlotCount)
-	}
-	return "Wykonano suchą kontrolę profilu. Historia i dostarczanie nie zostały zmienione."
 }
 
 func terminalSnapshot(settings options) (tui.Snapshot, error) {

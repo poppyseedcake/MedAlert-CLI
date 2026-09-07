@@ -866,23 +866,10 @@ func countActiveEpisodes(storage *store.Store, profileID string) int {
 
 func latestRunStart(storage *store.Store, profileID string) (time.Time, bool) {
 	runs, err := storage.ListObservationRuns(profileID)
-	if err != nil || len(runs) == 0 {
+	if err != nil {
 		return time.Time{}, false
 	}
-	latest := time.Time{}
-	for _, run := range runs {
-		parsed, err := time.Parse(time.RFC3339Nano, run.StartedAt)
-		if err != nil {
-			continue
-		}
-		if parsed.After(latest) {
-			latest = parsed
-		}
-	}
-	if latest.IsZero() {
-		return time.Time{}, false
-	}
-	return latest, true
+	return monitoring.LatestRunStart(runs)
 }
 
 func watchMedicoverFailure(err error) (string, string) {

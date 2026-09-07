@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 
+	"github.com/poppyseedcake/MedAlert/internal/application"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 )
 
@@ -118,6 +120,13 @@ func profileCreate(command string, settings options, stdout, stderr io.Writer, j
 		writeError(stderr, command, "invalid_arguments", "check interval is required (use --check-interval-minutes)", jsonOutput)
 		return 2
 	}
+	if strings.TrimSpace(settings.telegramIDsRaw) == "" {
+		profile, err := applicationProfile(context.Background(), settings, id, "create")
+		if err != nil {
+			return reportApplicationProfileError(stderr, command, err, jsonOutput)
+		}
+		return writeApplicationProfile(stdout, stderr, settings, command, profile, fmt.Sprintf("Created profile %s for account %s.\n", profile.ID, profile.AccountID), jsonOutput)
+	}
 	profile, err := buildProfileFromOptions(id, accountID, settings)
 	if err != nil {
 		writeError(stderr, command, "invalid_arguments", err.Error(), jsonOutput)
@@ -207,6 +216,13 @@ func profileEdit(command string, settings options, stdout, stderr io.Writer, jso
 		telegramIDs = []string{}
 		hasTelegramChange = true
 	}
+	if !hasTelegramChange {
+		updated, err := applicationProfile(context.Background(), settings, strings.TrimSpace(id), "edit")
+		if err != nil {
+			return reportApplicationProfileError(stderr, command, err, jsonOutput)
+		}
+		return writeApplicationProfile(stdout, stderr, settings, command, updated, fmt.Sprintf("Updated profile %s for account %s.\n", updated.ID, updated.AccountID), jsonOutput)
+	}
 	update, hasChange, err := buildProfileUpdateFromOptions(settings)
 	if err != nil {
 		writeError(stderr, command, "invalid_arguments", err.Error(), jsonOutput)
@@ -251,23 +267,19 @@ func profileSetEnabled(command string, settings options, enabled bool, stdout, s
 		writeError(stderr, command, "invalid_arguments", "profile id is required (use --profile or a positional id)", jsonOutput)
 		return 2
 	}
-	storage, err := ensureStore(settings.database)
-	if err != nil {
-		return reportStoreError(stderr, command, err, jsonOutput)
+	action := "disable"
+	if enabled {
+		action = "enable"
 	}
-	defer storage.Close()
-	updated, err := storage.SetProfileEnabled(strings.TrimSpace(id), enabled)
+	updated, err := applicationProfile(context.Background(), settings, strings.TrimSpace(id), action)
 	if err != nil {
-		return reportProfileError(stderr, command, err, jsonOutput)
+		return reportApplicationProfileError(stderr, command, err, jsonOutput)
 	}
 	verb := "Enabled"
 	if !enabled {
 		verb = "Disabled"
 	}
-	if err := writeProfileWithDestinations(stdout, command, storage, updated, fmt.Sprintf("%s profile %s for account %s.\n", verb, updated.ID, updated.AccountID), jsonOutput); err != nil {
-		return reportStoreError(stderr, command, err, jsonOutput)
-	}
-	return 0
+	return writeApplicationProfile(stdout, stderr, settings, command, updated, fmt.Sprintf("%s profile %s for account %s.\n", verb, updated.ID, updated.AccountID), jsonOutput)
 }
 
 func profileDelete(command string, settings options, stdout, stderr io.Writer, jsonOutput bool) int {
@@ -279,19 +291,9 @@ func profileDelete(command string, settings options, stdout, stderr io.Writer, j
 		writeError(stderr, command, "invalid_arguments", "profile id is required (use --profile or a positional id)", jsonOutput)
 		return 2
 	}
-	storage, err := ensureStore(settings.database)
+	current, err := applicationProfile(context.Background(), settings, strings.TrimSpace(id), "delete")
 	if err != nil {
-		return reportStoreError(stderr, command, err, jsonOutput)
-	}
-	defer storage.Close()
-	// Read the row first so the JSON result can still identify the account
-	// after the configuration and its history are removed.
-	current, err := storage.GetProfile(strings.TrimSpace(id))
-	if err != nil {
-		return reportProfileError(stderr, command, err, jsonOutput)
-	}
-	if err := storage.DeleteProfile(strings.TrimSpace(id)); err != nil {
-		return reportProfileError(stderr, command, err, jsonOutput)
+		return reportApplicationProfileError(stderr, command, err, jsonOutput)
 	}
 	if jsonOutput {
 		writeResult(stdout, command, map[string]any{"deleted": current.ID, "account": current.AccountID})
@@ -504,6 +506,81 @@ func parseCheckInterval(raw string) (int, error) {
 }
 
 func ptr(value string) *string { return &value }
+
+func applicationProfile(ctx context.Context, settings options, id, action string) (store.Profile, error) {
+	return application.New(application.Config{
+		Database:         settings.database,
+		SessionDir:       settings.sessionDir,
+		MedicoverBaseURL: settings.medicoverBaseURL,
+		TelegramBaseURL:  settings.telegramBaseURL,
+	}).Profile(ctx, application.ProfileRequest{
+		Action: action,
+		ID:     id,
+		Values: application.ProfileValues{
+			AccountID: settings.accountID, RegionIDs: settings.region, SpecialtyIDs: settings.specialty,
+			ClinicIDs: settings.clinic, DoctorIDs: settings.doctor, LanguageIDs: settings.language,
+			VisitType: settings.visitType, SearchType: settings.searchType, StartDate: settings.startDate,
+			EndDate: settings.endDate, CheckIntervalMinutes: settings.checkIntervalRaw,
+			Enabled: !settings.profileDisabled,
+		},
+		Clear: profileClearFields(settings),
+	})
+}
+
+func profileClearFields(settings options) []string {
+	fields := []string{}
+	if settings.clearClinic {
+		fields = append(fields, "clinic_ids")
+	}
+	if settings.clearDoctor {
+		fields = append(fields, "doctor_ids")
+	}
+	if settings.clearLanguage {
+		fields = append(fields, "language_ids")
+	}
+	if settings.clearVisitType {
+		fields = append(fields, "visit_type")
+	}
+	if settings.clearSearchType {
+		fields = append(fields, "search_type")
+	}
+	if settings.clearStartDate {
+		fields = append(fields, "start_date")
+	}
+	if settings.clearEndDate {
+		fields = append(fields, "end_date")
+	}
+	return fields
+}
+
+func reportApplicationProfileError(stderr io.Writer, command string, err error, jsonOutput bool) int {
+	code, detail := application.ErrorInfo(err)
+	switch code {
+	case "account_not_found":
+		return reportAccountError(stderr, command, err, jsonOutput)
+	case "profile_exists", "profile_not_found":
+		return reportProfileError(stderr, command, err, jsonOutput)
+	case "invalid_arguments":
+		writeError(stderr, command, code, detail, jsonOutput)
+		return 2
+	default:
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
+}
+
+func writeApplicationProfile(stdout, stderr io.Writer, settings options, command string, profile store.Profile, textTemplate string, jsonOutput bool) int {
+	// The application owns the mutation. This adapter only reads the safe
+	// profile and its non-secret destination ids for the established output.
+	storage, err := ensureStore(settings.database)
+	if err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
+	defer storage.Close()
+	if err := writeProfileWithDestinations(stdout, command, storage, profile, textTemplate, jsonOutput); err != nil {
+		return reportStoreError(stderr, command, err, jsonOutput)
+	}
+	return 0
+}
 
 func writeProfile(stdout io.Writer, command string, profile store.Profile, textTemplate string, jsonOutput bool) {
 	if jsonOutput {
