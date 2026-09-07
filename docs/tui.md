@@ -59,23 +59,42 @@ Logout and deletion default to `Nie` (No). Select `Tak` (Yes) and press Enter
 to confirm. Logout removes only the selected account's session. Deletion also
 removes its profiles and history. Other accounts keep their sessions.
 
-Profiles, Telegram, Monitoring, and History show saved data in this change.
-Profile controls and full monitoring details are tracked in issue #33.
-The Monitoring screen explicitly states that it does not check systemd.
+## Profiles
+
+In `Profile`, use `A` to create, `E` to edit, `P` to enable or disable, `Y` to
+run a dry check, `K` to run a durable check, and `D` to delete the selected
+profile. A profile form covers the account, region, specialty, clinic, doctor,
+language, visit type, search type, date range, and check interval. The form
+keeps long input fields visible while you move through them. Validation errors
+are shown in Polish and the profile form keeps its values after a failed save.
+
+Deleting a profile also deletes its observation history. Disabling a profile
+pauses its monitoring state without deleting its configuration or history.
+
+## Monitoring
+
+`Monitoring` shows each profile's enabled work, its next planned run, profiles
+paused because an account needs authentication, and active operational
+problems. The next planned run is calculated from the last saved observation
+run and the profile interval. `Y` does not change observation history or send
+notifications. `K` uses the durable `check` operation and can update history
+and notifications.
 
 ## Implementation and tests
 
 `internal/tui` owns screen state and keyboard behavior. `internal/cli/tui.go`
-connects its requests to the same account operations used by the CLI. It maps
+connects its requests to the same account, profile, and check use cases used by the CLI. It maps
 status to Polish text and supplies only display data to the model. It does not
 send command output or raw errors to the terminal. The Medicover module owns
 the MFA challenge and accepts an optional input callback.
 
 State tests use real SQLite files and a local Medicover test server. They cover
-account changes, password and MFA input, session reuse, account isolation,
-confirmation, cancellation, input correction, and secret redaction. One test
-runs the built executable through a pseudo-terminal. It also checks resizing,
-help, alternate-screen cleanup, and secret markers in all captured output.
+account changes, profile creation and editing, dry and durable checks, profile
+pauses, required-action navigation, password and MFA input, session reuse,
+account isolation, confirmation, cancellation, input correction, and secret
+redaction. One test runs the built executable through a pseudo-terminal. It
+also checks resizing, help, alternate-screen cleanup, and secret markers in all
+captured output.
 
 Design source: [accepted status-first prototype](https://github.com/poppyseedcake/MedAlert/issues/9#issuecomment-5496941266).
-Scope: [issue #32](https://github.com/poppyseedcake/MedAlert/issues/32).
+Scope: [issue #33](https://github.com/poppyseedcake/MedAlert/issues/33).

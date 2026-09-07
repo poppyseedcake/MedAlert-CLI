@@ -42,13 +42,20 @@ func key(m *tui.Model, value string) tea.Cmd {
 		msg.Type = tea.KeyEsc
 	case "tab":
 		msg.Type = tea.KeyTab
+	case "shift+tab":
+		msg.Type = tea.KeyShiftTab
+	case "ctrl+a":
+		msg.Type = tea.KeyCtrlA
+	case "ctrl+k":
+		msg.Type = tea.KeyCtrlK
 	case "down":
 		msg.Type = tea.KeyDown
 	default:
+		var cmd tea.Cmd
 		for _, r := range value {
-			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
 		}
-		return nil
+		return cmd
 	}
 	_, cmd := m.Update(msg)
 	return cmd
@@ -288,5 +295,209 @@ func TestRequiredHistoryActionSelectsMatchingHistoryRow(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "delivery details") || strings.Contains(view, "niezwiązany przebieg") {
 		t.Fatalf("history detail is unrelated: %s", view)
+	}
+}
+
+func TestProfileFormCoversCriteriaAndRunsChecks(t *testing.T) {
+	snapshot := tui.Snapshot{
+		Accounts: []tui.Row{{ID: "home", Label: "patient", Detail: "OK — sesja zapisana"}},
+		Profiles: []tui.Row{{ID: "morning", Label: "morning — OK — włączony", Detail: "Konto: home"}},
+		ProfileValues: map[string]tui.ProfileValues{
+			"morning": {
+				AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132", ClinicIDs: "",
+				DoctorIDs: "", LanguageIDs: "", VisitType: "", SearchType: "Standard",
+				StartDate: "", EndDate: "", CheckIntervalMinutes: "30", Enabled: true,
+			},
+		},
+	}
+	var requests []tui.Request
+	m := tui.New(context.Background(), func(_ context.Context, request tui.Request, _ tui.Prompt) tui.Result {
+		requests = append(requests, request)
+		result := snapshot
+		if request.Action == "profile-create" {
+			result.Profiles = append([]tui.Row(nil), snapshot.Profiles...)
+			result.Profiles = append(result.Profiles, tui.Row{ID: request.ID, Label: request.ID + " — OK — włączony", Detail: "Konto: " + request.Profile.AccountID})
+			result.ProfileValues = map[string]tui.ProfileValues{}
+			for id, values := range snapshot.ProfileValues {
+				result.ProfileValues[id] = values
+			}
+			request.Profile.Enabled = true
+			result.ProfileValues[request.ID] = request.Profile
+		}
+		if request.ID == "new-profile" && request.Action != "profile-create" {
+			result.Profiles = append([]tui.Row(nil), snapshot.Profiles...)
+			result.Profiles = append(result.Profiles, tui.Row{ID: request.ID, Label: request.ID + " — OK — włączony", Detail: "Konto: home"})
+			result.ProfileValues = map[string]tui.ProfileValues{
+				request.ID: {AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132", SearchType: "Standard", CheckIntervalMinutes: "15", Enabled: true},
+			}
+		}
+		return tui.Result{Snapshot: result, Message: "Operacja zakończona."}
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if cmd == nil {
+		t.Fatal("refresh did not start")
+	}
+	m.Update(cmd())
+
+	key(m, "3")
+	key(m, "a")
+	labels := []string{
+		"Identyfikator profilu", "Konto Medicover", "Regiony", "Specjalności", "Placówki",
+		"Lekarze", "Języki", "Typ wizyty", "Typ wyszukiwania", "Data od", "Data do",
+		"Interwał sprawdzania",
+	}
+	for i, label := range labels {
+		if !strings.Contains(m.View(), label) {
+			t.Fatalf("profile form misses %q: %s", label, m.View())
+		}
+		if i < len(labels)-1 {
+			key(m, "tab")
+		}
+	}
+	for i := 0; i < len(labels)-1; i++ {
+		key(m, "shift+tab")
+	}
+	for i, value := range []string{"new-profile", "home", "204", "132", "", "", "", "", "Standard", "", "", "15"} {
+		if value != "" {
+			if i == 8 || i == 11 {
+				key(m, "ctrl+a")
+				key(m, "ctrl+k")
+			}
+			key(m, value)
+		}
+		key(m, "tab")
+	}
+	cmd = key(m, "enter")
+	if cmd == nil {
+		t.Fatal("profile save did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 2 || requests[1].Action != "profile-create" {
+		t.Fatalf("profile create requests = %+v", requests)
+	}
+	created := requests[1]
+	if created.ID != "new-profile" || created.Profile.AccountID != "home" || created.Profile.RegionIDs != "204" || created.Profile.SpecialtyIDs != "132" || created.Profile.CheckIntervalMinutes != "15" {
+		t.Fatalf("profile create request = %+v", created)
+	}
+
+	key(m, "down")
+	cmd = key(m, "y")
+	if cmd == nil {
+		t.Fatal("dry check did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 3 || requests[2].Action != "profile-dry-check" || requests[2].ID != "new-profile" {
+		t.Fatalf("dry check request = %+v", requests)
+	}
+	cmd = key(m, "k")
+	if cmd == nil {
+		t.Fatal("durable check did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 4 || requests[3].Action != "profile-check" || requests[3].ID != "new-profile" {
+		t.Fatalf("durable check request = %+v", requests)
+	}
+}
+
+func TestProfileEditPauseAndDeleteUseSelectedProfile(t *testing.T) {
+	snapshot := tui.Snapshot{
+		Profiles: []tui.Row{{ID: "morning", Label: "morning — OK — włączony", Detail: "Konto: home"}},
+		ProfileValues: map[string]tui.ProfileValues{
+			"morning": {
+				AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132", ClinicIDs: "12", SearchType: "Standard",
+				CheckIntervalMinutes: "30", Enabled: true,
+			},
+		},
+	}
+	var requests []tui.Request
+	m := tui.New(context.Background(), func(_ context.Context, request tui.Request, _ tui.Prompt) tui.Result {
+		requests = append(requests, request)
+		return tui.Result{Snapshot: snapshot, Message: "Profil zapisany."}
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m.Update(cmd())
+	key(m, "3")
+	key(m, "e")
+	if !strings.Contains(m.View(), "204") || !strings.Contains(m.View(), "132") {
+		t.Fatalf("edit form did not load profile values: %s", m.View())
+	}
+	// Region is the first edit field. Append a second valid Medicover ID and
+	// leave the other fields unchanged.
+	m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	key(m, ",205")
+	for i := 0; i < 9; i++ {
+		if i == 2 {
+			key(m, "ctrl+a")
+			key(m, "ctrl+k")
+		}
+		key(m, "tab")
+	}
+	if !strings.Contains(m.View(), "30") {
+		t.Fatalf("edit form did not keep the interval visible: %s", m.View())
+	}
+	key(m, "tab")
+	cmd = key(m, "enter")
+	if cmd == nil {
+		t.Fatal("profile edit did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 2 || requests[1].Action != "profile-edit" || requests[1].Profile.RegionIDs != "204,205" || len(requests[1].ProfileClear) != 1 || requests[1].ProfileClear[0] != "clinic_ids" {
+		t.Fatalf("profile edit request = %+v", requests)
+	}
+
+	cmd = key(m, "p")
+	if cmd == nil {
+		t.Fatal("profile pause did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 3 || requests[2].Action != "profile-disable" || requests[2].ID != "morning" {
+		t.Fatalf("profile pause request = %+v", requests)
+	}
+	key(m, "d")
+	if !strings.Contains(m.View(), "Usunąć profil morning") {
+		t.Fatalf("profile delete did not ask for confirmation: %s", m.View())
+	}
+	key(m, "tab")
+	cmd = key(m, "enter")
+	if cmd == nil {
+		t.Fatal("profile delete did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 4 || requests[3].Action != "profile-delete" {
+		t.Fatalf("profile delete request = %+v", requests)
+	}
+}
+
+func TestMonitoringAndRequiredActionsNavigateToProfileWork(t *testing.T) {
+	snapshot := tui.Snapshot{
+		Actions:  []tui.Row{{ID: "morning", Label: "! Profil wyłączony: morning", Target: 2}},
+		Profiles: []tui.Row{{ID: "morning", Label: "morning — — wyłączony", Detail: "Konto: home"}},
+		Monitoring: []tui.Row{
+			{ID: "work:morning", Label: "morning — aktywna praca", Detail: "Następny przebieg: za 5 min"},
+			{ID: "pause:home", Label: "Konto home — wstrzymane", Detail: "Wymaga logowania"},
+			{ID: "incident:1", Label: "! Aktywny problem: morning", Detail: "temporary_failure"},
+		},
+	}
+	m := tui.New(context.Background(), func(_ context.Context, request tui.Request, _ tui.Prompt) tui.Result {
+		if request.Action != "refresh" {
+			t.Fatalf("request = %+v, want refresh", request)
+		}
+		return tui.Result{Snapshot: snapshot, Message: "Stan odświeżony."}
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m.Update(cmd())
+	key(m, "5")
+	for _, text := range []string{"aktywna praca", "Następny przebieg", "wstrzymane", "Aktywny problem"} {
+		if !strings.Contains(m.View(), text) {
+			t.Fatalf("monitoring misses %q: %s", text, m.View())
+		}
+	}
+	key(m, "1")
+	key(m, "enter")
+	if !strings.Contains(m.View(), "> morning") {
+		t.Fatalf("required action did not select profile: %s", m.View())
 	}
 }

@@ -23,14 +23,38 @@ type Row struct {
 	ID, Label, Detail string
 	Target            int
 }
+
+// ProfileValues contains safe values used to fill a profile form. It does
+// not contain passwords, sessions, or notification tokens.
+type ProfileValues struct {
+	AccountID            string
+	RegionIDs            string
+	SpecialtyIDs         string
+	ClinicIDs            string
+	DoctorIDs            string
+	LanguageIDs          string
+	VisitType            string
+	SearchType           string
+	StartDate            string
+	EndDate              string
+	CheckIntervalMinutes string
+	Enabled              bool
+}
+
 type Snapshot struct {
 	Accounts                     []Row
 	Actions                      []Row
 	Profiles, Destinations, Runs []Row
+	Monitoring                   []Row
+	ProfileValues                map[string]ProfileValues
 	History                      []Row
 	Summary                      string
 }
-type Request struct{ Action, ID, Username, PasswordFile string }
+type Request struct {
+	Action, ID, Username, PasswordFile string
+	Profile                            ProfileValues
+	ProfileClear                       []string
+}
 type Result struct {
 	Snapshot Snapshot
 	Message  string
@@ -60,12 +84,12 @@ type Model struct {
 }
 
 type form struct {
-	title, action, id string
-	labels, original  []string
-	fields            []textinput.Model
-	focus             int
-	secret            bool
-	reply             chan string
+	title, action, id      string
+	keys, labels, original []string
+	fields                 []textinput.Model
+	focus                  int
+	secret                 bool
+	reply                  chan string
 }
 type promptMsg struct {
 	kind       string
@@ -256,16 +280,41 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a":
 			if m.area == 1 {
 				m.openForm("Dodaj konto", "create", "", []string{"Identyfikator (litery, cyfry, - lub _)", "Login Medicover", "Plik hasła (pusty: pytaj przy logowaniu)"}, []string{"", "", ""})
+			} else if m.area == 2 {
+				m.openProfileCreateForm()
 			}
 		case "e":
 			if m.area == 1 && m.selectedID() != "" {
 				m.openForm("Edytuj konto", "edit", m.selectedID(), []string{"Login Medicover", "Plik hasła (pusty: zachowaj źródło)"}, []string{m.rows()[m.selected].Label, ""})
+			} else if m.area == 2 && m.selectedID() != "" {
+				m.openProfileEditForm(m.selectedID())
 			}
 		case "l":
 			if m.area == 1 && m.selectedID() != "" {
 				return m, m.start(Request{Action: "login", ID: m.selectedID()})
 			}
-		case "d", "o":
+		case "p":
+			if m.area == 2 && m.selectedID() != "" {
+				action := "profile-enable"
+				if m.profileEnabled(m.selectedID()) {
+					action = "profile-disable"
+				}
+				return m, m.start(Request{Action: action, ID: m.selectedID()})
+			}
+		case "y":
+			if m.area == 2 && m.selectedID() != "" {
+				return m, m.start(Request{Action: "profile-dry-check", ID: m.selectedID()})
+			}
+		case "k":
+			if m.area == 2 && m.selectedID() != "" {
+				return m, m.start(Request{Action: "profile-check", ID: m.selectedID()})
+			}
+		case "d":
+			if (m.area == 1 || m.area == 2) && m.selectedID() != "" {
+				m.confirmation = key
+				m.confirmYes = false
+			}
+		case "o":
 			if m.area == 1 && m.selectedID() != "" {
 				m.confirmation = key
 				m.confirmYes = false
@@ -297,6 +346,9 @@ func (m *Model) stop() {
 
 func operationKey(request Request) string {
 	if id := strings.TrimSpace(request.ID); id != "" {
+		if strings.HasPrefix(request.Action, "profile-") {
+			return "profile:" + id
+		}
 		return "account:" + id
 	}
 	return "action:" + request.Action
@@ -314,8 +366,10 @@ func (m *Model) rows() []Row {
 		return m.snapshot.Actions
 	case 1:
 		return m.snapshot.Accounts
-	case 2, 4:
+	case 2:
 		return m.snapshot.Profiles
+	case 4:
+		return m.snapshot.Monitoring
 	case 3:
 		return m.snapshot.Destinations
 	case 5:
@@ -326,8 +380,29 @@ func (m *Model) rows() []Row {
 	}
 	return nil
 }
+
+func (m *Model) profileEnabled(id string) bool {
+	if values, ok := m.snapshot.ProfileValues[id]; ok {
+		return values.Enabled
+	}
+	rows := m.snapshot.Profiles
+	for _, row := range rows {
+		if row.ID == id {
+			return !strings.Contains(strings.ToLower(row.Label), "wyłączony")
+		}
+	}
+	return false
+}
+
 func (m *Model) openForm(title, action, id string, labels, values []string) {
-	f := &form{title: title, action: action, id: id, labels: labels, original: values}
+	m.openFormFields(title, action, id, defaultFormKeys(action, len(labels)), labels, values)
+}
+
+func (m *Model) openFormFields(title, action, id string, keys, labels, values []string) {
+	keys = append([]string(nil), keys...)
+	labels = append([]string(nil), labels...)
+	values = append([]string(nil), values...)
+	f := &form{title: title, action: action, id: id, keys: keys, labels: labels, original: values}
 	for i, value := range values {
 		input := textinput.New()
 		input.CharLimit = 512
@@ -341,6 +416,77 @@ func (m *Model) openForm(title, action, id string, labels, values []string) {
 	}
 	m.form = f
 }
+
+func defaultFormKeys(action string, fieldCount int) []string {
+	var keys []string
+	switch action {
+	case "create":
+		keys = []string{"id", "username", "password_file"}
+	case "edit":
+		keys = []string{"username", "password_file"}
+	case "secret":
+		keys = []string{"secret"}
+	}
+	if len(keys) != fieldCount {
+		keys = make([]string, fieldCount)
+	}
+	return keys
+}
+
+var profileCreateKeys = []string{
+	"profile_id", "account_id", "region_ids", "specialty_ids", "clinic_ids", "doctor_ids",
+	"language_ids", "visit_type", "search_type", "start_date", "end_date", "check_interval_minutes",
+}
+
+var profileEditKeys = []string{
+	"region_ids", "specialty_ids", "clinic_ids", "doctor_ids", "language_ids", "visit_type",
+	"search_type", "start_date", "end_date", "check_interval_minutes",
+}
+
+var profileCreateLabels = []string{
+	"Identyfikator profilu",
+	"Konto Medicover (identyfikator)",
+	"Regiony (ID lub lista)",
+	"Specjalności (ID lub lista)",
+	"Placówki (ID lub lista, puste: dowolna)",
+	"Lekarze (ID lub lista, puste: dowolny)",
+	"Języki (ID lub lista, puste: dowolny)",
+	"Typ wizyty (opcjonalnie)",
+	"Typ wyszukiwania (Standard lub DiagnosticProcedure)",
+	"Data od (YYYY-MM-DD, opcjonalnie)",
+	"Data do (YYYY-MM-DD, opcjonalnie)",
+	"Interwał sprawdzania (minuty)",
+}
+
+var profileEditLabels = []string{
+	"Regiony (ID lub lista)",
+	"Specjalności (ID lub lista)",
+	"Placówki (ID lub lista, puste: dowolna)",
+	"Lekarze (ID lub lista, puste: dowolny)",
+	"Języki (ID lub lista, puste: dowolny)",
+	"Typ wizyty (opcjonalnie)",
+	"Typ wyszukiwania (Standard lub DiagnosticProcedure)",
+	"Data od (YYYY-MM-DD, opcjonalnie)",
+	"Data do (YYYY-MM-DD, opcjonalnie)",
+	"Interwał sprawdzania (minuty)",
+}
+
+func (m *Model) openProfileCreateForm() {
+	values := []string{"", "", "", "", "", "", "", "", "Standard", "", "", "30"}
+	m.openFormFields("Dodaj profil obserwacji", "profile-create", "", profileCreateKeys, profileCreateLabels, values)
+}
+
+func (m *Model) openProfileEditForm(id string) {
+	values := m.snapshot.ProfileValues[id]
+	formValues := []string{
+		values.RegionIDs, values.SpecialtyIDs, values.ClinicIDs, values.DoctorIDs, values.LanguageIDs,
+		values.VisitType, values.SearchType, values.StartDate, values.EndDate, values.CheckIntervalMinutes,
+	}
+	if strings.TrimSpace(formValues[6]) == "" {
+		formValues[6] = "Standard"
+	}
+	m.openFormFields("Edytuj profil obserwacji", "profile-edit", id, profileEditKeys, profileEditLabels, formValues)
+}
 func (f *form) dirty() bool {
 	for i, field := range f.fields {
 		if field.Value() != f.original[i] {
@@ -349,6 +495,81 @@ func (f *form) dirty() bool {
 	}
 	return false
 }
+
+func (f *form) request() Request {
+	request := Request{Action: f.action, ID: f.id}
+	for i, key := range f.keys {
+		if i >= len(f.fields) {
+			continue
+		}
+		value := f.fields[i].Value()
+		switch key {
+		case "id":
+			request.ID = value
+		case "username":
+			request.Username = value
+		case "password_file":
+			request.PasswordFile = value
+		case "profile_id":
+			request.ID = value
+		case "account_id":
+			request.Profile.AccountID = value
+		case "region_ids":
+			request.Profile.RegionIDs = value
+		case "specialty_ids":
+			request.Profile.SpecialtyIDs = value
+		case "clinic_ids":
+			request.Profile.ClinicIDs = value
+		case "doctor_ids":
+			request.Profile.DoctorIDs = value
+		case "language_ids":
+			request.Profile.LanguageIDs = value
+		case "visit_type":
+			request.Profile.VisitType = value
+		case "search_type":
+			request.Profile.SearchType = value
+		case "start_date":
+			request.Profile.StartDate = value
+		case "end_date":
+			request.Profile.EndDate = value
+		case "check_interval_minutes":
+			request.Profile.CheckIntervalMinutes = value
+		}
+		if f.action == "profile-edit" && value == "" && i < len(f.original) && f.original[i] != "" {
+			request.ProfileClear = append(request.ProfileClear, key)
+		}
+	}
+	return request
+}
+
+func validateFormRequest(request Request) (string, bool) {
+	switch request.Action {
+	case "create", "edit":
+		if strings.TrimSpace(request.ID) == "" || strings.TrimSpace(request.Username) == "" {
+			return "Uzupełnij identyfikator i login.", false
+		}
+	case "profile-create":
+		if strings.TrimSpace(request.ID) == "" {
+			return "Wpisz identyfikator profilu.", false
+		}
+		if strings.TrimSpace(request.Profile.AccountID) == "" {
+			return "Wpisz identyfikator konta Medicover.", false
+		}
+		fallthrough
+	case "profile-edit":
+		if strings.TrimSpace(request.Profile.RegionIDs) == "" {
+			return "Wpisz co najmniej jeden region.", false
+		}
+		if strings.TrimSpace(request.Profile.SpecialtyIDs) == "" {
+			return "Wpisz co najmniej jedną specjalność.", false
+		}
+		if strings.TrimSpace(request.Profile.CheckIntervalMinutes) == "" {
+			return "Wpisz interwał sprawdzania w minutach.", false
+		}
+	}
+	return "", true
+}
+
 func (m *Model) updateForm(msg tea.KeyMsg) tea.Cmd {
 	f := m.form
 	// Bubble Tea can group typed runes. Keep ordinary text such as "home"
@@ -400,14 +621,9 @@ func (m *Model) updateForm(msg tea.KeyMsg) tea.Cmd {
 		if f.focus < len(f.fields) {
 			return m.updateForm(tea.KeyMsg{Type: tea.KeyTab})
 		}
-		request := Request{Action: f.action, ID: f.id}
-		if f.action == "create" {
-			request.ID, request.Username, request.PasswordFile = f.fields[0].Value(), f.fields[1].Value(), f.fields[2].Value()
-		} else {
-			request.Username, request.PasswordFile = f.fields[0].Value(), f.fields[1].Value()
-		}
-		if strings.TrimSpace(request.ID) == "" || strings.TrimSpace(request.Username) == "" {
-			m.notice = "Uzupełnij identyfikator i login."
+		request := f.request()
+		if notice, valid := validateFormRequest(request); !valid {
+			m.notice = notice
 			return nil
 		}
 		cmd := m.start(request)
@@ -445,6 +661,8 @@ func (m *Model) confirm(key string) tea.Cmd {
 		request := Request{ID: m.selectedID(), Action: "delete"}
 		if action == "o" {
 			request.Action = "logout"
+		} else if m.area == 2 {
+			request.Action = "profile-delete"
 		}
 		return m.start(request)
 	}
@@ -458,10 +676,14 @@ func (m *Model) View() string {
 	footer := "1-6: obszar  ↑↓: wybór  Enter: szczegóły  R: odśwież  ?: pomoc  q: koniec"
 	switch {
 	case m.help:
-		content = []string{"Pomoc — klawiatura", "", "1-6: otwórz obszar poza formularzem.", "Strzałki ↑↓: wybierz pozycję. PgUp/PgDn: przewiń.", "Enter: otwórz szczegóły lub wykonaj działanie.", "Konta: A dodaj, E edytuj, L zaloguj, O wyloguj, D usuń.", "R: odśwież dane i stan sesji.", "Tab / Shift+Tab: pola i przyciski formularza.", "Esc: wróć; w formularzu anuluj zmiany.", "Hasło i kod MFA są ukryte. F1: pomoc w formularzu.", "Q: zakończ poza formularzem. Ctrl+C: zakończ zawsze.", "", "Esc / Enter: zamknij pomoc."}
+		content = []string{"Pomoc — klawiatura", "", "1-6: otwórz obszar poza formularzem.", "Strzałki ↑↓: wybierz pozycję. PgUp/PgDn: przewiń.", "Enter: otwórz szczegóły lub wykonaj działanie.", "Konta: A dodaj, E edytuj, L zaloguj, O wyloguj, D usuń.", "Profile: A dodaj, E edytuj, P włącz/wyłącz, Y sucha kontrola, K kontrola, D usuń.", "R: odśwież dane i stan sesji.", "Tab / Shift+Tab: pola i przyciski formularza.", "Esc: wróć; w formularzu anuluj zmiany.", "Hasło i kod MFA są ukryte. F1: pomoc w formularzu.", "Q: zakończ poza formularzem. Ctrl+C: zakończ zawsze.", "", "Esc / Enter: zamknij pomoc."}
 	case m.confirmation != "":
 		title := "Usunąć konto " + m.selectedID() + "?"
 		detail := "Usunięcie obejmuje profile i ich historię."
+		if m.area == 2 {
+			title = "Usunąć profil " + m.selectedID() + "?"
+			detail = "Usunięcie obejmuje konfigurację i historię profilu."
+		}
 		if m.confirmation == "o" {
 			title = "Wylogować konto " + m.selectedID() + "?"
 			detail = "Zapisana sesja tego konta zostanie usunięta."
@@ -477,33 +699,7 @@ func (m *Model) View() string {
 		content = append(strings.Split(ansi.Hardwrap(safe(title), m.bodyWidth(), true), "\n"), "", detail, "", buttons)
 		footer = "Tab / ←→: wybór  Enter: zatwierdź  Esc: wróć"
 	case m.form != nil:
-		f := m.form
-		content = []string{f.title, ""}
-		for i, field := range f.fields {
-			prefix := "  "
-			if f.focus == i {
-				prefix = "> "
-			}
-			value := field.Value()
-			if f.focus == i && !f.secret {
-				value = inputWindow(field, m.bodyWidth()-2)
-			}
-			if f.secret {
-				value = "[wartość ukryta]"
-			}
-			content = append(content, prefix+f.labels[i], "  "+value, "")
-		}
-		save, cancel := "  [Zapisz]", "  [Anuluj]"
-		if f.secret {
-			save = "  [Wyślij]"
-		}
-		if f.focus == len(f.fields) {
-			save = ">" + save[1:]
-		}
-		if f.focus == len(f.fields)+1 {
-			cancel = ">" + cancel[1:]
-		}
-		content = append(content, save+"    "+cancel)
+		content = m.formContent()
 		footer = "Tab: pole lub przycisk  Enter: dalej  Esc: anuluj  F1: pomoc"
 	default:
 		if m.area == 0 {
@@ -520,6 +716,9 @@ func (m *Model) View() string {
 				if !m.loaded {
 					empty = "Stan nie jest jeszcze dostępny. R: odśwież."
 				}
+			}
+			if m.area == 4 {
+				empty = "Brak profili do monitorowania."
 			}
 			content = append(content, empty)
 		}
@@ -539,6 +738,9 @@ func (m *Model) View() string {
 				if m.area == 1 {
 					label = row.ID + " — " + row.Detail
 				}
+				if m.area == 4 && row.Detail != "" {
+					label += " · " + row.Detail
+				}
 				content = append(content, prefix+label)
 			}
 			if len(rows) > capacity {
@@ -548,11 +750,57 @@ func (m *Model) View() string {
 		if m.area == 1 {
 			footer = "A: dodaj  E: edytuj  L: loguj  O: wyloguj  D: usuń  ?: pomoc  Esc: stan"
 		}
+		if m.area == 2 {
+			footer = "A: dodaj  E: edytuj  P: włącz/wyłącz  Y: sucha kontrola  K: kontrola  D: usuń  Esc: stan"
+		}
 		if m.area == 4 {
-			content = append(content, "", "Stan zapisanych profili. R: odśwież.", "Stałe monitorowanie: polecenie medalert watch.", "Stan usługi systemd: nie jest sprawdzany.")
+			footer = "↑↓: wybór  Enter: szczegóły  R: odśwież  Esc: stan"
 		}
 	}
 	return m.frame(content, footer)
+}
+
+func (m *Model) formContent() []string {
+	f := m.form
+	content := []string{f.title, ""}
+	// A profile form has many fields. Keep the focused field and its nearby
+	// fields visible at the minimum terminal size, so Tab never moves the
+	// cursor to an invisible control.
+	capacity := max(1, (m.height-6-2)/3)
+	start := 0
+	if f.focus < len(f.fields) {
+		start = max(0, f.focus-capacity+1)
+	} else if len(f.fields) > capacity {
+		start = len(f.fields) - capacity
+	}
+	end := min(len(f.fields), start+capacity)
+	for i := start; i < end; i++ {
+		field := f.fields[i]
+		prefix := "  "
+		if f.focus == i {
+			prefix = "> "
+		}
+		value := field.Value()
+		if f.focus == i && !f.secret {
+			value = inputWindow(field, m.bodyWidth()-2)
+		}
+		if f.secret {
+			value = "[wartość ukryta]"
+		}
+		content = append(content, prefix+f.labels[i], "  "+value, "")
+	}
+	save, cancel := "  [Zapisz]", "  [Anuluj]"
+	if f.secret {
+		save = "  [Wyślij]"
+	}
+	if f.focus == len(f.fields) {
+		save = ">" + save[1:]
+	}
+	if f.focus == len(f.fields)+1 {
+		cancel = ">" + cancel[1:]
+	}
+	content = append(content, save+"    "+cancel)
+	return content
 }
 
 func (m *Model) frame(content []string, footer string) string {

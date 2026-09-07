@@ -17,6 +17,10 @@ import (
 )
 
 func runCheck(command string, settings options, stdin *os.File, stdout, stderr io.Writer) int {
+	return runCheckWithContext(context.Background(), command, settings, stdin, stdout, stderr)
+}
+
+func runCheckWithContext(ctx context.Context, command string, settings options, stdin *os.File, stdout, stderr io.Writer) int {
 	jsonOutput := settings.output == "json"
 	if len(settings.positionals) > 1 || (settings.profileID != "" && len(settings.positionals) > 0 && settings.positionals[0] != settings.profileID) {
 		writeError(stderr, command, "invalid_arguments", "use either --profile or one positional profile id", jsonOutput)
@@ -71,7 +75,7 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 		return 4
 	}
 	client := medicoverClientFor(settings)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	auth, authErr := client.Authenticate(ctx, medicover.AuthRequest{Session: saved})
 	if authErr != nil && medicover.IsAuthRequired(authErr) {
