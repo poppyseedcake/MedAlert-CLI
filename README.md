@@ -23,3 +23,13 @@ Run the installation smoke test from a local checkout:
 ```
 
 The service unit is [`systemd/medalert.service`](systemd/medalert.service).
+
+## Docker installation
+
+Builds for `main` publish the Linux amd64 image at
+`ghcr.io/poppyseedcake/medalert`. The image runs as a non-root user, stores
+SQLite data and Medicover Session State in `/var/lib/medalert`, reads mounted
+secret files, and starts `watch --non-interactive` by default.
+
+See [`docs/docker.md`](docs/docker.md) for secret mounts, persistent data,
+commit image tags, updates, and rollback.
