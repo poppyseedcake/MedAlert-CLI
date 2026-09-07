@@ -5,6 +5,8 @@ working Secret Service provider. MedAlert does not support another native
 operating system or architecture. It does not publish native archives or
 GitHub Releases.
 
+For Docker installation, see [Docker installation](docker.md).
+
 The native build uses Go with CGO disabled. Use Go 1.25 or newer.
 
 ## Install the command
