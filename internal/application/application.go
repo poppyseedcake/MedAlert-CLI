@@ -143,7 +143,7 @@ func (a *Application) Profile(ctx context.Context, request ProfileRequest) (stor
 			return store.Profile{}, &OperationError{Code: "invalid_arguments", Message: buildErr.Error()}
 		}
 		profile.Enabled = request.Values.Enabled
-		created, createErr := storage.CreateProfile(profile)
+		created, createErr := storage.CreateProfileContext(ctx, profile)
 		if createErr != nil {
 			return store.Profile{}, profileOperationError(createErr)
 		}
@@ -156,23 +156,23 @@ func (a *Application) Profile(ctx context.Context, request ProfileRequest) (stor
 		if !hasChange {
 			return store.Profile{}, &OperationError{Code: "invalid_arguments", Message: "no profile changes requested"}
 		}
-		updated, updateErr := storage.UpdateProfile(id, update)
+		updated, updateErr := storage.UpdateProfileContext(ctx, id, update)
 		if updateErr != nil {
 			return store.Profile{}, profileOperationError(updateErr)
 		}
 		return updated, nil
 	case "enable", "disable":
-		updated, setErr := storage.SetProfileEnabled(id, request.Action == "enable")
+		updated, setErr := storage.SetProfileEnabledContext(ctx, id, request.Action == "enable")
 		if setErr != nil {
 			return store.Profile{}, profileOperationError(setErr)
 		}
 		return updated, nil
 	case "delete":
-		current, getErr := storage.GetProfile(id)
+		current, getErr := storage.GetProfileContext(ctx, id)
 		if getErr != nil {
 			return store.Profile{}, profileOperationError(getErr)
 		}
-		if deleteErr := storage.DeleteProfile(id); deleteErr != nil {
+		if deleteErr := storage.DeleteProfileContext(ctx, id); deleteErr != nil {
 			return store.Profile{}, profileOperationError(deleteErr)
 		}
 		return current, nil

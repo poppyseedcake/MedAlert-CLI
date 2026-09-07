@@ -83,6 +83,13 @@ var (
 // CreateProfile stores a new observation profile. The referenced account must
 // already exist. The profile starts enabled unless Enabled is false.
 func (s *Store) CreateProfile(profile Profile) (Profile, error) {
+	return s.CreateProfileContext(context.Background(), profile)
+}
+
+// CreateProfileContext stores a new observation profile and observes ctx while
+// waiting for SQLite. The referenced account must already exist. The profile
+// starts enabled unless Enabled is false.
+func (s *Store) CreateProfileContext(ctx context.Context, profile Profile) (Profile, error) {
 	// Normalize first so direct store callers get the same documented
 	// storage format as the CLI ("205, 204" -> "204,205", "0" -> "Standard").
 	// ValidateProfile only checks normalized copies, so without this the
@@ -92,7 +99,7 @@ func (s *Store) CreateProfile(profile Profile) (Profile, error) {
 		return Profile{}, err
 	}
 	profile = normalized
-	if _, err := s.GetAccount(profile.AccountID); err != nil {
+	if _, err := s.GetAccountContext(ctx, profile.AccountID); err != nil {
 		if errors.Is(err, ErrAccountNotFound) || errors.Is(err, ErrAccountInvalid) {
 			return Profile{}, fmt.Errorf("%w: %s", ErrAccountNotFound, profile.AccountID)
 		}
@@ -105,7 +112,7 @@ func (s *Store) CreateProfile(profile Profile) (Profile, error) {
 	if profile.Enabled {
 		enabled = 1
 	}
-	_, err = s.db.Exec(
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO profiles (id, account_id, region_ids, specialty_ids, clinic_ids, doctor_ids, language_ids, visit_type, search_type, start_date, end_date, check_interval_minutes, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		profile.ID, profile.AccountID, profile.RegionIDs, profile.SpecialtyIDs, profile.ClinicIDs, profile.DoctorIDs, profile.LanguageIDs, profile.VisitType, profile.SearchType, profile.StartDate, profile.EndDate, profile.CheckIntervalMinutes, enabled, profile.CreatedAt, profile.UpdatedAt,
 	)
@@ -156,12 +163,18 @@ func (s *Store) ListProfiles(accountFilter string) ([]Profile, error) {
 
 // GetProfile returns one profile by its stable id.
 func (s *Store) GetProfile(id string) (Profile, error) {
+	return s.GetProfileContext(context.Background(), id)
+}
+
+// GetProfileContext returns one profile by its stable id and observes ctx
+// while waiting for SQLite.
+func (s *Store) GetProfileContext(ctx context.Context, id string) (Profile, error) {
 	if !profileIDPattern.MatchString(id) {
 		return Profile{}, fmt.Errorf("%w: profile id %q", ErrProfileInvalid, id)
 	}
 	var profile Profile
 	var enabled int
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT id, account_id, region_ids, specialty_ids, clinic_ids, doctor_ids, language_ids, visit_type, search_type, start_date, end_date, check_interval_minutes, enabled, created_at, updated_at FROM profiles WHERE id = ?`, id,
 	).Scan(&profile.ID, &profile.AccountID, &profile.RegionIDs, &profile.SpecialtyIDs, &profile.ClinicIDs, &profile.DoctorIDs, &profile.LanguageIDs, &profile.VisitType, &profile.SearchType, &profile.StartDate, &profile.EndDate, &profile.CheckIntervalMinutes, &enabled, &profile.CreatedAt, &profile.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -189,10 +202,16 @@ func (s *Store) GetProfile(id string) (Profile, error) {
 // cross-field rules (for example end_date >= start_date) cannot end up
 // violated in the stored row.
 func (s *Store) UpdateProfile(id string, update ProfileUpdate) (Profile, error) {
+	return s.UpdateProfileContext(context.Background(), id, update)
+}
+
+// UpdateProfileContext changes search criteria while keeping the profile
+// identity, its account, and its enabled state. It observes ctx while waiting
+// for SQLite and rolls back when ctx is cancelled.
+func (s *Store) UpdateProfileContext(ctx context.Context, id string, update ProfileUpdate) (Profile, error) {
 	if !profileIDPattern.MatchString(id) {
 		return Profile{}, fmt.Errorf("%w: profile id %q", ErrProfileInvalid, id)
 	}
-	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return Profile{}, fmt.Errorf("edit profile: %w", err)
@@ -204,7 +223,7 @@ func (s *Store) UpdateProfile(id string, update ProfileUpdate) (Profile, error) 
 	committed := false
 	defer func() {
 		if !committed {
-			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		}
 	}()
 	var current Profile
@@ -343,7 +362,13 @@ func (s *Store) UpdateProfile(id string, update ProfileUpdate) (Profile, error) 
 // SetProfileEnabled pauses (false) or resumes (true) observation without
 // deleting the profile row. Saved state and history rows stay untouched.
 func (s *Store) SetProfileEnabled(id string, enabled bool) (Profile, error) {
-	current, err := s.GetProfile(id)
+	return s.SetProfileEnabledContext(context.Background(), id, enabled)
+}
+
+// SetProfileEnabledContext pauses (false) or resumes (true) observation
+// without deleting the profile row. It observes ctx while waiting for SQLite.
+func (s *Store) SetProfileEnabledContext(ctx context.Context, id string, enabled bool) (Profile, error) {
+	current, err := s.GetProfileContext(ctx, id)
 	if err != nil {
 		return Profile{}, err
 	}
@@ -353,7 +378,7 @@ func (s *Store) SetProfileEnabled(id string, enabled bool) (Profile, error) {
 	if enabled {
 		value = 1
 	}
-	result, err := s.db.Exec(`UPDATE profiles SET enabled = ?, updated_at = ? WHERE id = ?`, value, current.UpdatedAt, id)
+	result, err := s.db.ExecContext(ctx, `UPDATE profiles SET enabled = ?, updated_at = ? WHERE id = ?`, value, current.UpdatedAt, id)
 	if err != nil {
 		return Profile{}, fmt.Errorf("set profile enabled: %w", err)
 	}
@@ -371,10 +396,18 @@ func (s *Store) SetProfileEnabled(id string, enabled bool) (Profile, error) {
 // reference profiles with ON DELETE CASCADE, so history that belongs to the
 // profile disappears in the same transaction.
 func (s *Store) DeleteProfile(id string) error {
+	return s.DeleteProfileContext(context.Background(), id)
+}
+
+// DeleteProfileContext removes the profile configuration and observes ctx
+// while waiting for SQLite. Observation History tables reference profiles
+// with ON DELETE CASCADE, so history that belongs to the profile disappears
+// in the same transaction.
+func (s *Store) DeleteProfileContext(ctx context.Context, id string) error {
 	if !profileIDPattern.MatchString(id) {
 		return fmt.Errorf("%w: profile id %q", ErrProfileInvalid, id)
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("delete profile: %w", err)
 	}
@@ -383,7 +416,7 @@ func (s *Store) DeleteProfile(id string) error {
 	// (schema 3 without later tables) simply skip the missing tables so the
 	// profile delete still succeeds.
 	for _, table := range []string{"observation_runs", "availability_episodes", "telegram_deliveries", "profile_telegram_destinations"} {
-		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE profile_id = ?`, table), id); err != nil {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE profile_id = ?`, table), id); err != nil {
 			if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 				return fmt.Errorf("delete profile history: %w", err)
 			}
@@ -392,7 +425,7 @@ func (s *Store) DeleteProfile(id string) error {
 	// Operational incidents reference profiles without a foreign key, and
 	// their deliveries reference incidents. Delete deliveries first so no
 	// orphaned notification rows remain when constraints are off.
-	if _, err := tx.Exec(`DELETE FROM operational_deliveries WHERE incident_id IN (SELECT id FROM operational_incidents WHERE profile_id = ?)`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM operational_deliveries WHERE incident_id IN (SELECT id FROM operational_incidents WHERE profile_id = ?)`, id); err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 			return fmt.Errorf("delete profile history: %w", err)
 		}
@@ -400,13 +433,13 @@ func (s *Store) DeleteProfile(id string) error {
 	// Destination-scope incidents for this profile also carry profile_id, so
 	// one delete covers profile and destination scopes.
 	for _, table := range []string{"operational_incidents"} {
-		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE profile_id = ?`, table), id); err != nil {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE profile_id = ?`, table), id); err != nil {
 			if !strings.Contains(strings.ToLower(err.Error()), "no such table") {
 				return fmt.Errorf("delete profile history: %w", err)
 			}
 		}
 	}
-	result, err := tx.Exec(`DELETE FROM profiles WHERE id = ?`, id)
+	result, err := tx.ExecContext(ctx, `DELETE FROM profiles WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete profile: %w", err)
 	}
