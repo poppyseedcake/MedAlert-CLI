@@ -18,7 +18,7 @@ fi
 grep -Fqx 'ExecStart=%h/.local/bin/medalert watch --non-interactive' "$unit_file"
 grep -Fqx 'StandardOutput=journal' "$unit_file"
 grep -Fqx 'StandardError=journal' "$unit_file"
-grep -Fqx 'UnsetEnvironment=MEDALERT_DATABASE MEDALERT_SESSION_DIR' "$unit_file"
+grep -Fqx 'UnsetEnvironment=MEDALERT_DATABASE MEDALERT_SESSION_DIR MEDALERT_MEDICOVER_BASE_URL MEDALERT_TELEGRAM_BASE_URL MEDALERT_WATCH_MAX_ITERATIONS' "$unit_file"
 
 if ! command -v systemd-analyze >/dev/null 2>&1; then
 	printf '%s\n' 'systemd-analyze is required by the installation smoke test' >&2

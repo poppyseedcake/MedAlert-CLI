@@ -112,8 +112,9 @@ systemctl --user status medalert.service
 
 The unit runs `medalert watch --non-interactive`. It does not start a custom
 daemon. It does not set a database path, so the command uses the XDG data path
-described above. It clears test-only database and session overrides, so native
-operation uses SQLite in the XDG data directory and Secret Service for session
+described above. It clears test-only database, session, endpoint, and iteration
+overrides, so native operation uses SQLite in the XDG data directory, the
+production Medicover and Telegram endpoints, and Secret Service for session
 state.
 
 Text watch logs go to standard error. systemd sends standard output and
