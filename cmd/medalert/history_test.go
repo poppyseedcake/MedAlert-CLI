@@ -315,7 +315,7 @@ func TestAutomationCommandGroupsAndContracts(t *testing.T) {
 	}
 }
 
-func TestHistorySecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
+func TestFinalAcceptanceSecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
 	medicoverFake, medicoverCleanup := newIncidentMedicoverFake(t)
 	defer medicoverCleanup()
 	medicoverFake.setSlots(incidentSlot("booking-secret"))

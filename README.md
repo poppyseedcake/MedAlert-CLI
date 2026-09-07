@@ -33,3 +33,18 @@ secret files, and starts `watch --non-interactive` by default.
 
 See [`docs/docker.md`](docs/docker.md) for secret mounts, persistent data,
 commit image tags, updates, and rollback.
+
+## Supported scope
+
+MedAlert supports a native executable, a systemd user service, and one Docker
+image on Linux amd64 (`x86_64`). The project does not publish native archives
+or GitHub Releases. Successful updates to `main` publish the tested container
+as `latest` and `sha-<commit>` tags.
+
+## License and attribution
+
+MedAlert is an independent Go rewrite and modification of
+[MediCzuwacz](https://github.com/SteveSteve24/MediCzuwacz). It retains clear
+attribution to the original project and its contributors. MediCzuwacz is
+GPLv3-licensed, and MedAlert is distributed under the GNU General Public
+License v3.0. See [`LICENSE`](LICENSE) for the license terms.
