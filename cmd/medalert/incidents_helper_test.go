@@ -25,13 +25,19 @@ type incidentMedicoverFake struct {
 	slots       []map[string]any
 	mode        string // success, temporary, protocol
 	failRegion  string
+	passwords   map[string]string
 	pending     map[string]string
 	codes       map[string]string
 }
 
 func newIncidentMedicoverFake(t *testing.T) (*incidentMedicoverFake, func()) {
 	t.Helper()
-	fake := &incidentMedicoverFake{pending: map[string]string{}, codes: map[string]string{}, mode: "success"}
+	fake := &incidentMedicoverFake{
+		pending:   map[string]string{},
+		codes:     map[string]string{},
+		mode:      "success",
+		passwords: map[string]string{"patient@example.com": "durable-pass", "alice@example.com": "alice-pass", "bob@example.com": "bob-pass"},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -70,9 +76,9 @@ func newIncidentMedicoverFake(t *testing.T) (*incidentMedicoverFake, func()) {
 		_ = r.ParseForm()
 		username := r.PostForm.Get("Input.Username")
 		password := r.PostForm.Get("Input.Password")
-		valid := (username == "patient@example.com" && password == "durable-pass") ||
-			(username == "alice@example.com" && password == "alice-pass") ||
-			(username == "bob@example.com" && password == "bob-pass")
+		fake.mu.Lock()
+		valid := fake.passwords[username] == password
+		fake.mu.Unlock()
 		if !valid {
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte(`<html><body><form><input type="password" name="Input.Password" /></form></body></html>`))
@@ -157,6 +163,12 @@ func newIncidentMedicoverFake(t *testing.T) (*incidentMedicoverFake, func()) {
 	fake.baseURL = server.URL
 	fake.redirectURI = server.URL + "/signin-oidc"
 	return fake, server.Close
+}
+
+func (f *incidentMedicoverFake) setPassword(username, password string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.passwords[username] = password
 }
 
 func minIncidentLen(value string, n int) int {

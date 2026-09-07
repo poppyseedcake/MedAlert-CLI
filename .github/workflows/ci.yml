@@ -30,8 +30,15 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Run critical acceptance set
+        run: |
+          go test ./cmd/medalert ./internal/cli ./internal/medicover ./internal/store ./internal/secrets ./internal/telegram ./internal/tui
+
       - name: Run vet
         run: go vet ./...
+
+      - name: Run project acceptance checks
+        run: ./scripts/project-acceptance-test.sh
 
       - name: Build Linux amd64 executable
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/medalert ./cmd/medalert

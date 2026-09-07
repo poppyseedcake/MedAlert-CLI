@@ -315,7 +315,7 @@ func TestAutomationCommandGroupsAndContracts(t *testing.T) {
 	}
 }
 
-func TestHistorySecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
+func TestFinalAcceptanceSecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
 	medicoverFake, medicoverCleanup := newIncidentMedicoverFake(t)
 	defer medicoverCleanup()
 	medicoverFake.setSlots(incidentSlot("booking-secret"))
@@ -331,6 +331,7 @@ func TestHistorySecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := "MARKER-HISTORY-" + t.Name() + "-unique"
+	medicoverFake.setPassword("patient@example.com", marker+"-pass")
 	passwordFile := writeProcessSecretFile(t, secretDir, "pw", marker+"-pass")
 	tokenFile := writeProcessSecretFile(t, secretDir, "tok", marker+"-token")
 	environment := []string{
@@ -340,49 +341,74 @@ func TestHistorySecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
 		"MEDALERT_TELEGRAM_BASE_URL=" + telegramServer.URL,
 		"MEDALERT_NON_INTERACTIVE=true",
 	}
+	outputs := make([]string, 0, 32)
+	recordOutput := func(result processResult) {
+		outputs = append(outputs, result.stdout, result.stderr)
+	}
 	created := run(t, environment, "account", "create", "--account", "alice", "--username", "alice@example.com", "--password-file", passwordFile, "--non-interactive")
 	if created.exitCode != 0 {
 		t.Fatalf("create account = %#v", created)
 	}
-	// Overwrite the secret files with the marker after creation so the stored
-	// references stay valid but the values are unique markers.
-	if err := os.WriteFile(passwordFile, []byte(marker+"-pass\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	recordOutput(created)
 	// Point the account at the marker password file.
 	edited := run(t, environment, "account", "edit", "--account", "alice", "--password-file", passwordFile, "--non-interactive")
 	if edited.exitCode != 0 {
 		t.Fatalf("edit account = %#v", edited)
 	}
+	recordOutput(edited)
 	createdDest := run(t, environment, "telegram", "create", "--telegram", "phone", "--name", "T", "--chat-id", "123456", "--token-file", tokenFile, "--non-interactive")
 	if createdDest.exitCode != 0 {
 		t.Fatalf("create dest = %#v", createdDest)
 	}
+	recordOutput(createdDest)
 	createdProfile := run(t, environment, "profile", "create", "--profile", "secret-prof", "--account", "alice", "--region", "204", "--specialty", "132", "--check-interval-minutes", "30", "--telegram", "phone", "--non-interactive")
 	if createdProfile.exitCode != 0 {
 		t.Fatalf("create profile = %#v", createdProfile)
 	}
-	// Use the real password the fake accepts for the check, then restore the
-	// marker so history and logs are exercised with marker secrets present.
-	if err := os.WriteFile(passwordFile, []byte("durable-pass\n"), 0o600); err != nil {
-		t.Fatal(err)
+	recordOutput(createdProfile)
+	createdPatient := run(t, environment, "account", "create", "--account", "patient", "--username", "patient@example.com", "--password-file", passwordFile, "--non-interactive")
+	if createdPatient.exitCode != 0 {
+		t.Fatalf("create patient account = %#v", createdPatient)
 	}
-	// The fixture account uses patient credentials in the fake; create a
-	// matching patient account for the durable check.
-	_ = run(t, environment, "account", "create", "--account", "patient", "--username", "patient@example.com", "--password-file", passwordFile, "--non-interactive")
-	_ = run(t, environment, "profile", "create", "--profile", "patient-prof", "--account", "patient", "--region", "204", "--specialty", "132", "--check-interval-minutes", "30", "--telegram", "phone", "--non-interactive")
+	recordOutput(createdPatient)
+	createdPatientProfile := run(t, environment, "profile", "create", "--profile", "patient-prof", "--account", "patient", "--region", "204", "--specialty", "132", "--check-interval-minutes", "30", "--telegram", "phone", "--non-interactive")
+	if createdPatientProfile.exitCode != 0 {
+		t.Fatalf("create patient profile = %#v", createdPatientProfile)
+	}
+	recordOutput(createdPatientProfile)
 	checkResult := run(t, environment, "check", "--profile", "patient-prof", "--output", "json", "--non-interactive")
 	if checkResult.exitCode != 0 {
 		t.Fatalf("check = %#v", checkResult)
 	}
-	if err := os.WriteFile(passwordFile, []byte(marker+"-pass\n"), 0o600); err != nil {
+	recordOutput(checkResult)
+	textCheckResult := run(t, environment, "check", "--profile", "patient-prof", "--non-interactive")
+	if textCheckResult.exitCode != 0 {
+		t.Fatalf("text check = %#v", textCheckResult)
+	}
+	recordOutput(textCheckResult)
+	databaseHandle, err := sql.Open("sqlite", database)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(tokenFile, []byte(marker+"-token\n"), 0o600); err != nil {
+	if _, err := databaseHandle.Exec("DROP TABLE operational_deliveries; DROP TABLE operational_incidents; DELETE FROM schema_migrations WHERE version = 7; PRAGMA user_version = 6"); err != nil {
+		databaseHandle.Close()
 		t.Fatal(err)
 	}
-	outputs := []string{checkResult.stdout, checkResult.stderr}
+	if err := databaseHandle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrationResult := run(t, environment, "database", "initialize")
+	if migrationResult.exitCode != 0 {
+		t.Fatalf("initialize migration database = %#v", migrationResult)
+	}
+	recordOutput(migrationResult)
 	for _, args := range [][]string{
+		{"account", "show", "patient", "--output", "json"},
+		{"account", "status", "--account", "patient", "--output", "json"},
+		{"profile", "list", "--output", "json"},
+		{"profile", "show", "--profile", "patient-prof", "--output", "json"},
+		{"telegram", "list", "--output", "json"},
+		{"telegram", "show", "--telegram", "phone", "--output", "json"},
 		{"history", "runs", "--profile", "patient-prof", "--output", "json", "--non-interactive"},
 		{"history", "episodes", "--profile", "patient-prof", "--output", "json", "--non-interactive"},
 		{"history", "incidents", "--output", "json", "--non-interactive"},
@@ -394,18 +420,41 @@ func TestHistorySecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
 		{"doctor", "--non-interactive"},
 	} {
 		result := run(t, environment, args...)
-		outputs = append(outputs, result.stdout, result.stderr)
+		if result.exitCode != 0 {
+			t.Fatalf("command %v = %#v", args, result)
+		}
+		recordOutput(result)
 	}
 	for _, output := range outputs {
 		if strings.Contains(output, marker) {
 			t.Fatalf("output leaks secret marker: %q", output)
 		}
 	}
-	raw, err := os.ReadFile(database)
-	if err != nil {
-		t.Fatal(err)
+	var markerPath string
+	durableRoot := filepath.Dir(database)
+	walkErr := filepath.Walk(durableRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == secretDir {
+			return filepath.SkipDir
+		}
+		if info.IsDir() {
+			return nil
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(contents), marker) {
+			markerPath = path
+		}
+		return nil
+	})
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		t.Fatal(walkErr)
 	}
-	if strings.Contains(string(raw), marker) {
-		t.Fatal("database file contains secret marker")
+	if markerPath != "" {
+		t.Fatalf("durable file %s contains secret marker", markerPath)
 	}
 }
