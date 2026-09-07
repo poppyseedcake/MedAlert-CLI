@@ -555,7 +555,7 @@ func historyIncidentRow(incident store.Incident) Row {
 }
 
 func historyDeliveryRow(delivery store.Delivery) Row {
-	status := historyDeliveryStatus(delivery.Status)
+	status := historyDeliveryRowStatus(delivery.Status, delivery.LastError)
 	detail := fmt.Sprintf("Profil: %s · Epizod: %s · Telegram: %s · Próby: %d · Utworzono: %s · Zmieniono: %s",
 		delivery.ProfileID, delivery.EpisodeID, delivery.DestinationID, delivery.Attempts, delivery.CreatedAt, delivery.UpdatedAt)
 	if delivery.NextAttemptAt != "" {
@@ -571,7 +571,7 @@ func historyDeliveryRow(delivery store.Delivery) Row {
 }
 
 func historyIncidentDeliveryRow(delivery store.IncidentDelivery) Row {
-	status := historyDeliveryStatus(delivery.Status)
+	status := historyDeliveryRowStatus(delivery.Status, delivery.LastError)
 	detail := fmt.Sprintf("Incydent: %s · Telegram: %s · Typ: %s · Próby: %d · Utworzono: %s · Zmieniono: %s",
 		delivery.IncidentID, delivery.DestinationID, delivery.Kind, delivery.Attempts, delivery.CreatedAt, delivery.UpdatedAt)
 	if delivery.NextAttemptAt != "" {
@@ -610,6 +610,19 @@ func historyDeliveryStatus(status string) string {
 		return label
 	}
 	return status
+}
+
+func historyDeliveryRowStatus(status, message string) string {
+	if status == store.DeliveryPermanentFailure && isNonDeliveryPermanentFailure(message) {
+		return "anulowane"
+	}
+	return historyDeliveryStatus(status)
+}
+
+func isNonDeliveryPermanentFailure(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, "slot is no longer available") ||
+		strings.Contains(message, "incident ended before failure was delivered")
 }
 
 func displayValue(value string) string {
@@ -706,6 +719,9 @@ func (a *Application) readStatus(storage *store.Store) (statusData, error) {
 	}
 	destinationFailures := map[string]struct{}{}
 	for _, delivery := range data.PermanentFailures {
+		if isNonDeliveryPermanentFailure(delivery.LastError) {
+			continue
+		}
 		data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "permanent_failure", Scope: "delivery", ID: delivery.ID})
 		if destinationID := strings.TrimSpace(delivery.DestinationID); destinationID != "" {
 			if _, seen := destinationFailures[destinationID]; !seen {
@@ -719,6 +735,9 @@ func (a *Application) readStatus(storage *store.Store) (statusData, error) {
 		return data, err
 	}
 	for _, delivery := range data.OperationalDeliveries {
+		if isNonDeliveryPermanentFailure(delivery.LastError) {
+			continue
+		}
 		data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "permanent_failure", Scope: "operational_delivery", ID: delivery.ID})
 		if destinationID := strings.TrimSpace(delivery.DestinationID); destinationID != "" {
 			if _, seen := destinationFailures[destinationID]; !seen {

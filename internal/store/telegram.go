@@ -448,6 +448,12 @@ func (s *Store) ListDestinationProfileIDs(destinationID string) ([]string, error
 // destinations. The operation is atomic so a missing profile cannot leave a
 // partial link update.
 func (s *Store) SetDestinationProfiles(destinationID string, profileIDs []string) error {
+	return s.SetDestinationProfilesContext(context.Background(), destinationID, profileIDs)
+}
+
+// SetDestinationProfilesContext replaces the profiles linked to one
+// destination and observes ctx while waiting for SQLite.
+func (s *Store) SetDestinationProfilesContext(ctx context.Context, destinationID string, profileIDs []string) error {
 	if !destinationIDPattern.MatchString(destinationID) {
 		return fmt.Errorf("%w: destination id %q", ErrDestinationInvalid, destinationID)
 	}
@@ -455,7 +461,6 @@ func (s *Store) SetDestinationProfiles(destinationID string, profileIDs []string
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("link destination profiles: %w", err)
