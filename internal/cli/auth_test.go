@@ -133,6 +133,17 @@ func newMinimalFake(t *testing.T) (*minimalFake, func()) {
 		http.SetCookie(w, &http.Cookie{Name: "MedicoverTrusted", Value: "trusted-1", Path: "/"})
 		http.Redirect(w, r, fake.redirectURI+"?code="+url.QueryEscape(code)+"&state="+url.QueryEscape(state), http.StatusFound)
 	})
+	searchHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/slots") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "totalPages": 1})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"regions": []any{}})
+	}
+	mux.HandleFunc("/appointments/api/v2/search-appointments/filters/initial-filters", searchHandler)
+	mux.HandleFunc("/appointments/api/v2/search-appointments/filters", searchHandler)
+	mux.HandleFunc("/appointments/api/v2/search-appointments/slots", searchHandler)
 	mux.HandleFunc("/connect/token", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		if r.PostForm.Get("grant_type") == "refresh_token" {

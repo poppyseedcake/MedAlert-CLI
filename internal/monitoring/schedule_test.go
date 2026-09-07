@@ -40,6 +40,17 @@ func TestNextRunAfterThrottlesByInterval(t *testing.T) {
 	}
 }
 
+func TestLatestRunStartUsesNewestValidRun(t *testing.T) {
+	latest, ok := LatestRunStart([]store.ObservationRun{
+		{StartedAt: "not-a-time"},
+		{StartedAt: "2026-09-04T12:00:00Z"},
+		{StartedAt: "2026-09-04T12:30:00Z"},
+	})
+	if !ok || !latest.Equal(time.Date(2026, time.September, 4, 12, 30, 0, 0, time.UTC)) {
+		t.Fatalf("latest run = %v, %v", latest, ok)
+	}
+}
+
 func TestDueProfilesKeepsOnlyEnabledDue(t *testing.T) {
 	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
 	profiles := []store.Profile{

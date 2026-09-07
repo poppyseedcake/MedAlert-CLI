@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/poppyseedcake/MedAlert/internal/application"
 	"github.com/poppyseedcake/MedAlert/internal/tui"
 	"golang.org/x/term"
 )
@@ -37,10 +39,15 @@ func runTUI(settings options, stdin *os.File, stdout, stderr io.Writer) int {
 func terminalAction(ctx context.Context, settings options, request tui.Request, prompt tui.Prompt) tui.Result {
 	ctx = contextOrBackground(ctx)
 	settings.output, settings.nonInteractive = "json", true
-	settings.accountID, settings.username, settings.passwordFile = request.ID, request.Username, request.PasswordFile
+	if strings.HasPrefix(request.Action, "profile-") {
+		applyProfileRequest(&settings, request)
+	} else {
+		settings.accountID, settings.username, settings.passwordFile = request.ID, request.Username, request.PasswordFile
+	}
 	var stdout, stderr bytes.Buffer
 	code := 0
 	sessionCleanupFailed := false
+	checkResultMessage := ""
 	switch request.Action {
 	case "refresh":
 	case "create", "edit":
@@ -58,6 +65,38 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		code = accountLogoutWithContext(ctx, "account logout", settings, &stdout, &stderr, true)
 	case "login":
 		code = accountLoginWithPrompt(ctx, "account login", settings, nil, &stdout, &stderr, true, prompt)
+	case "profile-create":
+		if err := terminalProfileApplication(ctx, settings, request, "create"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
+	case "profile-edit":
+		if err := terminalProfileApplication(ctx, settings, request, "edit"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
+	case "profile-enable":
+		if err := terminalProfileApplication(ctx, settings, request, "enable"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
+	case "profile-disable":
+		if err := terminalProfileApplication(ctx, settings, request, "disable"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
+	case "profile-delete":
+		if err := terminalProfileApplication(ctx, settings, request, "delete"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
+	case "profile-dry-check":
+		settings.dry = true
+		checked, err := terminalCheckApplication(ctx, settings, request, prompt)
+		if err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
+		checkResultMessage = fmt.Sprintf("Sucha kontrola profilu %s znalazła %d terminów. Historia i dostarczanie nie zostały zmienione.", request.ID, len(checked.Search.Slots))
+	case "profile-check":
+		if _, err := terminalCheckApplication(ctx, settings, request, prompt); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
+		checkResultMessage = "Wykonano trwałą kontrolę profilu."
 	default:
 		return tui.Result{Failed: true, Message: "Nieznana operacja."}
 	}
@@ -69,9 +108,13 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 			Error errorBody `json:"error"`
 		}
 		_ = json.Unmarshal(stderr.Bytes(), &envelope)
-		return tui.Result{Failed: true, Message: terminalError(envelope.Error.Code)}
+		message := terminalError(envelope.Error.Code)
+		if strings.HasPrefix(request.Action, "profile-") {
+			message = terminalErrorDetails(envelope.Error.Code, envelope.Error.Message)
+		}
+		return tui.Result{Failed: true, Message: message}
 	}
-	snapshot, err := terminalSnapshot(settings)
+	snapshot, err := terminalSnapshotWithContext(ctx, settings, request.Action != "profile-dry-check")
 	if err != nil {
 		return tui.Result{Failed: true, Message: "Nie można odczytać stanu. Sprawdź dostęp do bazy. R: ponów."}
 	}
@@ -91,113 +134,168 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		message = "Wylogowano konto."
 	case "login":
 		message = "Zalogowano konto. Sesja została zapisana."
+	case "profile-create", "profile-edit":
+		message = "Zapisano profil."
+	case "profile-enable":
+		message = "Włączono profil."
+	case "profile-disable":
+		message = "Wstrzymano profil."
+	case "profile-delete":
+		message = "Usunięto profil i jego historię."
+	case "profile-dry-check", "profile-check":
+		if checkResultMessage != "" {
+			message = checkResultMessage
+		}
 	}
 	return tui.Result{Snapshot: snapshot, Message: message}
 }
 
+func terminalProfileApplication(ctx context.Context, settings options, request tui.Request, action string) error {
+	values := application.ProfileValues{
+		AccountID: request.Profile.AccountID, RegionIDs: request.Profile.RegionIDs,
+		SpecialtyIDs: request.Profile.SpecialtyIDs, ClinicIDs: request.Profile.ClinicIDs,
+		DoctorIDs: request.Profile.DoctorIDs, LanguageIDs: request.Profile.LanguageIDs,
+		VisitType: request.Profile.VisitType, SearchType: request.Profile.SearchType,
+		StartDate: request.Profile.StartDate, EndDate: request.Profile.EndDate,
+		CheckIntervalMinutes: request.Profile.CheckIntervalMinutes,
+		Enabled:              request.Profile.Enabled,
+	}
+	if action == "create" {
+		values.Enabled = true
+	}
+	_, err := application.New(application.Config{
+		Database:         settings.database,
+		SessionDir:       settings.sessionDir,
+		MedicoverBaseURL: settings.medicoverBaseURL,
+	}).Profile(ctx, application.ProfileRequest{
+		Action: action, ID: request.ID, Values: values, Clear: request.ProfileClear,
+	})
+	return err
+}
+
+func terminalApplicationFailure(ctx context.Context, err error) tui.Result {
+	if ctx.Err() != nil {
+		return tui.Result{Failed: true, Message: "Anulowano operację. Odśwież stan."}
+	}
+	code, detail := application.ErrorInfo(err)
+	return tui.Result{Failed: true, Message: terminalErrorDetails(code, detail)}
+}
+
+func terminalCheckApplication(ctx context.Context, settings options, request tui.Request, prompt tui.Prompt) (application.CheckResult, error) {
+	return application.New(application.Config{
+		Database:         settings.database,
+		SessionDir:       settings.sessionDir,
+		MedicoverBaseURL: settings.medicoverBaseURL,
+		TelegramBaseURL:  settings.telegramBaseURL,
+	}).Check(ctx, application.CheckRequest{ProfileID: request.ID, Dry: settings.dry, Prompt: prompt})
+}
+
+func applyProfileRequest(settings *options, request tui.Request) {
+	settings.profileID = request.ID
+	settings.accountID = request.Profile.AccountID
+	settings.region = request.Profile.RegionIDs
+	settings.specialty = request.Profile.SpecialtyIDs
+	settings.clinic = request.Profile.ClinicIDs
+	settings.doctor = request.Profile.DoctorIDs
+	settings.language = request.Profile.LanguageIDs
+	settings.visitType = request.Profile.VisitType
+	settings.searchType = request.Profile.SearchType
+	settings.startDate = request.Profile.StartDate
+	settings.endDate = request.Profile.EndDate
+	settings.checkIntervalRaw = request.Profile.CheckIntervalMinutes
+	for _, field := range request.ProfileClear {
+		switch field {
+		case "clinic_ids":
+			settings.clearClinic = true
+		case "doctor_ids":
+			settings.clearDoctor = true
+		case "language_ids":
+			settings.clearLanguage = true
+		case "visit_type":
+			settings.clearVisitType = true
+		case "search_type":
+			settings.clearSearchType = true
+		case "start_date":
+			settings.clearStartDate = true
+		case "end_date":
+			settings.clearEndDate = true
+		}
+	}
+}
+
 func terminalSnapshot(settings options) (tui.Snapshot, error) {
-	var snapshot tui.Snapshot
-	storage, err := ensureStore(settings.database)
+	return terminalSnapshotWithContext(context.Background(), settings, true)
+}
+
+func terminalSnapshotWithPrune(settings options, prune bool) (tui.Snapshot, error) {
+	return terminalSnapshotWithContext(context.Background(), settings, prune)
+}
+
+func terminalSnapshotWithContext(ctx context.Context, settings options, prune bool) (tui.Snapshot, error) {
+	state, err := application.New(application.Config{
+		Database:         settings.database,
+		SessionDir:       settings.sessionDir,
+		MedicoverBaseURL: settings.medicoverBaseURL,
+	}).Snapshot(ctx, prune)
 	if err != nil {
-		return snapshot, err
+		return tui.Snapshot{}, err
 	}
-	defer storage.Close()
-	pruneHistoryBestEffort(storage)
-	status, err := collectHistoryStatusForIssuer(storage, sessionStoreFor(settings), settings.medicoverBaseURL)
-	if err != nil {
-		return snapshot, err
+	return tui.Snapshot{
+		Accounts:      tuiRows(state.Accounts),
+		Profiles:      tuiRows(state.Profiles),
+		Destinations:  tuiRows(state.Destinations),
+		Monitoring:    tuiRows(state.Monitoring),
+		Runs:          tuiRows(state.Runs),
+		History:       tuiRows(state.History),
+		Actions:       tuiRows(state.Actions),
+		ProfileValues: tuiProfileValues(state.ProfileValues),
+		Summary:       state.Summary,
+	}, nil
+}
+
+func tuiRows(rows []application.Row) []tui.Row {
+	converted := make([]tui.Row, 0, len(rows))
+	for _, row := range rows {
+		converted = append(converted, tui.Row{ID: row.ID, Label: row.Label, Detail: row.Detail, Target: row.Target})
 	}
-	for _, account := range status.Accounts {
-		state := "? Brak dostępu do magazynu sesji"
-		if account.AuthRequired {
-			state = "! Wymaga logowania"
-		} else if account.Authenticated {
-			state = "OK — sesja zapisana"
-		}
-		snapshot.Accounts = append(snapshot.Accounts, tui.Row{ID: account.ID, Label: account.Username, Detail: state})
-		if !account.AuthRequired && !account.Authenticated {
-			snapshot.Actions = append(snapshot.Actions, tui.Row{ID: account.ID, Label: "! Sprawdź magazyn sesji: " + account.ID, Target: 1})
-		}
-	}
-	for _, action := range status.RequiredActions {
-		label := map[string]string{
-			"authentication_required": "Zaloguj konto", "profile_disabled": "Profil wyłączony", "destination_disabled": "Telegram wyłączony",
-			"active_incident": "Sprawdź aktywny problem", "permanent_failure": "Sprawdź błąd dostarczenia", "invalid_retention": "Sprawdź okres historii",
-		}[action.Code]
-		if label == "" {
-			label = "Sprawdź stan"
-		}
-		snapshot.Actions = append(snapshot.Actions, tui.Row{ID: action.ID, Label: "! " + label + ": " + action.ID, Detail: label, Target: map[string]int{"account": 1, "profile": 2, "destination": 3, "delivery": 5, "operational_delivery": 5, "history": 5}[action.Scope]})
-		if action.Code == "invalid_retention" {
-			snapshot.History = append(snapshot.History, tui.Row{
-				ID:     action.ID,
-				Label:  "Nieprawidłowy okres historii",
-				Detail: "Ustaw prawidłowy okres w poleceniu history retention.",
-			})
+	return converted
+}
+
+func tuiProfileValues(values map[string]application.ProfileValues) map[string]tui.ProfileValues {
+	converted := make(map[string]tui.ProfileValues, len(values))
+	for id, value := range values {
+		converted[id] = tui.ProfileValues{
+			AccountID: value.AccountID, RegionIDs: value.RegionIDs, SpecialtyIDs: value.SpecialtyIDs,
+			ClinicIDs: value.ClinicIDs, DoctorIDs: value.DoctorIDs, LanguageIDs: value.LanguageIDs,
+			VisitType: value.VisitType, SearchType: value.SearchType, StartDate: value.StartDate,
+			EndDate: value.EndDate, CheckIntervalMinutes: value.CheckIntervalMinutes, Enabled: value.Enabled,
 		}
 	}
-	if len(status.Accounts) == 0 {
-		snapshot.Actions = append(snapshot.Actions, tui.Row{Label: "! Dodaj konto w obszarze Konta (2, A).", Target: 1})
-	}
-	profiles, err := storage.ListProfiles("")
-	if err != nil {
-		return snapshot, err
-	}
-	for _, profile := range profiles {
-		state := "OK — włączony"
-		if !profile.Enabled {
-			state = "— wyłączony"
-		}
-		snapshot.Profiles = append(snapshot.Profiles, tui.Row{ID: profile.ID, Label: profile.ID + " — " + state, Detail: "Konto: " + profile.AccountID})
-	}
-	destinations, err := storage.ListDestinations()
-	if err != nil {
-		return snapshot, err
-	}
-	for _, destination := range destinations {
-		state := "OK — włączony"
-		if !destination.Enabled {
-			state = "— wyłączony"
-		}
-		snapshot.Destinations = append(snapshot.Destinations, tui.Row{ID: destination.ID, Label: destination.Name + " — " + state, Detail: "Dane tokenu są ukryte."})
-	}
-	runs, err := storage.ListRecentObservationRuns(100)
-	if err != nil {
-		return snapshot, err
-	}
-	for _, run := range runs {
-		state := map[string]string{"running": "w toku", "complete": "ukończony", "failed": "błąd", "partial": "częściowy", "cancelled": "anulowany", "conflicting": "konflikt", "stale": "nieaktualny"}[run.Status]
-		row := tui.Row{ID: run.ID, Label: run.ProfileID + " — " + state, Detail: run.StartedAt}
-		snapshot.Runs = append(snapshot.Runs, row)
-		snapshot.History = append(snapshot.History, row)
-	}
-	for _, delivery := range status.PermanentFailures {
-		snapshot.History = append(snapshot.History, tui.Row{
-			ID:    delivery.ID,
-			Label: delivery.ProfileID + " — trwały błąd dostarczenia",
-			Detail: fmt.Sprintf("Telegram: %s · Próby: %d · Utworzono: %s",
-				delivery.DestinationID, delivery.Attempts, delivery.CreatedAt),
-		})
-	}
-	for _, delivery := range status.OperationalDeliveries {
-		snapshot.History = append(snapshot.History, tui.Row{
-			ID:    delivery.ID,
-			Label: "Operacyjne dostarczenie — trwały błąd",
-			Detail: fmt.Sprintf("Incydent: %s · Telegram: %s · Typ: %s · Próby: %d · Utworzono: %s",
-				delivery.IncidentID, delivery.DestinationID, delivery.Kind, delivery.Attempts, delivery.CreatedAt),
-		})
-	}
-	snapshot.Summary = fmt.Sprintf("Konta: %d · Profile: %d · Problemy: %d", len(snapshot.Accounts), len(snapshot.Profiles), len(status.ActiveIncidents))
-	return snapshot, nil
+	return converted
 }
 
 func terminalError(code string) string {
+	return terminalErrorDetails(code, "")
+}
+
+func terminalErrorDetails(code, detail string) string {
 	switch code {
 	case "account_exists":
 		return "Konto już istnieje. Użyj innego identyfikatora."
 	case "account_not_found":
 		return "Konto nie istnieje. R: odśwież listę."
+	case "profile_exists":
+		return "Profil już istnieje. Użyj innego identyfikatora."
+	case "profile_not_found":
+		return "Profil nie istnieje. R: odśwież listę."
+	case "profile_disabled":
+		return "Profil jest wyłączony. Włącz go klawiszem P."
+	case "run_active":
+		return "Kontrola tego profilu już trwa. Spróbuj ponownie później."
 	case "invalid_arguments":
+		if message := polishProfileValidation(detail); message != "" {
+			return message
+		}
 		return "Nieprawidłowe dane. Sprawdź pola lub uprawnienia pliku."
 	case "invalid_credentials":
 		return "Nieprawidłowe dane logowania lub kod MFA. L: ponów."
@@ -211,5 +309,39 @@ func terminalError(code string) string {
 		return "Logowanie przekroczyło limit czasu. L: ponów."
 	default:
 		return "Operacja nie powiodła się. Sprawdź połączenie i magazyn sesji. R: odśwież."
+	}
+}
+
+func polishProfileValidation(detail string) string {
+	lower := strings.ToLower(strings.TrimSpace(detail))
+	switch {
+	case strings.Contains(lower, "end date must not be before start date"):
+		return "Nieprawidłowy zakres dat: Data końcowa nie może być wcześniejsza niż Data początkowa."
+	case strings.Contains(lower, "start date"):
+		return "Nieprawidłowa data początkowa. Użyj formatu YYYY-MM-DD."
+	case strings.Contains(lower, "end date"):
+		return "Nieprawidłowa data końcowa. Użyj formatu YYYY-MM-DD."
+	case strings.Contains(lower, "check interval"):
+		return "Nieprawidłowy interwał. Podaj liczbę od 1 do 43200 minut."
+	case strings.Contains(lower, "search type"):
+		return "Nieprawidłowy typ wyszukiwania. Użyj Standard albo DiagnosticProcedure."
+	case strings.Contains(lower, "visit type"):
+		return "Nieprawidłowy typ wizyty. Użyj liter, cyfr, - albo _."
+	case strings.Contains(lower, "region"):
+		return "Nieprawidłowe regiony. Podaj dodatnie identyfikatory rozdzielone przecinkami."
+	case strings.Contains(lower, "specialty"):
+		return "Nieprawidłowe specjalności. Podaj dodatnie identyfikatory rozdzielone przecinkami."
+	case strings.Contains(lower, "clinic"):
+		return "Nieprawidłowe placówki. Podaj dodatnie identyfikatory rozdzielone przecinkami."
+	case strings.Contains(lower, "doctor"):
+		return "Nieprawidłowi lekarze. Podaj dodatnie identyfikatory rozdzielone przecinkami."
+	case strings.Contains(lower, "language"):
+		return "Nieprawidłowe języki. Podaj dodatnie identyfikatory rozdzielone przecinkami."
+	case strings.Contains(lower, "profile id"):
+		return "Nieprawidłowy identyfikator profilu. Użyj liter, cyfr, - albo _."
+	case strings.Contains(lower, "account id"):
+		return "Nieprawidłowy identyfikator konta. Wybierz istniejące konto."
+	default:
+		return ""
 	}
 }

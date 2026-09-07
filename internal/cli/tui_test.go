@@ -362,3 +362,218 @@ func TestTerminalTimeoutMessage(t *testing.T) {
 		t.Fatalf("timeout message = %q", message)
 	}
 }
+
+func TestTerminalProfileActionsUseSharedProfileUseCases(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{
+		ID: "home", Username: "patient@example.com", PasswordSource: store.PasswordSourcePrompt,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	settings := options{database: database, sessionDir: filepath.Join(root, "sessions")}
+	profile := tui.ProfileValues{
+		AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132", ClinicIDs: "12", SearchType: "Standard", CheckIntervalMinutes: "30",
+		Enabled: false,
+	}
+	result := terminalAction(context.Background(), settings, tui.Request{Action: "profile-create", ID: "morning", Profile: profile}, nil)
+	if result.Failed || len(result.Snapshot.Profiles) != 1 || result.Snapshot.ProfileValues["morning"].AccountID != "home" || !result.Snapshot.ProfileValues["morning"].Enabled {
+		t.Fatalf("profile create result = %+v", result)
+	}
+
+	profile.RegionIDs = "204,205"
+	profile.ClinicIDs = ""
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "profile-edit", ID: "morning", Profile: profile, ProfileClear: []string{"clinic_ids"}}, nil)
+	if result.Failed || result.Snapshot.ProfileValues["morning"].RegionIDs != "204,205" || result.Snapshot.ProfileValues["morning"].ClinicIDs != "" {
+		t.Fatalf("profile edit result = %+v", result)
+	}
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "profile-disable", ID: "morning"}, nil)
+	if result.Failed || result.Snapshot.ProfileValues["morning"].Enabled {
+		t.Fatalf("profile disable result = %+v", result)
+	}
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "profile-enable", ID: "morning"}, nil)
+	if result.Failed || !result.Snapshot.ProfileValues["morning"].Enabled {
+		t.Fatalf("profile enable result = %+v", result)
+	}
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "profile-delete", ID: "morning"}, nil)
+	if result.Failed || len(result.Snapshot.Profiles) != 0 {
+		t.Fatalf("profile delete result = %+v", result)
+	}
+}
+
+func TestTerminalProfileChecksUseTerminalPrompt(t *testing.T) {
+	fake, closeServer := newMinimalFake(t)
+	defer closeServer()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{
+		ID: "home", Username: "plain-user@example.com", PasswordSource: store.PasswordSourcePrompt,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateProfile(store.Profile{
+		ID: "morning", AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132",
+		SearchType: store.SearchTypeStandard, CheckIntervalMinutes: 30, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	oldRun, err := storage.BeginObservationRun("morning", time.Now().UTC().Add(-48*time.Hour))
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.FailObservationRun(oldRun.ID, store.ObservationRunFailed, "temporary_failure", "old test run", time.Now().UTC().Add(-48*time.Hour)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.SetHistoryRetentionDays(1); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := options{
+		database:         database,
+		sessionDir:       filepath.Join(root, "sessions"),
+		medicoverBaseURL: fake.baseURL,
+	}
+	prompted := []string{}
+	prompt := func(_ context.Context, kind string) (string, error) {
+		prompted = append(prompted, kind)
+		if kind != "password" {
+			t.Fatalf("unexpected prompt kind %q", kind)
+		}
+		return "plain-pass", nil
+	}
+
+	result := terminalAction(context.Background(), settings, tui.Request{Action: "profile-dry-check", ID: "morning"}, prompt)
+	if result.Failed || !strings.Contains(result.Message, "Historia i dostarczanie nie zostały zmienione") {
+		t.Fatalf("dry check result = %+v", result)
+	}
+	if len(prompted) != 1 || prompted[0] != "password" {
+		t.Fatalf("dry check prompts = %#v", prompted)
+	}
+	if _, err := os.Stat(filepath.Join(settings.sessionDir, "sessions", "home.json")); !os.IsNotExist(err) {
+		t.Fatalf("dry check saved session: %v", err)
+	}
+	storage, err = store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := storage.ListObservationRuns("morning")
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("dry check pruned history: %d runs remain, want 1", len(runs))
+	}
+
+	prompted = nil
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "profile-check", ID: "morning"}, prompt)
+	if result.Failed || result.Message != "Wykonano trwałą kontrolę profilu." {
+		t.Fatalf("durable check result = %+v", result)
+	}
+	if len(prompted) != 1 || prompted[0] != "password" {
+		t.Fatalf("durable check prompts = %#v", prompted)
+	}
+}
+
+func TestTerminalProfileValidationMessageIsPolish(t *testing.T) {
+	message := terminalErrorDetails("invalid_arguments", "end date must not be before start date")
+	if !strings.Contains(message, "Data końcowa") || !strings.Contains(message, "Data początkowa") {
+		t.Fatalf("validation message = %q", message)
+	}
+}
+
+func TestTerminalSnapshotShowsMonitoringPausesAndProblems(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{
+		ID: "home", Username: "patient@example.com", PasswordSource: store.PasswordSourcePrompt,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	profile, err := storage.CreateProfile(store.Profile{
+		ID: "morning", AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132",
+		SearchType: store.SearchTypeStandard, CheckIntervalMinutes: 30, Enabled: true,
+	})
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, _, _, err := storage.RecordIncidentFailure(store.IncidentScopeProfile, profile.ID, profile.AccountID, profile.ID, "", "temporary_failure", "safe failure", time.Now().UTC(), nil); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := terminalSnapshot(options{database: database, sessionDir: filepath.Join(root, "sessions")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	monitoringView := ""
+	for _, row := range snapshot.Monitoring {
+		monitoringView += row.Label + " " + row.Detail + "\n"
+	}
+	for _, want := range []string{
+		"morning — wstrzymane: konto wymaga logowania",
+		"Następny przebieg: wstrzymany",
+		"Konto home — wstrzymane",
+		"! Aktywny problem: profil morning",
+	} {
+		if !strings.Contains(monitoringView, want) {
+			t.Fatalf("monitoring view misses %q: %s", want, monitoringView)
+		}
+	}
+	for _, action := range snapshot.Actions {
+		if action.ID == "morning" && action.Target == 2 {
+			return
+		}
+	}
+	t.Fatalf("profile required action did not target Profiles: %+v", snapshot.Actions)
+}

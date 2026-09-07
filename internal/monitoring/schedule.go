@@ -42,6 +42,20 @@ func NextRunAfter(profile store.Profile, last time.Time) time.Time {
 	return last.Add(interval)
 }
 
+// LatestRunStart returns the latest valid start time from durable observation
+// history. The watch loop and status view use the same rule for completed,
+// failed, cancelled, conflicting, stale, and running attempts.
+func LatestRunStart(runs []store.ObservationRun) (time.Time, bool) {
+	latest := time.Time{}
+	for _, run := range runs {
+		parsed, err := time.Parse(time.RFC3339Nano, run.StartedAt)
+		if err == nil && parsed.After(latest) {
+			latest = parsed
+		}
+	}
+	return latest, !latest.IsZero()
+}
+
 // DueProfiles filters enabled profiles to those due at now. lastRuns maps a
 // profile id to its last known start time; missing entries mean never run.
 func DueProfiles(profiles []store.Profile, lastRuns map[string]time.Time, now time.Time) []store.Profile {
