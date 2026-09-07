@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
+	"github.com/poppyseedcake/MedAlert/internal/telegram"
 )
 
 // Config selects the durable application resources used by the application
@@ -97,11 +99,21 @@ func ErrorInfo(err error) (string, string) {
 	if errors.As(err, &medicoverErr) {
 		return medicoverErr.Code, medicoverErr.Message
 	}
+	var telegramErr *telegram.Error
+	if errors.As(err, &telegramErr) {
+		return telegramErr.Code, telegramErr.Message
+	}
 	switch {
 	case errors.Is(err, store.ErrProfileNotFound):
 		return "profile_not_found", err.Error()
 	case errors.Is(err, store.ErrAccountNotFound):
 		return "account_not_found", err.Error()
+	case errors.Is(err, store.ErrDestinationExists):
+		return "destination_exists", err.Error()
+	case errors.Is(err, store.ErrDestinationNotFound):
+		return "destination_not_found", err.Error()
+	case errors.Is(err, store.ErrDestinationInvalid), errors.Is(err, store.ErrProfileInvalid):
+		return "invalid_arguments", err.Error()
 	case errors.Is(err, store.ErrProfileDisabled):
 		return "profile_disabled", err.Error()
 	case errors.Is(err, store.ErrObservationRunActive):
@@ -114,6 +126,8 @@ func ErrorInfo(err error) (string, string) {
 		return "invalid_arguments", err.Error()
 	case errors.Is(err, secrets.ErrMissingInput):
 		return "missing_input", err.Error()
+	case errors.Is(err, secrets.ErrSecretNotFound), errors.Is(err, secrets.ErrSecretUnsafe):
+		return "secret_error", "cannot access the required secret"
 	case errors.Is(err, context.Canceled):
 		return "cancelled", "operation was cancelled"
 	case errors.Is(err, context.DeadlineExceeded):
@@ -123,8 +137,8 @@ func ErrorInfo(err error) (string, string) {
 }
 
 // Profile applies a profile configuration action through the application
-// boundary. Telegram links are managed by the command adapter and are not
-// part of the profile form in the Polish TUI.
+// boundary. Telegram links are managed by Telegram actions and are not part
+// of the profile form in the Polish TUI.
 func (a *Application) Profile(ctx context.Context, request ProfileRequest) (store.Profile, error) {
 	ctx = contextOrBackground(ctx)
 	if err := ctx.Err(); err != nil {
@@ -183,15 +197,31 @@ func (a *Application) Profile(ctx context.Context, request ProfileRequest) (stor
 
 // Snapshot is the display-safe application state used by the Polish TUI.
 type Snapshot struct {
-	Accounts      []Row
-	Profiles      []Row
-	Destinations  []Row
-	Monitoring    []Row
-	Runs          []Row
-	History       []Row
-	Actions       []Row
-	ProfileValues map[string]ProfileValues
-	Summary       string
+	Accounts          []Row
+	Profiles          []Row
+	Destinations      []Row
+	Monitoring        []Row
+	Runs              []Row
+	History           []Row
+	Actions           []Row
+	ProfileValues     map[string]ProfileValues
+	DestinationValues map[string]DestinationValues
+	Summary           string
+}
+
+// DestinationValues contains safe Telegram values used by the Polish TUI.
+// It never contains a bot token. TokenFile is a path to an approved secret
+// file, not the file contents.
+type DestinationValues struct {
+	Name           string
+	ChatID         string
+	TokenFile      string
+	TokenSource    string
+	LinkedProfiles []string
+	LastTestAt     string
+	LastTestStatus string
+	LastTestError  string
+	Enabled        bool
 }
 
 type accountStatus struct {
@@ -211,6 +241,7 @@ type statusData struct {
 	Accounts              []accountStatus
 	Profiles              []store.Profile
 	Destinations          []store.Destination
+	DestinationProfiles   map[string][]string
 	ActiveIncidents       []store.Incident
 	PermanentFailures     []store.Delivery
 	OperationalDeliveries []store.IncidentDelivery
@@ -224,6 +255,7 @@ func (a *Application) Snapshot(ctx context.Context, prune bool) (Snapshot, error
 	var snapshot Snapshot
 	ctx = contextOrBackground(ctx)
 	snapshot.ProfileValues = map[string]ProfileValues{}
+	snapshot.DestinationValues = map[string]DestinationValues{}
 	if err := ctx.Err(); err != nil {
 		return snapshot, err
 	}
@@ -260,12 +292,14 @@ func (a *Application) Snapshot(ctx context.Context, prune bool) (Snapshot, error
 
 	for _, action := range status.RequiredActions {
 		label := map[string]string{
-			"authentication_required": "Zaloguj konto",
-			"profile_disabled":        "Profil wyłączony",
-			"destination_disabled":    "Telegram wyłączony",
-			"active_incident":         "Sprawdź aktywny problem",
-			"permanent_failure":       "Sprawdź błąd dostarczenia",
-			"invalid_retention":       "Sprawdź okres historii",
+			"authentication_required":      "Zaloguj konto",
+			"profile_disabled":             "Profil wyłączony",
+			"destination_disabled":         "Telegram wyłączony",
+			"destination_test_failure":     "Sprawdź Telegram",
+			"destination_delivery_failure": "Sprawdź Telegram",
+			"active_incident":              "Sprawdź aktywny problem",
+			"permanent_failure":            "Sprawdź błąd dostarczenia",
+			"invalid_retention":            "Sprawdź okres historii",
 		}[action.Code]
 		if label == "" {
 			label = "Sprawdź stan"
@@ -332,38 +366,78 @@ func (a *Application) Snapshot(ctx context.Context, prune bool) (Snapshot, error
 		if !destination.Enabled {
 			state = "— wyłączony"
 		}
+		linkedProfiles := append([]string(nil), status.DestinationProfiles[destination.ID]...)
+		values := destinationValues(destination, linkedProfiles)
+		snapshot.DestinationValues[destination.ID] = values
 		snapshot.Destinations = append(snapshot.Destinations, Row{
 			ID:     destination.ID,
 			Label:  destination.Name + " — " + state,
-			Detail: "Dane tokenu są ukryte.",
+			Detail: destinationDetail(values),
 		})
 	}
+
 	runs, err := storage.ListRecentObservationRuns(100)
 	if err != nil {
 		return snapshot, err
 	}
+	episodes, err := storage.ListRecentEpisodes("", false, 100)
+	if err != nil {
+		return snapshot, err
+	}
+	incidents, err := storage.ListIncidents("", "", 100)
+	if err != nil {
+		return snapshot, err
+	}
+	deliveries, err := storage.ListRecentDeliveries("", "", 100)
+	if err != nil {
+		return snapshot, err
+	}
+	incidentDeliveries, err := storage.ListRecentIncidentDeliveries("", 100)
+	if err != nil {
+		return snapshot, err
+	}
+
+	type historyItem struct {
+		at  time.Time
+		row Row
+	}
+	items := make([]historyItem, 0, len(runs)+len(episodes)+len(incidents)+len(deliveries)+len(incidentDeliveries)+len(status.Destinations))
 	for _, run := range runs {
-		state := map[string]string{
-			"running": "w toku", "complete": "ukończony", "failed": "błąd",
-			"partial": "częściowy", "cancelled": "anulowany", "conflicting": "konflikt", "stale": "nieaktualny",
-		}[run.Status]
-		row := Row{ID: run.ID, Label: run.ProfileID + " — " + state, Detail: run.StartedAt}
+		row := historyRunRow(run)
 		snapshot.Runs = append(snapshot.Runs, row)
-		snapshot.History = append(snapshot.History, row)
+		items = append(items, historyItem{at: parseHistoryTime(run.StartedAt), row: row})
 	}
-	for _, delivery := range status.PermanentFailures {
-		snapshot.History = append(snapshot.History, Row{
-			ID:     delivery.ID,
-			Label:  delivery.ProfileID + " — trwały błąd dostarczenia",
-			Detail: fmt.Sprintf("Telegram: %s · Próby: %d · Utworzono: %s", delivery.DestinationID, delivery.Attempts, delivery.CreatedAt),
-		})
+	for _, episode := range episodes {
+		row := historyEpisodeRow(episode)
+		items = append(items, historyItem{at: parseHistoryTime(episode.StartedAt), row: row})
 	}
-	for _, delivery := range status.OperationalDeliveries {
-		snapshot.History = append(snapshot.History, Row{
-			ID:     delivery.ID,
-			Label:  "Operacyjne dostarczenie — trwały błąd",
-			Detail: fmt.Sprintf("Incydent: %s · Telegram: %s · Typ: %s · Próby: %d · Utworzono: %s", delivery.IncidentID, delivery.DestinationID, delivery.Kind, delivery.Attempts, delivery.CreatedAt),
-		})
+	for _, incident := range incidents {
+		row := historyIncidentRow(incident)
+		items = append(items, historyItem{at: parseHistoryTime(incident.LastSeenAt), row: row})
+	}
+	for _, delivery := range deliveries {
+		row := historyDeliveryRow(delivery)
+		items = append(items, historyItem{at: parseHistoryTime(delivery.CreatedAt), row: row})
+	}
+	for _, delivery := range incidentDeliveries {
+		row := historyIncidentDeliveryRow(delivery)
+		items = append(items, historyItem{at: parseHistoryTime(delivery.CreatedAt), row: row})
+	}
+	for _, destination := range status.Destinations {
+		if strings.TrimSpace(destination.LastTestAt) == "" || strings.TrimSpace(destination.LastTestStatus) == "" {
+			continue
+		}
+		row := historyDestinationTestRow(destination)
+		items = append(items, historyItem{at: parseHistoryTime(destination.LastTestAt), row: row})
+	}
+	sort.SliceStable(items, func(left, right int) bool {
+		if items[left].at.Equal(items[right].at) {
+			return items[left].row.ID > items[right].row.ID
+		}
+		return items[left].at.After(items[right].at)
+	})
+	for _, item := range items {
+		snapshot.History = append(snapshot.History, item.row)
 	}
 	paused := 0
 	for _, profile := range status.Profiles {
@@ -373,6 +447,197 @@ func (a *Application) Snapshot(ctx context.Context, prune bool) (Snapshot, error
 	}
 	snapshot.Summary = fmt.Sprintf("Konta: %d · Profile: %d · Wstrzymane: %d · Problemy: %d", len(snapshot.Accounts), len(snapshot.Profiles), paused, len(status.ActiveIncidents))
 	return snapshot, nil
+}
+
+func destinationValues(destination store.Destination, linkedProfiles []string) DestinationValues {
+	values := DestinationValues{
+		Name:           destination.Name,
+		ChatID:         destination.ChatID,
+		TokenSource:    destination.TokenSource,
+		LinkedProfiles: append([]string(nil), linkedProfiles...),
+		LastTestAt:     destination.LastTestAt,
+		LastTestStatus: destination.LastTestStatus,
+		LastTestError:  destination.LastTestError,
+		Enabled:        destination.Enabled,
+	}
+	if destination.TokenSource == store.TokenSourceFile {
+		values.TokenFile = destination.TokenRef
+	}
+	return values
+}
+
+func destinationDetail(values DestinationValues) string {
+	token := "Token: magazyn sekretów"
+	switch values.TokenSource {
+	case store.TokenSourceFile:
+		token = "Token: plik " + values.TokenFile
+	case store.TokenSourcePrompt:
+		token = "Token: pytaj przy wysyłce"
+	}
+	profiles := "Profile: brak"
+	if len(values.LinkedProfiles) > 0 {
+		profiles = "Profile: " + strings.Join(values.LinkedProfiles, ", ")
+	}
+	detail := fmt.Sprintf("Chat: %s · %s · %s", values.ChatID, token, profiles)
+	if values.LastTestStatus != "" {
+		detail += fmt.Sprintf(" · Ostatni test: %s", historyDeliveryStatus(values.LastTestStatus))
+		if values.LastTestError != "" {
+			detail += " — " + values.LastTestError
+		}
+	}
+	return detail
+}
+
+func historyRunRow(run store.ObservationRun) Row {
+	state := map[string]string{
+		store.ObservationRunRunning:     "w toku",
+		store.ObservationRunComplete:    "ukończony",
+		store.ObservationRunFailed:      "błąd",
+		store.ObservationRunPartial:     "częściowy",
+		store.ObservationRunCancelled:   "anulowany",
+		store.ObservationRunConflicting: "konflikt",
+		store.ObservationRunStale:       "nieaktualny",
+	}[run.Status]
+	if state == "" {
+		state = run.Status
+	}
+	detail := fmt.Sprintf("Profil: %s · Start: %s", run.ProfileID, run.StartedAt)
+	if run.CompletedAt != "" {
+		detail += " · Koniec: " + run.CompletedAt
+	}
+	if run.Status == store.ObservationRunComplete {
+		detail += fmt.Sprintf(" · Terminów: %d", run.SlotCount)
+	}
+	if run.ErrorCode != "" {
+		detail += " · Błąd: " + run.ErrorCode
+	}
+	if run.ErrorMessage != "" {
+		detail += " — " + run.ErrorMessage
+	}
+	return Row{ID: run.ID, Label: fmt.Sprintf("Przebieg %s — %s (%s)", run.ProfileID, state, run.Status), Detail: detail}
+}
+
+func historyEpisodeRow(episode store.AvailabilityEpisode) Row {
+	state := "zakończona"
+	status := "ended"
+	if episode.Active {
+		state = "aktywna"
+		status = "active"
+	}
+	detail := fmt.Sprintf("Profil: %s · Czas: %s · Lekarz: %s · Specjalizacja: %s · Placówka: %s · Typ wizyty: %s · Start: %s",
+		episode.ProfileID, displayValue(episode.Time), displayValue(episode.Doctor), displayValue(episode.Specialty), displayValue(episode.Clinic), displayValue(episode.VisitType), episode.StartedAt)
+	if episode.EndedAt != "" {
+		detail += " · Koniec: " + episode.EndedAt
+	}
+	return Row{ID: episode.ID, Label: fmt.Sprintf("Dostępność %s — %s (%s)", episode.ProfileID, state, status), Detail: detail}
+}
+
+func historyIncidentRow(incident store.Incident) Row {
+	state := "aktywny"
+	if incident.Status == store.IncidentStatusResolved {
+		state = "rozwiązany"
+	}
+	detail := fmt.Sprintf("Zakres: %s %s · Błąd: %s · Kolejne błędy: %d · Start: %s · Ostatnio: %s",
+		incidentScopeLabel(incident.ScopeType), incident.ScopeID, incident.FailureCode, incident.ConsecutiveFailures, incident.FirstSeenAt, incident.LastSeenAt)
+	if incident.AccountID != "" {
+		detail += " · Konto: " + incident.AccountID
+	}
+	if incident.ProfileID != "" {
+		detail += " · Profil: " + incident.ProfileID
+	}
+	if incident.DestinationID != "" {
+		detail += " · Telegram: " + incident.DestinationID
+	}
+	if incident.FailureMessage != "" {
+		detail += " — " + incident.FailureMessage
+	}
+	return Row{ID: incident.ID, Label: fmt.Sprintf("Incydent %s %s — %s (%s)", incidentScopeLabel(incident.ScopeType), incident.ScopeID, state, incident.Status), Detail: detail}
+}
+
+func historyDeliveryRow(delivery store.Delivery) Row {
+	status := historyDeliveryRowStatus(delivery.Status, delivery.LastError)
+	detail := fmt.Sprintf("Profil: %s · Epizod: %s · Telegram: %s · Próby: %d · Utworzono: %s · Zmieniono: %s",
+		delivery.ProfileID, delivery.EpisodeID, delivery.DestinationID, delivery.Attempts, delivery.CreatedAt, delivery.UpdatedAt)
+	if delivery.NextAttemptAt != "" {
+		detail += " · Następna próba: " + delivery.NextAttemptAt
+	}
+	if delivery.DeliveredAt != "" {
+		detail += " · Dostarczono: " + delivery.DeliveredAt
+	}
+	if delivery.LastError != "" {
+		detail += " · Błąd: " + delivery.LastError
+	}
+	return Row{ID: delivery.ID, Label: fmt.Sprintf("Dostarczenie Telegram — %s — %s (%s)", delivery.ProfileID, status, delivery.Status), Detail: detail}
+}
+
+func historyIncidentDeliveryRow(delivery store.IncidentDelivery) Row {
+	status := historyDeliveryRowStatus(delivery.Status, delivery.LastError)
+	detail := fmt.Sprintf("Incydent: %s · Telegram: %s · Typ: %s · Próby: %d · Utworzono: %s · Zmieniono: %s",
+		delivery.IncidentID, delivery.DestinationID, delivery.Kind, delivery.Attempts, delivery.CreatedAt, delivery.UpdatedAt)
+	if delivery.NextAttemptAt != "" {
+		detail += " · Następna próba: " + delivery.NextAttemptAt
+	}
+	if delivery.DeliveredAt != "" {
+		detail += " · Dostarczono: " + delivery.DeliveredAt
+	}
+	if delivery.LastError != "" {
+		detail += " · Błąd: " + delivery.LastError
+	}
+	return Row{ID: delivery.ID, Label: fmt.Sprintf("Powiadomienie incydentu — %s — %s (%s)", delivery.Kind, status, delivery.Status), Detail: detail}
+}
+
+func historyDestinationTestRow(destination store.Destination) Row {
+	detail := fmt.Sprintf("Cel: %s · Chat: %s · Próba: %s", destination.ID, destination.ChatID, destination.LastTestAt)
+	if destination.LastTestError != "" {
+		detail += " · " + destination.LastTestError
+	}
+	return Row{ID: "test:" + destination.ID, Label: fmt.Sprintf("Test Telegram — %s — %s (%s)", destination.Name, historyDeliveryStatus(destination.LastTestStatus), destination.LastTestStatus), Detail: detail}
+}
+
+func historyDeliveryStatus(status string) string {
+	labels := map[string]string{
+		store.DeliveryPending:          "oczekuje",
+		store.DeliveryDelivered:        "dostarczone",
+		store.DeliveryRetry:            "ponowienie",
+		store.DeliveryPermanentFailure: "trwały błąd",
+		"unknown_delivery":             "nieznany wynik",
+		"temporary_failure":            "błąd tymczasowy",
+		"rate_limited":                 "limit zapytań",
+		"cancelled":                    "anulowane",
+		"timeout":                      "przekroczony czas",
+	}
+	if label := labels[status]; label != "" {
+		return label
+	}
+	return status
+}
+
+func historyDeliveryRowStatus(status, message string) string {
+	if status == store.DeliveryPermanentFailure && isNonDeliveryPermanentFailure(message) {
+		return "anulowane"
+	}
+	return historyDeliveryStatus(status)
+}
+
+func isNonDeliveryPermanentFailure(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, "slot is no longer available") ||
+		strings.Contains(message, "incident ended before failure was delivered")
+}
+
+func displayValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "—"
+	}
+	return value
+}
+
+func parseHistoryTime(value string) time.Time {
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }
 
 func (a *Application) readStatus(storage *store.Store) (statusData, error) {
@@ -404,9 +669,17 @@ func (a *Application) readStatus(storage *store.Store) (statusData, error) {
 	if err != nil {
 		return data, err
 	}
+	data.DestinationProfiles = map[string][]string{}
 	for _, profile := range data.Profiles {
 		if !profile.Enabled {
 			data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "profile_disabled", Scope: "profile", ID: profile.ID})
+		}
+		linked, linkErr := storage.ListProfileDestinationIDs(profile.ID)
+		if linkErr != nil {
+			return data, linkErr
+		}
+		for _, destinationID := range linked {
+			data.DestinationProfiles[destinationID] = append(data.DestinationProfiles[destinationID], profile.ID)
 		}
 	}
 	data.Destinations, err = storage.ListDestinations()
@@ -416,6 +689,9 @@ func (a *Application) readStatus(storage *store.Store) (statusData, error) {
 	for _, destination := range data.Destinations {
 		if !destination.Enabled {
 			data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "destination_disabled", Scope: "destination", ID: destination.ID})
+		}
+		if destination.LastTestStatus == store.DeliveryPermanentFailure {
+			data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "destination_test_failure", Scope: "destination", ID: destination.ID})
 		}
 	}
 	data.ActiveIncidents, err = storage.ListIncidents(store.IncidentStatusActive, "", 1000)
@@ -441,15 +717,34 @@ func (a *Application) readStatus(storage *store.Store) (statusData, error) {
 	if err != nil {
 		return data, err
 	}
+	destinationFailures := map[string]struct{}{}
 	for _, delivery := range data.PermanentFailures {
+		if isNonDeliveryPermanentFailure(delivery.LastError) {
+			continue
+		}
 		data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "permanent_failure", Scope: "delivery", ID: delivery.ID})
+		if destinationID := strings.TrimSpace(delivery.DestinationID); destinationID != "" {
+			if _, seen := destinationFailures[destinationID]; !seen {
+				data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "destination_delivery_failure", Scope: "destination", ID: destinationID})
+				destinationFailures[destinationID] = struct{}{}
+			}
+		}
 	}
 	data.OperationalDeliveries, err = storage.ListRecentIncidentDeliveriesByStatus("", store.DeliveryPermanentFailure, 1000)
 	if err != nil {
 		return data, err
 	}
 	for _, delivery := range data.OperationalDeliveries {
+		if isNonDeliveryPermanentFailure(delivery.LastError) {
+			continue
+		}
 		data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "permanent_failure", Scope: "operational_delivery", ID: delivery.ID})
+		if destinationID := strings.TrimSpace(delivery.DestinationID); destinationID != "" {
+			if _, seen := destinationFailures[destinationID]; !seen {
+				data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "destination_delivery_failure", Scope: "destination", ID: destinationID})
+				destinationFailures[destinationID] = struct{}{}
+			}
+		}
 	}
 	if _, err := storage.GetHistoryRetentionDays(); err != nil && errors.Is(err, store.ErrHistoryInvalid) {
 		data.RequiredActions = append(data.RequiredActions, requiredAction{Code: "invalid_retention", Scope: "history", ID: "retention"})

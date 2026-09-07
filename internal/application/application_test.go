@@ -99,6 +99,96 @@ func TestProfileCancellationDoesNotCommitBlockedCreate(t *testing.T) {
 	}
 }
 
+func TestTelegramTestCancellationDoesNotRecordFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(store.Destination{
+		ID: "phone", Name: "Phone", ChatID: "123", TokenSource: store.TokenSourcePrompt, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = application.New(application.Config{Database: databasePath}).Telegram(ctx, application.TelegramRequest{
+		Action: "test", ID: "phone",
+	}, func(promptContext context.Context, _ string) (string, error) {
+		cancel()
+		return "", promptContext.Err()
+	})
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("telegram test cancellation error = %v, want context.Canceled", err)
+	}
+
+	storage, err = store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	destination, err := storage.GetDestination("phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if destination.LastTestStatus != "" || destination.LastTestAt != "" {
+		t.Fatalf("cancelled telegram test recorded result: %#v", destination)
+	}
+}
+
+func TestTelegramMetadataEditKeepsAnUnchangedFileReference(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	tokenFile := filepath.Join(root, "telegram-token")
+	if err := os.WriteFile(tokenFile, []byte("token-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(store.Destination{
+		ID: "phone", Name: "Phone", ChatID: "123", TokenSource: store.TokenSourceFile, TokenRef: tokenFile, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := application.New(application.Config{Database: databasePath}).Telegram(context.Background(), application.TelegramRequest{
+		Action: "edit", ID: "phone", Values: application.DestinationValues{Name: "Home phone", ChatID: "456", TokenFile: tokenFile},
+	}, nil)
+	if err != nil {
+		t.Fatalf("metadata edit with unavailable unchanged file: %v", err)
+	}
+	if updated.Name != "Home phone" || updated.ChatID != "456" || updated.TokenSource != store.TokenSourceFile || updated.TokenRef != tokenFile {
+		t.Fatalf("updated destination = %#v", updated)
+	}
+}
+
 func openApplicationTestDatabase(path string) (*sql.DB, error) {
 	location := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=rw&_busy_timeout=5000"}
 	database, err := sql.Open("sqlite", location.String())

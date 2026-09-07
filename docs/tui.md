@@ -8,7 +8,8 @@ Closing the interface does not start or stop `medalert watch`.
 Without a terminal, a missing command returns exit code 2. The same rule applies
 with `--non-interactive` or `--output json`. Explicit commands keep their English
 text and JSON output. Use `--database` or `MEDALERT_DATABASE` to select a database.
-The existing session directory and Medicover endpoint settings also apply.
+The existing session directory, Medicover endpoint, and Telegram endpoint
+settings also apply.
 
 ## Screen size and keyboard
 
@@ -71,6 +72,28 @@ are shown in Polish and the profile form keeps its values after a failed save.
 Deleting a profile also deletes its observation history. Disabling a profile
 pauses its monitoring state without deleting its configuration or history.
 
+## Telegram
+
+In `Telegram`, use `A` to create, `E` to edit, `P` to enable or disable, `T` to
+send a test message, `S` to replace a Secret Service token, `L` to replace the
+linked profiles, and `D` to delete the selected destination. A destination can
+serve more than one profile. An empty profile list removes all profile links.
+
+A new destination uses the Secret Service by default. The token prompt is
+hidden. A token file can be selected instead; the interface stores and shows
+only the file path. The bot token is never shown after it is saved and never
+crosses the TUI display boundary. Test results, permanent failures, and the
+affected destination ID are shown in Polish.
+
+## History
+
+`Historia` combines observation runs, run failures, active and ended
+availability episodes, incidents, Telegram delivery attempts, incident
+delivery attempts, and recovery notifications. Each row includes the related
+profile, account, destination, or incident where that data exists. The
+status-first screen links required actions to the matching account, profile,
+Telegram destination, delivery, or history row.
+
 ## Monitoring
 
 `Monitoring` shows each profile's enabled work, its next planned run, profiles
@@ -83,19 +106,22 @@ and notifications.
 ## Implementation and tests
 
 `internal/tui` owns screen state and keyboard behavior. The
-`internal/application` service owns profile actions, checks, and the safe
-monitoring query. `internal/cli/tui.go` maps TUI requests to that service and
-supplies only display data to the model. It does not send command output or
-raw errors to the terminal. The Medicover module owns the MFA challenge and
-accepts an optional input callback.
+`internal/application` service owns profile actions, Telegram destination
+actions, checks, history queries, and safe display data. `internal/cli/tui.go`
+maps TUI requests to that service and supplies only display data to the model.
+It does not send command output or raw errors to the terminal. The Medicover
+module owns the MFA challenge and the Telegram module owns direct Bot API
+calls.
 
 State tests use real SQLite files and a local Medicover test server. They cover
 account changes, profile creation and editing, dry and durable checks, profile
 pauses, required-action navigation, password and MFA input, session reuse,
-account isolation, confirmation, cancellation, input correction, and secret
-redaction. One test runs the built executable through a pseudo-terminal. It
-also checks resizing, help, alternate-screen cleanup, and secret markers in all
-captured output.
+account isolation, confirmation, cancellation, input correction, Telegram
+destination changes, test delivery, history inspection, incident recovery,
+hidden Telegram token input, and secret redaction. One test runs the built
+executable through a pseudo-terminal. It also checks Polish output, form focus,
+Telegram test delivery, resizing, help, alternate-screen cleanup, and secret
+markers in all captured output.
 
 Design source: [accepted status-first prototype](https://github.com/poppyseedcake/MedAlert/issues/9#issuecomment-5496941266).
-Scope: [issue #33](https://github.com/poppyseedcake/MedAlert/issues/33).
+Scope: [issue #34](https://github.com/poppyseedcake/MedAlert/issues/34).

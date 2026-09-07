@@ -2,7 +2,10 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,8 +13,10 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/poppyseedcake/MedAlert/internal/tui"
+	"github.com/zalando/go-keyring"
 )
 
 // This driver sends keyboard events through the public TUI state boundary.
@@ -576,4 +581,325 @@ func TestTerminalSnapshotShowsMonitoringPausesAndProblems(t *testing.T) {
 		}
 	}
 	t.Fatalf("profile required action did not target Profiles: %+v", snapshot.Actions)
+}
+
+func TestTerminalSnapshotShowsCompletePolishHistory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{
+		ID: "home", Username: "patient@example.com", PasswordSource: store.PasswordSourcePrompt,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(store.Destination{
+		ID: "phone", Name: "Telefon", ChatID: "123", TokenSource: store.TokenSourcePrompt, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateProfile(store.Profile{
+		ID: "morning", AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132",
+		SearchType: store.SearchTypeStandard, CheckIntervalMinutes: 30, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("morning", []string{"phone"}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	runAt := time.Now().UTC().Add(-2 * time.Hour)
+	run, err := storage.BeginObservationRun("morning", runAt)
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.ReconcileObservationRun(run.ID, []store.ObservationSlot{{
+		Identity: "slot-1", StableIdentity: "slot-1", Time: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
+		Doctor: "Dr Kowalski", Specialty: "Kardiologia", Clinic: "Centrum", VisitType: "Standard",
+	}}, runAt.Add(time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	episodes, err := storage.ListAvailabilityEpisodes("morning")
+	if err != nil || len(episodes) != 1 {
+		storage.Close()
+		t.Fatalf("episodes = %#v, err=%v", episodes, err)
+	}
+	if _, err := storage.EnsureEpisodeDeliveries("morning", episodes[0].ID, runAt.Add(time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	deliveries, err := storage.ListDeliveriesForProfile("morning")
+	if err != nil || len(deliveries) != 1 {
+		storage.Close()
+		t.Fatalf("deliveries = %#v, err=%v", deliveries, err)
+	}
+	claimedDelivery, err := storage.BeginDeliveryAttempt(deliveries[0].ID, runAt.Add(2*time.Minute))
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.RecordDeliveryResult(claimedDelivery.ID, claimedDelivery, store.DeliveryResult{
+		Status: store.DeliveryPermanentFailure, LastError: "permanent_failure: chat not found",
+	}, runAt.Add(3*time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, _, _, err := storage.RecordIncidentFailure(
+		store.IncidentScopeProfile, "morning", "home", "morning", "", "protocol_changed", "portal changed", runAt, []string{"phone"},
+	); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	incidents, err := storage.ListIncidents(store.IncidentStatusActive, "", 10)
+	if err != nil || len(incidents) != 1 {
+		storage.Close()
+		t.Fatalf("incidents = %#v, err=%v", incidents, err)
+	}
+	incidentDeliveries, err := storage.ListIncidentDeliveries(incidents[0].ID)
+	if err != nil || len(incidentDeliveries) != 1 {
+		storage.Close()
+		t.Fatalf("incident deliveries = %#v, err=%v", incidentDeliveries, err)
+	}
+	claimed, err := storage.BeginIncidentDeliveryAttempt(incidentDeliveries[0].ID, runAt.Add(2*time.Minute))
+	if err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: 7}, runAt.Add(3*time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, _, _, err := storage.ResolveIncident(store.IncidentScopeProfile, "morning", "morning", "", runAt.Add(4*time.Minute)); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := terminalSnapshot(options{database: database, sessionDir: filepath.Join(root, "sessions")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var history strings.Builder
+	for _, row := range snapshot.History {
+		history.WriteString(row.Label)
+		history.WriteByte(' ')
+		history.WriteString(row.Detail)
+		history.WriteByte('\n')
+	}
+	view := history.String()
+	for _, want := range []string{"Przebieg", "Dostępność", "Incydent", "Dostarczenie Telegram", "Powiadomienie incydentu", "Kardiologia", "protocol_changed", "recovery"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("history misses %q: %s", want, view)
+		}
+	}
+	foundDestinationAction := false
+	for _, action := range snapshot.Actions {
+		if action.ID == "phone" && action.Target == 3 {
+			foundDestinationAction = true
+		}
+	}
+	if !foundDestinationAction {
+		t.Fatalf("permanent delivery did not target Telegram destination: %#v", snapshot.Actions)
+	}
+}
+
+func TestTerminalTelegramActionsUseSafeApplicationFlow(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateAccount(store.Account{ID: "home", Username: "patient@example.com", PasswordSource: store.PasswordSourcePrompt}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateProfile(store.Profile{
+		ID: "morning", AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132",
+		SearchType: store.SearchTypeStandard, CheckIntervalMinutes: 30, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tokenMarker := "TUI_TELEGRAM_TOKEN_MARKER_34"
+	tokenFile := filepath.Join(root, "token")
+	if err := os.WriteFile(tokenFile, []byte(tokenMarker+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{"message_id": 34}})
+	}))
+	defer server.Close()
+	settings := options{database: database, sessionDir: filepath.Join(root, "sessions"), telegramBaseURL: server.URL}
+
+	result := terminalAction(context.Background(), settings, tui.Request{
+		Action: "telegram-create", ID: "phone",
+		Destination: tui.DestinationValues{Name: "Telefon", ChatID: "123", TokenFile: tokenFile},
+	}, nil)
+	if result.Failed {
+		t.Fatalf("create result = %+v", result)
+	}
+	if len(result.Snapshot.Destinations) != 1 || !strings.Contains(result.Snapshot.Destinations[0].Label, "Telefon") {
+		t.Fatalf("created destinations = %#v", result.Snapshot.Destinations)
+	}
+
+	result = terminalAction(context.Background(), settings, tui.Request{
+		Action: "telegram-link", ID: "phone",
+		Destination: tui.DestinationValues{LinkedProfiles: "morning"},
+	}, nil)
+	if result.Failed {
+		t.Fatalf("link result = %+v", result)
+	}
+	if got := result.Snapshot.DestinationValues["phone"].LinkedProfiles; got != "morning" {
+		t.Fatalf("linked profiles = %q, want morning", got)
+	}
+
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "telegram-test", ID: "phone"}, nil)
+	if result.Failed || !strings.Contains(result.Message, "test") && !strings.Contains(result.Message, "testową") {
+		t.Fatalf("test result = %+v", result)
+	}
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "telegram-disable", ID: "phone"}, nil)
+	if result.Failed || result.Snapshot.DestinationValues["phone"].Enabled {
+		t.Fatalf("disable result = %+v", result)
+	}
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "telegram-enable", ID: "phone"}, nil)
+	if result.Failed || !result.Snapshot.DestinationValues["phone"].Enabled {
+		t.Fatalf("enable result = %+v", result)
+	}
+	result = terminalAction(context.Background(), settings, tui.Request{
+		Action: "telegram-edit", ID: "phone",
+		Destination: tui.DestinationValues{Name: "Telefon domowy", ChatID: "456"},
+	}, nil)
+	if result.Failed || !strings.Contains(result.Snapshot.Destinations[0].Label, "Telefon domowy") {
+		t.Fatalf("edit result = %+v", result)
+	}
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "telegram-delete", ID: "phone"}, nil)
+	if result.Failed || len(result.Snapshot.Destinations) != 0 {
+		t.Fatalf("delete result = %+v", result)
+	}
+
+	if strings.Contains(result.Message, tokenMarker) {
+		t.Fatal("telegram token leaked in TUI result")
+	}
+}
+
+func TestTerminalTelegramPromptKeepsTokenHidden(t *testing.T) {
+	keyring.MockInit()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	d := newTerminalDriver(t, options{database: database, sessionDir: filepath.Join(root, "sessions")})
+	d.text("4")
+	d.text("a")
+	d.text("phone")
+	d.press(tea.KeyTab)
+	d.text("Telefon")
+	d.press(tea.KeyTab)
+	d.text("123")
+	d.press(tea.KeyTab)
+	d.press(tea.KeyTab)
+	d.press(tea.KeyEnter)
+	d.until("Podaj token bota Telegram")
+	tokenMarker := "TUI_HIDDEN_TELEGRAM_TOKEN_MARKER_34"
+	d.text(tokenMarker)
+	if strings.Contains(d.model.View(), tokenMarker) {
+		t.Fatal("telegram token visible while entering it")
+	}
+	d.press(tea.KeyEnter)
+	d.until("Zapisano cel Telegram.")
+	if strings.Contains(d.model.View(), tokenMarker) {
+		t.Fatal("telegram token leaked after it was saved")
+	}
+	stored, err := secrets.GetTelegramToken("phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored != tokenMarker {
+		t.Fatalf("stored telegram token = %q, want marker", stored)
+	}
+}
+
+func TestTerminalTelegramPermanentFailurePointsToDestination(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(database); err != nil {
+		t.Fatal(err)
+	}
+	tokenMarker := "TUI_PERMANENT_TELEGRAM_TOKEN_MARKER_34"
+	tokenFile := filepath.Join(root, "telegram-token")
+	if err := os.WriteFile(tokenFile, []byte(tokenMarker+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`))
+	}))
+	defer server.Close()
+	settings := options{database: database, sessionDir: filepath.Join(root, "sessions"), telegramBaseURL: server.URL}
+	result := terminalAction(context.Background(), settings, tui.Request{
+		Action: "telegram-create", ID: "phone",
+		Destination: tui.DestinationValues{Name: "Telefon", ChatID: "123", TokenFile: tokenFile},
+	}, nil)
+	if result.Failed {
+		t.Fatalf("create result = %+v", result)
+	}
+	result = terminalAction(context.Background(), settings, tui.Request{Action: "telegram-test", ID: "phone"}, nil)
+	if !result.Failed || !strings.Contains(result.Message, "phone") || !strings.Contains(result.Message, "Trwały błąd") {
+		t.Fatalf("permanent failure result = %+v", result)
+	}
+	if strings.Contains(result.Message, tokenMarker) {
+		t.Fatal("telegram token leaked in permanent failure")
+	}
+	snapshot, err := terminalSnapshot(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshot.DestinationValues["phone"].LastTestStatus; got != store.DeliveryPermanentFailure {
+		t.Fatalf("last test status = %q, want %q", got, store.DeliveryPermanentFailure)
+	}
+	foundAction := false
+	for _, row := range snapshot.Actions {
+		if row.ID == "phone" && row.Target == 3 {
+			foundAction = true
+		}
+	}
+	if !foundAction {
+		t.Fatalf("missing destination action: %#v", snapshot.Actions)
+	}
+	if strings.Contains(snapshot.Destinations[0].Detail, tokenMarker) {
+		t.Fatal("telegram token leaked in destination snapshot")
+	}
 }
