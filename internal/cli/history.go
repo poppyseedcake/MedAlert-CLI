@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/poppyseedcake/MedAlert/internal/medicover"
+	"github.com/poppyseedcake/MedAlert/internal/operatorstatus"
 	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 )
@@ -407,115 +407,68 @@ func collectHistoryStatus(storage *store.Store, backend session.Store) (historyS
 }
 
 func collectHistoryStatusForIssuer(storage *store.Store, backend session.Store, medicoverIssuer string) (historyStatusData, error) {
+	status, err := operatorstatus.Read(storage, backend, medicoverIssuer, time.Now().UTC())
+	if err != nil {
+		return historyStatusData{}, err
+	}
 	data := historyStatusData{
-		Accounts:              []historyAccountStatus{},
-		DisabledProfiles:      []historyProfileRef{},
-		DisabledDestinations:  []historyDestRef{},
-		ActiveIncidents:       []store.Incident{},
-		PermanentFailures:     []store.Delivery{},
-		OperationalDeliveries: []store.IncidentDelivery{},
-		RequiredActions:       []historyAction{},
-		Summary:               map[string]int{},
+		Accounts: []historyAccountStatus{}, DisabledProfiles: []historyProfileRef{},
+		DisabledDestinations: []historyDestRef{}, RequiredActions: []historyAction{},
+		ActiveIncidents: status.ActiveIncidents, PermanentFailures: status.PermanentFailures,
+		OperationalDeliveries: status.OperationalDeliveries, RetentionDays: status.RetentionDays,
 	}
-	accounts, err := storage.ListAccounts()
-	if err != nil {
-		return data, err
+	for _, account := range status.Accounts {
+		data.Accounts = append(data.Accounts, historyAccountStatus{
+			ID: account.ID, Username: account.Username, Authenticated: account.Authenticated, AuthRequired: account.AuthRequired,
+		})
 	}
-	for _, account := range accounts {
-		authenticated := true
-		authRequired := false
-		if state, loadErr := backend.Load(account.ID); loadErr != nil {
-			if errors.Is(loadErr, session.ErrNotFound) || errors.Is(loadErr, session.ErrCorrupt) {
-				authenticated = false
-				authRequired = true
-			} else if errors.Is(loadErr, session.ErrUnsafe) {
-				authenticated = false
-			} else {
-				// Secret Service unavailability is temporary: keep the last
-				// known state unknown without marking auth required.
-				authenticated = false
-			}
-		} else if !medicover.HasUsableSessionCookiesForIssuer(state, medicoverIssuer, time.Now().UTC()) {
-			authenticated = false
-			authRequired = true
-		}
-		data.Accounts = append(data.Accounts, historyAccountStatus{ID: account.ID, Username: account.Username, Authenticated: authenticated, AuthRequired: authRequired})
-		if authRequired {
-			data.RequiredActions = append(data.RequiredActions, historyAction{Code: "authentication_required", Scope: "account", ID: account.ID, Message: fmt.Sprintf("account %s requires authentication", account.ID)})
-		}
-	}
-	profiles, err := storage.ListProfiles("")
-	if err != nil {
-		return data, err
-	}
-	for _, profile := range profiles {
+	for _, profile := range status.Profiles {
 		if !profile.Enabled {
 			data.DisabledProfiles = append(data.DisabledProfiles, historyProfileRef{ID: profile.ID, Account: profile.AccountID})
-			data.RequiredActions = append(data.RequiredActions, historyAction{Code: "profile_disabled", Scope: "profile", ID: profile.ID, Message: fmt.Sprintf("profile %s is disabled", profile.ID)})
 		}
 	}
-	destinations, err := storage.ListDestinations()
-	if err != nil {
-		return data, err
-	}
-	for _, destination := range destinations {
+	for _, destination := range status.Destinations {
 		if !destination.Enabled {
 			data.DisabledDestinations = append(data.DisabledDestinations, historyDestRef{ID: destination.ID, Name: destination.Name})
-			data.RequiredActions = append(data.RequiredActions, historyAction{Code: "destination_disabled", Scope: "destination", ID: destination.ID, Message: fmt.Sprintf("telegram destination %s is disabled", destination.ID)})
 		}
 	}
-	incidents, err := storage.ListIncidents(store.IncidentStatusActive, "", 1000)
-	if err != nil {
-		return data, err
+	for _, action := range status.RequiredActions {
+		data.RequiredActions = append(data.RequiredActions, historyAction{
+			Code: action.Code, Scope: action.Scope, ID: action.ID, Message: historyActionMessage(action),
+		})
 	}
-	data.ActiveIncidents = incidents
-	for _, incident := range incidents {
-		scope := incident.ScopeType
-		id := incident.ScopeID
-		if id == "" {
-			id = incident.ID
-		}
-		data.RequiredActions = append(data.RequiredActions, historyAction{Code: "active_incident", Scope: scope, ID: id, Message: fmt.Sprintf("%s incident %s: %s", scope, incident.ID, incident.FailureCode)})
-	}
-	failures, err := storage.ListRecentDeliveries("", store.DeliveryPermanentFailure, 1000)
-	if err != nil {
-		return data, err
-	}
-	data.PermanentFailures = failures
-	for _, delivery := range failures {
-		data.RequiredActions = append(data.RequiredActions, historyAction{Code: "permanent_failure", Scope: "delivery", ID: delivery.ID, Message: fmt.Sprintf("profile %s destination %s delivery failed permanently", delivery.ProfileID, delivery.DestinationID)})
-	}
-	operationalFailures, err := storage.ListRecentIncidentDeliveriesByStatus("", store.DeliveryPermanentFailure, 1000)
-	if err != nil {
-		return data, err
-	}
-	data.OperationalDeliveries = operationalFailures
-	for _, delivery := range operationalFailures {
-		data.RequiredActions = append(data.RequiredActions, historyAction{Code: "permanent_failure", Scope: "operational_delivery", ID: delivery.ID, Message: fmt.Sprintf("incident %s destination %s %s delivery failed permanently", delivery.IncidentID, delivery.DestinationID, delivery.Kind)})
-	}
-	retention, err := storage.GetHistoryRetentionDays()
-	if err != nil {
-		if !errors.Is(err, store.ErrHistoryInvalid) {
-			return data, err
-		}
-		// An invalid saved policy is itself a required action; keep the
-		// default for display so automation still gets a number.
-		retention = store.DefaultHistoryRetentionDays
-		data.RequiredActions = append(data.RequiredActions, historyAction{Code: "invalid_retention", Scope: "history", ID: "retention", Message: err.Error()})
-	}
-	data.RetentionDays = retention
 	data.Summary = map[string]int{
-		"accounts":               len(accounts),
-		"profiles":               len(profiles),
-		"disabled_profiles":      len(data.DisabledProfiles),
-		"destinations":           len(destinations),
-		"disabled_destinations":  len(data.DisabledDestinations),
-		"active_incidents":       len(data.ActiveIncidents),
-		"permanent_failures":     len(data.PermanentFailures) + len(data.OperationalDeliveries),
-		"operational_deliveries": len(data.OperationalDeliveries),
-		"required_actions":       len(data.RequiredActions),
+		"accounts": len(data.Accounts), "profiles": len(status.Profiles), "disabled_profiles": len(data.DisabledProfiles),
+		"destinations": len(status.Destinations), "disabled_destinations": len(data.DisabledDestinations),
+		"active_incidents": len(data.ActiveIncidents), "permanent_failures": len(data.PermanentFailures) + len(data.OperationalDeliveries),
+		"operational_deliveries": len(data.OperationalDeliveries), "required_actions": len(data.RequiredActions),
 	}
 	return data, nil
+}
+
+func historyActionMessage(action operatorstatus.Action) string {
+	switch action.Code {
+	case "authentication_required":
+		return fmt.Sprintf("account %s requires authentication", action.ID)
+	case "session_unavailable":
+		return fmt.Sprintf("check session storage for account %s", action.ID)
+	case "profile_disabled":
+		return fmt.Sprintf("profile %s is disabled", action.ID)
+	case "destination_disabled":
+		return fmt.Sprintf("telegram destination %s is disabled", action.ID)
+	case "destination_test_failure":
+		return fmt.Sprintf("check the failed test for telegram destination %s", action.ID)
+	case "destination_delivery_failure":
+		return fmt.Sprintf("check delivery to telegram destination %s", action.ID)
+	case "active_incident":
+		return fmt.Sprintf("check the active incident for %s %s", action.Scope, action.ID)
+	case "permanent_failure":
+		return fmt.Sprintf("%s %s failed permanently", action.Scope, action.ID)
+	case "invalid_retention":
+		return "set a valid history retention period"
+	default:
+		return fmt.Sprintf("check %s %s", action.Scope, action.ID)
+	}
 }
 
 func historyRetention(command string, settings options, stdout, stderr io.Writer, jsonOutput bool) int {

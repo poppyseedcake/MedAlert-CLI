@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/poppyseedcake/MedAlert/internal/application"
 	"github.com/poppyseedcake/MedAlert/internal/medicover"
 	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
@@ -492,5 +494,124 @@ func TestHistoryNeverLeaksSecrets(t *testing.T) {
 	}
 	if strings.Contains(string(raw), marker) {
 		t.Fatal("database file contains secret marker")
+	}
+}
+
+func TestStatusKeepsCancelledDeliveriesInHistoryWithoutRequiredActions(t *testing.T) {
+	database, getenv := setupHistoryFixture(t)
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	now := time.Now().UTC().Add(-time.Minute)
+	run, err := storage.BeginObservationRun("prof", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := storage.ReconcileObservationRun(run.ID, []store.ObservationSlot{{
+		Identity: "slot", StableIdentity: "slot", Time: "2099-01-10T10:00:00Z",
+	}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := storage.EnsureEpisodeDeliveries("prof", observed.NewEpisodes[0].ID, now)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("deliveries = %v, err = %v", deliveries, err)
+	}
+	if _, err := storage.CancelDeliveriesForEndedEpisodes("prof", []string{observed.NewEpisodes[0].ID}, now); err != nil {
+		t.Fatal(err)
+	}
+	incident, pending, _, err := storage.RecordIncidentFailure(store.IncidentScopeProfile, "prof", "alice", "prof", "", "authentication_required", "login required", now, []string{"dest"})
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("incident = %v, pending = %v, err = %v", incident, pending, err)
+	}
+	if _, _, _, err := storage.ResolveIncident(store.IncidentScopeProfile, "prof", "prof", "", now); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range [][]string{{"history", "status"}, {"doctor"}} {
+		code, stdout, stderr := runCLI(t, getenv, append(command, "--database", database, "--output", "json")...)
+		if code != 0 || stderr != "" {
+			t.Fatalf("%v: code=%d stderr=%q", command, code, stderr)
+		}
+		data := decodeEnvelope(t, stdout, strings.Join(command, " "))
+		for _, field := range []string{"permanent_failures", "operational_deliveries"} {
+			if command[0] == "doctor" {
+				continue
+			}
+			if rows, ok := data[field].([]any); !ok || len(rows) != 1 {
+				t.Fatalf("%s = %#v, want one historical cancellation", field, data[field])
+			}
+		}
+		for _, raw := range data["required_actions"].([]any) {
+			action := raw.(map[string]any)
+			if action["code"] == "permanent_failure" || action["code"] == "destination_delivery_failure" {
+				t.Errorf("%v reports cancelled delivery as required action: %v", command, action)
+			}
+		}
+	}
+	snapshot, err := application.New(application.Config{Database: database, SessionDir: getenv("MEDALERT_SESSION_DIR")}).Snapshot(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled := 0
+	for _, row := range snapshot.History {
+		if (row.ID == deliveries[0].ID || row.ID == pending[0].ID) && strings.Contains(row.Label, "anulowane") {
+			cancelled++
+		}
+	}
+	if cancelled != 2 {
+		t.Fatalf("TUI history = %+v, want two cancelled deliveries", snapshot.History)
+	}
+	for _, action := range snapshot.Actions {
+		if action.ID == deliveries[0].ID || action.ID == pending[0].ID || action.ID == "dest" {
+			t.Fatalf("TUI cancellation action = %+v", action)
+		}
+	}
+
+}
+
+func TestStatusSharesAccountPauseBetweenCLIAndTUI(t *testing.T) {
+	database, getenv := setupHistoryFixture(t)
+	backend := session.FileStore{Dir: getenv("MEDALERT_SESSION_DIR")}
+	if err := backend.Save("alice", &medicover.SessionState{DeviceID: "device", Cookies: []medicover.StoredCookie{{Name: "MedicoverTrusted", Value: "test-cookie", Domain: "login.example.test", Path: "/", Secure: true, Expires: "2099-01-10T10:00:00Z"}}}); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if _, _, _, err := storage.RecordIncidentFailure(store.IncidentScopeAccount, "alice", "alice", "", "", "authentication_required", "login required", time.Now().UTC(), nil); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runCLI(t, getenv, "history", "status", "--database", database, "--medicover-base-url", "https://login.example.test", "--output", "json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("status: code=%d stderr=%q", code, stderr)
+	}
+	data := decodeEnvelope(t, stdout, "history status")
+	accounts, ok := data["accounts"].([]any)
+	if !ok || len(accounts) != 1 {
+		t.Fatalf("accounts = %#v", data["accounts"])
+	}
+	account := accounts[0].(map[string]any)
+	if account["authenticated"] != false || account["auth_required"] != true {
+		t.Fatalf("account = %#v", account)
+	}
+	snapshot, err := application.New(application.Config{Database: database, SessionDir: backend.Dir, MedicoverBaseURL: "https://login.example.test"}).Snapshot(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Accounts) != 1 || snapshot.Accounts[0].Detail != "! Wymaga logowania" {
+		t.Fatalf("TUI accounts = %+v", snapshot.Accounts)
+	}
+	logins := 0
+	for _, action := range snapshot.Actions {
+		if action.ID == "alice" && action.Detail == "Zaloguj konto" && action.Target == 1 {
+			logins++
+		}
+	}
+	if logins != 1 {
+		t.Fatalf("TUI actions = %+v, want one login action", snapshot.Actions)
 	}
 }
