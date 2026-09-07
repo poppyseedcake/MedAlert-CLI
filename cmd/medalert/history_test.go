@@ -414,17 +414,14 @@ func TestFinalAcceptanceSecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
 			t.Fatalf("output leaks secret marker: %q", output)
 		}
 	}
-	raw, err := os.ReadFile(database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), marker) {
-		t.Fatal("database file contains secret marker")
-	}
 	var markerPath string
-	walkErr := filepath.Walk(sessionDir, func(path string, info os.FileInfo, err error) error {
+	durableRoot := filepath.Dir(database)
+	walkErr := filepath.Walk(durableRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		if path == secretDir {
+			return filepath.SkipDir
 		}
 		if info.IsDir() {
 			return nil
@@ -442,6 +439,6 @@ func TestFinalAcceptanceSecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
 		t.Fatal(walkErr)
 	}
 	if markerPath != "" {
-		t.Fatalf("session file %s contains secret marker", markerPath)
+		t.Fatalf("durable file %s contains secret marker", markerPath)
 	}
 }

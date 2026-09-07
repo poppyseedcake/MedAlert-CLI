@@ -43,8 +43,11 @@ contains "$workflow" 'sbom: false'
 if grep -Eiq 'arm64|aarch64' "$workflow"; then
 	fail 'the CI workflow mentions an unsupported arm64 build or test'
 fi
-if git -C "$repository_dir" grep -I -n -E 'actions/(create-release|github-release)|softprops/action-gh-release|gh[[:space:]]+release|goreleaser|cosign|syft|attest(ation)?s?[[:space:]:=]|release[-_ ]candidate|git tag -(s|u|a)|sha256sum|checksums?\.txt|^[[:space:]]*sbom:[[:space:]]*true' -- .github scripts Dockerfile ':!scripts/project-acceptance-test.sh' >/dev/null 2>&1; then
+if git -C "$repository_dir" grep -I -n -E 'actions/(create-release|github-release)|softprops/action-gh-release|gh[[:space:]]+release|goreleaser|cosign|syft|attest(ation)?s?[[:space:]:=]|release[-_ ]candidate|git tag -(s|u|a)|sha256sum|checksums?\.txt|^[[:space:]]*sbom:[[:space:]]*true' -- . ':!LICENSE' ':!README.md' ':!docs/**' ':!scripts/project-acceptance-test.sh' >/dev/null 2>&1; then
 	fail 'the repository contains a release, attestation, SBOM, or checksum publication path'
+fi
+if git -C "$repository_dir" ls-files | grep -E '(^|/)(release|releases|dist|artifacts?)/|(^|/)[^/]*(checksum|sha256)[^/]*\.(txt|json|yaml|yml)$|\.(zip|tar\.gz|tgz)$' >/dev/null 2>&1; then
+	fail 'the repository contains a release archive or checksum artifact'
 fi
 
 for text in 'go install' 'systemd' 'backup' 'recovery' 'Secret Service' 'journal' 'Linux amd64'; do
