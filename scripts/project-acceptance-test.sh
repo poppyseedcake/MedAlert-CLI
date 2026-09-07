@@ -43,11 +43,8 @@ contains "$workflow" 'sbom: false'
 if grep -Eiq 'arm64|aarch64' "$workflow"; then
 	fail 'the CI workflow mentions an unsupported arm64 build or test'
 fi
-if grep -Eiq 'softprops/action-gh-release|gh[[:space:]]+release|cosign|syft' "$workflow"; then
-	fail 'the CI workflow contains a release or publication tool outside GHCR'
-fi
-if grep -Eq '^[[:space:]]*(provenance|sbom):[[:space:]]*true([[:space:]]|$)' "$workflow"; then
-	fail 'the CI workflow publishes provenance or an SBOM'
+if git -C "$repository_dir" grep -I -n -E 'actions/(create-release|github-release)|softprops/action-gh-release|gh[[:space:]]+release|goreleaser|cosign|syft|attest(ation)?s?[[:space:]:=]|release[-_ ]candidate|git tag -(s|u|a)|sha256sum|checksums?\.txt|^[[:space:]]*sbom:[[:space:]]*true' -- .github scripts Dockerfile ':!scripts/project-acceptance-test.sh' >/dev/null 2>&1; then
+	fail 'the repository contains a release, attestation, SBOM, or checksum publication path'
 fi
 
 for text in 'go install' 'systemd' 'backup' 'recovery' 'Secret Service' 'journal' 'Linux amd64'; do
@@ -57,5 +54,5 @@ for text in 'persistent' 'secret' 'rollback' 'docker logs' 'Linux amd64'; do
 	contains "$container_docs" "$text"
 done
 
-(cd "$repository_dir" && go test ./cmd/medalert -count=1 -run '^TestFinalAcceptanceSecretMarkersStayOutOfOutputsAndHistory$')
+(cd "$repository_dir" && go test ./cmd/medalert -count=1 -run '^(TestFinalAcceptanceSecretMarkersStayOutOfOutputsAndHistory|TestTerminalAccountKeyboardSmoke|TestWatchStreamsTextLogsOnStderrAndJSONLinesOnStdout)$')
 printf '%s\n' 'project acceptance test passed'
