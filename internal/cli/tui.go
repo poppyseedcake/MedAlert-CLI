@@ -160,6 +160,9 @@ func terminalProfileApplication(ctx context.Context, settings options, request t
 		CheckIntervalMinutes: request.Profile.CheckIntervalMinutes,
 		Enabled:              request.Profile.Enabled,
 	}
+	if action == "create" {
+		values.Enabled = true
+	}
 	_, err := application.New(application.Config{
 		Database:         settings.database,
 		SessionDir:       settings.sessionDir,

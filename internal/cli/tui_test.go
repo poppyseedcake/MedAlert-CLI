@@ -388,10 +388,10 @@ func TestTerminalProfileActionsUseSharedProfileUseCases(t *testing.T) {
 	settings := options{database: database, sessionDir: filepath.Join(root, "sessions")}
 	profile := tui.ProfileValues{
 		AccountID: "home", RegionIDs: "204", SpecialtyIDs: "132", ClinicIDs: "12", SearchType: "Standard", CheckIntervalMinutes: "30",
-		Enabled: true,
+		Enabled: false,
 	}
 	result := terminalAction(context.Background(), settings, tui.Request{Action: "profile-create", ID: "morning", Profile: profile}, nil)
-	if result.Failed || len(result.Snapshot.Profiles) != 1 || result.Snapshot.ProfileValues["morning"].AccountID != "home" {
+	if result.Failed || len(result.Snapshot.Profiles) != 1 || result.Snapshot.ProfileValues["morning"].AccountID != "home" || !result.Snapshot.ProfileValues["morning"].Enabled {
 		t.Fatalf("profile create result = %+v", result)
 	}
 
