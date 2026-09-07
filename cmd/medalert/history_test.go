@@ -386,6 +386,17 @@ func TestFinalAcceptanceSecretMarkersStayOutOfOutputsAndHistory(t *testing.T) {
 		t.Fatalf("text check = %#v", textCheckResult)
 	}
 	recordOutput(textCheckResult)
+	migrationDirectory := filepath.Join(root, "migration")
+	if err := os.Mkdir(migrationDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	migrationDatabase := filepath.Join(migrationDirectory, "medalert.db")
+	createProcessDatabase(t, migrationDatabase, 0, "CREATE TABLE existing (value TEXT); INSERT INTO existing VALUES ('kept');")
+	migrationResult := run(t, environment, "database", "initialize", "--database", migrationDatabase)
+	if migrationResult.exitCode != 0 {
+		t.Fatalf("initialize migration database = %#v", migrationResult)
+	}
+	recordOutput(migrationResult)
 	for _, args := range [][]string{
 		{"account", "show", "patient", "--output", "json"},
 		{"account", "status", "--account", "patient", "--output", "json"},
