@@ -97,6 +97,10 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 			return terminalApplicationFailure(ctx, err)
 		}
 		checkResultMessage = "Wykonano trwałą kontrolę profilu."
+	case "telegram-create", "telegram-edit", "telegram-enable", "telegram-disable", "telegram-test", "telegram-token", "telegram-link", "telegram-delete":
+		if err := terminalTelegramApplication(ctx, settings, request, prompt); err != nil {
+			return terminalRequestFailure(ctx, request, err)
+		}
 	default:
 		return tui.Result{Failed: true, Message: "Nieznana operacja."}
 	}
@@ -146,8 +150,48 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		if checkResultMessage != "" {
 			message = checkResultMessage
 		}
+	case "telegram-create":
+		message = "Zapisano cel Telegram."
+	case "telegram-edit":
+		message = "Zapisano zmiany celu Telegram."
+	case "telegram-enable":
+		message = "Włączono cel Telegram."
+	case "telegram-disable":
+		message = "Wstrzymano cel Telegram."
+	case "telegram-test":
+		message = "Wysłano wiadomość testową Telegram."
+	case "telegram-token":
+		message = "Zapisano nowy token celu Telegram."
+	case "telegram-link":
+		message = "Zaktualizowano powiązania celu Telegram."
+	case "telegram-delete":
+		message = "Usunięto cel Telegram i jego powiązania."
 	}
 	return tui.Result{Snapshot: snapshot, Message: message}
+}
+
+func terminalTelegramApplication(ctx context.Context, settings options, request tui.Request, prompt tui.Prompt) error {
+	profileIDs := []string{}
+	if raw := strings.TrimSpace(request.Destination.LinkedProfiles); raw != "" {
+		profileIDs = strings.Split(raw, ",")
+	}
+	values := application.DestinationValues{
+		Name:      request.Destination.Name,
+		ChatID:    request.Destination.ChatID,
+		TokenFile: request.Destination.TokenFile,
+		Enabled:   request.Destination.Enabled,
+	}
+	_, err := application.New(application.Config{
+		Database:         settings.database,
+		MedicoverBaseURL: settings.medicoverBaseURL,
+		TelegramBaseURL:  settings.telegramBaseURL,
+	}).Telegram(ctx, application.TelegramRequest{
+		Action:     strings.TrimPrefix(request.Action, "telegram-"),
+		ID:         request.ID,
+		Values:     values,
+		ProfileIDs: profileIDs,
+	}, prompt)
+	return err
 }
 
 func terminalProfileApplication(ctx context.Context, settings options, request tui.Request, action string) error {
@@ -179,6 +223,37 @@ func terminalApplicationFailure(ctx context.Context, err error) tui.Result {
 	}
 	code, detail := application.ErrorInfo(err)
 	return tui.Result{Failed: true, Message: terminalErrorDetails(code, detail)}
+}
+
+func terminalRequestFailure(ctx context.Context, request tui.Request, err error) tui.Result {
+	if ctx.Err() != nil {
+		return tui.Result{Failed: true, Message: "Anulowano operację. Odśwież stan."}
+	}
+	code, detail := application.ErrorInfo(err)
+	message := terminalErrorDetails(code, detail)
+	if strings.HasPrefix(request.Action, "telegram-") {
+		message = terminalTelegramErrorDetails(code, detail)
+	}
+	if code == "permanent_failure" && strings.TrimSpace(request.ID) != "" {
+		message = fmt.Sprintf("Trwały błąd Telegram dla celu %s.", request.ID)
+		if strings.TrimSpace(detail) != "" {
+			message += " " + strings.TrimSpace(detail)
+		}
+	}
+	return tui.Result{Failed: true, Message: message}
+}
+
+func terminalTelegramErrorDetails(code, detail string) string {
+	switch code {
+	case "secret_error":
+		return "Brak dostępu do tokenu bota Telegram. Sprawdź plik lub magazyn sekretów."
+	case "missing_input":
+		return "Token bota Telegram jest wymagany. Wpisz go ponownie."
+	case "timeout":
+		return "Operacja Telegram przekroczyła limit czasu. Spróbuj ponownie."
+	default:
+		return terminalErrorDetails(code, detail)
+	}
 }
 
 func terminalCheckApplication(ctx context.Context, settings options, request tui.Request, prompt tui.Prompt) (application.CheckResult, error) {
@@ -236,20 +311,22 @@ func terminalSnapshotWithContext(ctx context.Context, settings options, prune bo
 		Database:         settings.database,
 		SessionDir:       settings.sessionDir,
 		MedicoverBaseURL: settings.medicoverBaseURL,
+		TelegramBaseURL:  settings.telegramBaseURL,
 	}).Snapshot(ctx, prune)
 	if err != nil {
 		return tui.Snapshot{}, err
 	}
 	return tui.Snapshot{
-		Accounts:      tuiRows(state.Accounts),
-		Profiles:      tuiRows(state.Profiles),
-		Destinations:  tuiRows(state.Destinations),
-		Monitoring:    tuiRows(state.Monitoring),
-		Runs:          tuiRows(state.Runs),
-		History:       tuiRows(state.History),
-		Actions:       tuiRows(state.Actions),
-		ProfileValues: tuiProfileValues(state.ProfileValues),
-		Summary:       state.Summary,
+		Accounts:          tuiRows(state.Accounts),
+		Profiles:          tuiRows(state.Profiles),
+		Destinations:      tuiRows(state.Destinations),
+		Monitoring:        tuiRows(state.Monitoring),
+		Runs:              tuiRows(state.Runs),
+		History:           tuiRows(state.History),
+		Actions:           tuiRows(state.Actions),
+		ProfileValues:     tuiProfileValues(state.ProfileValues),
+		DestinationValues: tuiDestinationValues(state.DestinationValues),
+		Summary:           state.Summary,
 	}, nil
 }
 
@@ -274,6 +351,24 @@ func tuiProfileValues(values map[string]application.ProfileValues) map[string]tu
 	return converted
 }
 
+func tuiDestinationValues(values map[string]application.DestinationValues) map[string]tui.DestinationValues {
+	converted := make(map[string]tui.DestinationValues, len(values))
+	for id, value := range values {
+		converted[id] = tui.DestinationValues{
+			Name:           value.Name,
+			ChatID:         value.ChatID,
+			TokenFile:      value.TokenFile,
+			TokenSource:    value.TokenSource,
+			LinkedProfiles: strings.Join(value.LinkedProfiles, ","),
+			LastTestAt:     value.LastTestAt,
+			LastTestStatus: value.LastTestStatus,
+			LastTestError:  value.LastTestError,
+			Enabled:        value.Enabled,
+		}
+	}
+	return converted
+}
+
 func terminalError(code string) string {
 	return terminalErrorDetails(code, "")
 }
@@ -288,10 +383,27 @@ func terminalErrorDetails(code, detail string) string {
 		return "Profil już istnieje. Użyj innego identyfikatora."
 	case "profile_not_found":
 		return "Profil nie istnieje. R: odśwież listę."
+	case "destination_exists":
+		return "Cel Telegram już istnieje. Użyj innego identyfikatora."
+	case "destination_not_found":
+		return "Cel Telegram nie istnieje. R: odśwież listę."
 	case "profile_disabled":
 		return "Profil jest wyłączony. Włącz go klawiszem P."
 	case "run_active":
 		return "Kontrola tego profilu już trwa. Spróbuj ponownie później."
+	case "permanent_failure":
+		if detail != "" {
+			return "Trwały błąd dostarczenia Telegram: " + detail
+		}
+		return "Trwały błąd dostarczenia Telegram. Sprawdź cel."
+	case "temporary_failure":
+		return "Tymczasowy błąd Telegram. Spróbuj ponownie później."
+	case "rate_limited":
+		return "Telegram zgłosił limit zapytań. Spróbuj później."
+	case "unknown_delivery":
+		return "Nieznany wynik dostarczenia Telegram. Sprawdź historię."
+	case "cancelled":
+		return "Anulowano operację."
 	case "invalid_arguments":
 		if message := polishProfileValidation(detail); message != "" {
 			return message

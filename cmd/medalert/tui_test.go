@@ -2,6 +2,8 @@ package main_test
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,8 +21,18 @@ func TestTerminalAccountKeyboardSmoke(t *testing.T) {
 	defer closeServer()
 	root := privateTempDir(t)
 	database := filepath.Join(root, "medalert.db")
+	tokenMarker := "TUI_TELEGRAM_TOKEN_MARKER_34"
+	tokenFile := filepath.Join(root, "telegram-token")
+	if err := os.WriteFile(tokenFile, []byte(tokenMarker+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	telegramServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":34}}`))
+	}))
+	defer telegramServer.Close()
 	command := exec.Command(executablePath, "--database", database)
-	command.Env = append(os.Environ(), "TERM=xterm-256color", "MEDALERT_NON_INTERACTIVE=", "MEDALERT_OUTPUT=text", "MEDALERT_SESSION_DIR="+filepath.Join(root, "sessions"), "MEDALERT_MEDICOVER_BASE_URL="+fake.baseURL)
+	command.Env = append(os.Environ(), "TERM=xterm-256color", "MEDALERT_NON_INTERACTIVE=", "MEDALERT_OUTPUT=text", "MEDALERT_SESSION_DIR="+filepath.Join(root, "sessions"), "MEDALERT_MEDICOVER_BASE_URL="+fake.baseURL, "MEDALERT_TELEGRAM_BASE_URL="+telegramServer.URL)
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Cols: 80, Rows: 24})
 	if err != nil {
 		t.Fatal(err)
@@ -82,6 +94,16 @@ func TestTerminalAccountKeyboardSmoke(t *testing.T) {
 	await("Podaj kod MFA")
 	send("123456\r")
 	await("Zalogowano konto.")
+	send("4")
+	await("Telegram")
+	send("a")
+	await("Dodaj cel Telegram")
+	send("phone\tTelefon\t123\t" + tokenFile + "\t\r")
+	await("Zapisano cel Telegram.")
+	send("t")
+	await("Wysłano wiadomość testową Telegram.")
+	send("2")
+	await("Konta Medicover")
 	send("o")
 	await("Wylogować konto")
 	send("\t\r")
@@ -94,7 +116,9 @@ func TestTerminalAccountKeyboardSmoke(t *testing.T) {
 	await("Anulowano logowanie.")
 	send("?")
 	await("Pomoc")
+	await("Esc / Enter: zamknij pomoc.")
 	send("\x1b")
+	await("Konta Medicover")
 	if err := pty.Setsize(terminal, &pty.Winsize{Cols: 79, Rows: 23}); err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +144,7 @@ func TestTerminalAccountKeyboardSmoke(t *testing.T) {
 	mu.Lock()
 	transcript := output.String()
 	mu.Unlock()
-	for _, secret := range []string{marker, "mfa-pass", "123456", "trusted-1", "mfa-t"} {
+	for _, secret := range []string{marker, tokenMarker, "mfa-pass", "123456", "trusted-1", "mfa-t"} {
 		if strings.Contains(transcript, secret) {
 			t.Fatalf("terminal exposed secret %q", secret)
 		}

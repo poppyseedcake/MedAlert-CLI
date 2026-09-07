@@ -167,6 +167,69 @@ func TestProfileLinksToMultipleDestinations(t *testing.T) {
 	}
 }
 
+func TestDestinationLinksToMultipleProfiles(t *testing.T) {
+	storage := openTelegramStore(t)
+	mustCreateAccount(t, storage, "alice", "alice@example.com")
+	for _, profileID := range []string{"morning", "evening"} {
+		if _, err := storage.CreateProfile(validProfile(profileID, "alice")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := storage.CreateDestination(validDestination("phone")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(validDestination("tablet")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetProfileDestinations("morning", []string{"tablet"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.SetDestinationProfiles("phone", []string{"evening", "morning", "evening"}); err != nil {
+		t.Fatalf("link destination: %v", err)
+	}
+	profiles, err := storage.ListDestinationProfileIDs("phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 2 || profiles[0] != "evening" || profiles[1] != "morning" {
+		t.Fatalf("destination profiles = %#v, want [evening morning]", profiles)
+	}
+	morningDestinations, err := storage.ListProfileDestinationIDs("morning")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(morningDestinations) != 2 || morningDestinations[0] != "phone" || morningDestinations[1] != "tablet" {
+		t.Fatalf("morning destinations = %#v, want [phone tablet]", morningDestinations)
+	}
+	if err := storage.SetDestinationProfiles("phone", []string{"evening"}); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err = storage.ListDestinationProfileIDs("phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 || profiles[0] != "evening" {
+		t.Fatalf("destination profiles after replace = %#v, want [evening]", profiles)
+	}
+	morningDestinations, err = storage.ListProfileDestinationIDs("morning")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(morningDestinations) != 1 || morningDestinations[0] != "tablet" {
+		t.Fatalf("morning destinations after replace = %#v, want [tablet]", morningDestinations)
+	}
+	if err := storage.SetDestinationProfiles("phone", []string{"missing"}); err == nil {
+		t.Fatal("link to missing profile succeeded")
+	}
+	profiles, err = storage.ListDestinationProfileIDs("phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 || profiles[0] != "evening" {
+		t.Fatalf("links changed after rejected update = %#v", profiles)
+	}
+}
+
 func TestDeleteDestinationRemovesLinks(t *testing.T) {
 	storage := openTelegramStore(t)
 	mustCreateAccount(t, storage, "alice", "alice@example.com")

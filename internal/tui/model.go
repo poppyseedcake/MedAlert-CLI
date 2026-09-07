@@ -41,18 +41,35 @@ type ProfileValues struct {
 	Enabled              bool
 }
 
+// DestinationValues contains safe values used to fill Telegram forms. It
+// never contains a bot token; TokenFile is only a path to an approved secret
+// file.
+type DestinationValues struct {
+	Name           string
+	ChatID         string
+	TokenFile      string
+	TokenSource    string
+	LinkedProfiles string
+	LastTestAt     string
+	LastTestStatus string
+	LastTestError  string
+	Enabled        bool
+}
+
 type Snapshot struct {
 	Accounts                     []Row
 	Actions                      []Row
 	Profiles, Destinations, Runs []Row
 	Monitoring                   []Row
 	ProfileValues                map[string]ProfileValues
+	DestinationValues            map[string]DestinationValues
 	History                      []Row
 	Summary                      string
 }
 type Request struct {
 	Action, ID, Username, PasswordFile string
 	Profile                            ProfileValues
+	Destination                        DestinationValues
 	ProfileClear                       []string
 }
 type Result struct {
@@ -166,11 +183,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			title := "Podaj hasło"
 			if msg.kind == "mfa" {
 				title = "Podaj kod MFA"
+			} else if msg.kind == "telegram-token" {
+				title = "Podaj token bota Telegram"
 			}
 			m.openForm(title, "secret", "", []string{title}, []string{""})
 			m.form.secret, m.form.reply = true, msg.reply
 			m.form.fields[0].EchoMode = textinput.EchoNone
 			m.notice = "Wpisz dane. Enter: wyślij. Esc: anuluj logowanie."
+			if msg.kind == "telegram-token" {
+				m.notice = "Wpisz dane. Enter: wyślij. Esc: anuluj operację."
+			}
 		}
 		return m, m.waitPrompt()
 	case finishedMsg:
@@ -282,16 +304,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openForm("Dodaj konto", "create", "", []string{"Identyfikator (litery, cyfry, - lub _)", "Login Medicover", "Plik hasła (pusty: pytaj przy logowaniu)"}, []string{"", "", ""})
 			} else if m.area == 2 {
 				m.openProfileCreateForm()
+			} else if m.area == 3 {
+				m.openDestinationCreateForm()
 			}
 		case "e":
 			if m.area == 1 && m.selectedID() != "" {
 				m.openForm("Edytuj konto", "edit", m.selectedID(), []string{"Login Medicover", "Plik hasła (pusty: zachowaj źródło)"}, []string{m.rows()[m.selected].Label, ""})
 			} else if m.area == 2 && m.selectedID() != "" {
 				m.openProfileEditForm(m.selectedID())
+			} else if m.area == 3 && m.selectedID() != "" {
+				m.openDestinationEditForm(m.selectedID())
 			}
 		case "l":
 			if m.area == 1 && m.selectedID() != "" {
 				return m, m.start(Request{Action: "login", ID: m.selectedID()})
+			} else if m.area == 3 && m.selectedID() != "" {
+				m.openDestinationLinkForm(m.selectedID())
 			}
 		case "p":
 			if m.area == 2 && m.selectedID() != "" {
@@ -300,6 +328,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					action = "profile-disable"
 				}
 				return m, m.start(Request{Action: action, ID: m.selectedID()})
+			} else if m.area == 3 && m.selectedID() != "" {
+				action := "telegram-enable"
+				if m.destinationEnabled(m.selectedID()) {
+					action = "telegram-disable"
+				}
+				return m, m.start(Request{Action: action, ID: m.selectedID()})
+			}
+		case "t":
+			if m.area == 3 && m.selectedID() != "" {
+				return m, m.start(Request{Action: "telegram-test", ID: m.selectedID()})
+			}
+		case "s":
+			if m.area == 3 && m.selectedID() != "" {
+				return m, m.start(Request{Action: "telegram-token", ID: m.selectedID()})
 			}
 		case "y":
 			if m.area == 2 && m.selectedID() != "" {
@@ -311,6 +353,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			if (m.area == 1 || m.area == 2) && m.selectedID() != "" {
+				m.confirmation = key
+				m.confirmYes = false
+			} else if m.area == 3 && m.selectedID() != "" {
 				m.confirmation = key
 				m.confirmYes = false
 			}
@@ -346,6 +391,9 @@ func (m *Model) stop() {
 
 func operationKey(request Request) string {
 	if id := strings.TrimSpace(request.ID); id != "" {
+		if strings.HasPrefix(request.Action, "telegram-") {
+			return "destination:" + id
+		}
 		if strings.HasPrefix(request.Action, "profile-") {
 			return "profile:" + id
 		}
@@ -394,6 +442,18 @@ func (m *Model) profileEnabled(id string) bool {
 	return false
 }
 
+func (m *Model) destinationEnabled(id string) bool {
+	if values, ok := m.snapshot.DestinationValues[id]; ok {
+		return values.Enabled
+	}
+	for _, row := range m.snapshot.Destinations {
+		if row.ID == id {
+			return !strings.Contains(strings.ToLower(row.Label), "wyłączony")
+		}
+	}
+	return false
+}
+
 func (m *Model) openForm(title, action, id string, labels, values []string) {
 	m.openFormFields(title, action, id, defaultFormKeys(action, len(labels)), labels, values)
 }
@@ -426,6 +486,12 @@ func defaultFormKeys(action string, fieldCount int) []string {
 		keys = []string{"username", "password_file"}
 	case "secret":
 		keys = []string{"secret"}
+	case "telegram-create":
+		keys = []string{"destination_id", "destination_name", "chat_id", "token_file"}
+	case "telegram-edit":
+		keys = []string{"destination_name", "chat_id", "token_file"}
+	case "telegram-link":
+		keys = []string{"profile_ids"}
 	}
 	if len(keys) != fieldCount {
 		keys = make([]string, fieldCount)
@@ -487,6 +553,34 @@ func (m *Model) openProfileEditForm(id string) {
 	}
 	m.openFormFields("Edytuj profil obserwacji", "profile-edit", id, profileEditKeys, profileEditLabels, formValues)
 }
+
+var destinationCreateLabels = []string{
+	"Identyfikator celu (litery, cyfry, - lub _)",
+	"Nazwa celu Telegram",
+	"Identyfikator czatu Telegram",
+	"Plik tokenu (pusty: zapytaj ukrycie)",
+}
+
+var destinationEditLabels = []string{
+	"Nazwa celu Telegram",
+	"Identyfikator czatu Telegram",
+	"Plik tokenu (pusty: zachowaj źródło)",
+}
+
+func (m *Model) openDestinationCreateForm() {
+	m.openFormFields("Dodaj cel Telegram", "telegram-create", "", defaultFormKeys("telegram-create", 4), destinationCreateLabels, []string{"", "", "", ""})
+}
+
+func (m *Model) openDestinationEditForm(id string) {
+	values := m.snapshot.DestinationValues[id]
+	m.openFormFields("Edytuj cel Telegram", "telegram-edit", id, defaultFormKeys("telegram-edit", 3), destinationEditLabels, []string{values.Name, values.ChatID, values.TokenFile})
+}
+
+func (m *Model) openDestinationLinkForm(id string) {
+	values := m.snapshot.DestinationValues[id]
+	m.openFormFields("Powiąż cel Telegram", "telegram-link", id, defaultFormKeys("telegram-link", 1), []string{"Profile powiązane (ID lub lista, puste: odłącz)"}, []string{values.LinkedProfiles})
+}
+
 func (f *form) dirty() bool {
 	for i, field := range f.fields {
 		if field.Value() != f.original[i] {
@@ -534,6 +628,16 @@ func (f *form) request() Request {
 			request.Profile.EndDate = value
 		case "check_interval_minutes":
 			request.Profile.CheckIntervalMinutes = value
+		case "destination_id":
+			request.ID = value
+		case "destination_name":
+			request.Destination.Name = value
+		case "chat_id":
+			request.Destination.ChatID = value
+		case "token_file":
+			request.Destination.TokenFile = value
+		case "profile_ids":
+			request.Destination.LinkedProfiles = value
 		}
 		if f.action == "profile-edit" && value == "" && i < len(f.original) && f.original[i] != "" {
 			request.ProfileClear = append(request.ProfileClear, key)
@@ -566,6 +670,23 @@ func validateFormRequest(request Request) (string, bool) {
 		if strings.TrimSpace(request.Profile.CheckIntervalMinutes) == "" {
 			return "Wpisz interwał sprawdzania w minutach.", false
 		}
+	case "telegram-create":
+		if strings.TrimSpace(request.ID) == "" {
+			return "Wpisz identyfikator celu Telegram.", false
+		}
+		if strings.TrimSpace(request.Destination.Name) == "" {
+			return "Wpisz nazwę celu Telegram.", false
+		}
+		if strings.TrimSpace(request.Destination.ChatID) == "" {
+			return "Wpisz identyfikator czatu Telegram.", false
+		}
+	case "telegram-edit":
+		if strings.TrimSpace(request.Destination.Name) == "" {
+			return "Wpisz nazwę celu Telegram.", false
+		}
+		if strings.TrimSpace(request.Destination.ChatID) == "" {
+			return "Wpisz identyfikator czatu Telegram.", false
+		}
 	}
 	return "", true
 }
@@ -583,8 +704,14 @@ func (m *Model) updateForm(msg tea.KeyMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		if f.secret {
+			operation := m.operations[m.activeGeneration]
+			telegramPrompt := strings.HasPrefix(operation, "destination:") || strings.HasPrefix(operation, "action:telegram-")
 			m.stop()
-			m.notice = "Anulowano logowanie."
+			if telegramPrompt {
+				m.notice = "Anulowano operację."
+			} else {
+				m.notice = "Anulowano logowanie."
+			}
 		} else if f.dirty() {
 			m.confirmation = "discard"
 			m.confirmYes = false
@@ -663,6 +790,8 @@ func (m *Model) confirm(key string) tea.Cmd {
 			request.Action = "logout"
 		} else if m.area == 2 {
 			request.Action = "profile-delete"
+		} else if m.area == 3 {
+			request.Action = "telegram-delete"
 		}
 		return m.start(request)
 	}
@@ -676,13 +805,17 @@ func (m *Model) View() string {
 	footer := "1-6: obszar  ↑↓: wybór  Enter: szczegóły  R: odśwież  ?: pomoc  q: koniec"
 	switch {
 	case m.help:
-		content = []string{"Pomoc — klawiatura", "", "1-6: otwórz obszar poza formularzem.", "Strzałki ↑↓: wybierz pozycję. PgUp/PgDn: przewiń.", "Enter: otwórz szczegóły lub wykonaj działanie.", "Konta: A dodaj, E edytuj, L zaloguj, O wyloguj, D usuń.", "Profile: A dodaj, E edytuj, P włącz/wyłącz, Y sucha kontrola, K kontrola, D usuń.", "R: odśwież dane i stan sesji.", "Tab / Shift+Tab: pola i przyciski formularza.", "Esc: wróć; w formularzu anuluj zmiany.", "Hasło i kod MFA są ukryte. F1: pomoc w formularzu.", "Q: zakończ poza formularzem. Ctrl+C: zakończ zawsze.", "", "Esc / Enter: zamknij pomoc."}
+		content = []string{"Pomoc — klawiatura", "", "1-6: otwórz obszar poza formularzem.", "Strzałki ↑↓: wybierz pozycję. PgUp/PgDn: przewiń.", "Enter: otwórz szczegóły lub wykonaj działanie.", "Konta: A dodaj, E edytuj, L zaloguj, O wyloguj, D usuń.", "Profile: A dodaj, E edytuj, P włącz/wyłącz, Y sucha kontrola, K kontrola, D usuń.", "Telegram: A dodaj, E edytuj, P włącz/wyłącz, T test, S nowy token, L profile, D usuń.", "R: odśwież dane i stan sesji.", "Tab / Shift+Tab: pola i przyciski formularza.", "Esc: wróć; w formularzu anuluj zmiany.", "Hasło, kod MFA i token Telegram są ukryte. F1: pomoc w formularzu.", "Q: zakończ poza formularzem. Ctrl+C: zakończ zawsze.", "", "Esc / Enter: zamknij pomoc."}
 	case m.confirmation != "":
 		title := "Usunąć konto " + m.selectedID() + "?"
 		detail := "Usunięcie obejmuje profile i ich historię."
 		if m.area == 2 {
 			title = "Usunąć profil " + m.selectedID() + "?"
 			detail = "Usunięcie obejmuje konfigurację i historię profilu."
+		}
+		if m.area == 3 {
+			title = "Usunąć cel Telegram " + m.selectedID() + "?"
+			detail = "Usunięcie obejmuje powiązania i historię dostarczeń."
 		}
 		if m.confirmation == "o" {
 			title = "Wylogować konto " + m.selectedID() + "?"
@@ -710,6 +843,9 @@ func (m *Model) View() string {
 			empty := "Brak zapisanych pozycji."
 			if m.area == 1 {
 				empty = "Brak kont. Naciśnij A, aby dodać konto."
+			}
+			if m.area == 3 {
+				empty = "Brak celów Telegram. Naciśnij A, aby dodać cel."
 			}
 			if m.area == 0 {
 				empty = "Brak wymaganych działań."
@@ -752,6 +888,9 @@ func (m *Model) View() string {
 		}
 		if m.area == 2 {
 			footer = "A: dodaj  E: edytuj  P: włącz/wyłącz  Y: sucha kontrola  K: kontrola  D: usuń  Esc: stan"
+		}
+		if m.area == 3 {
+			footer = "A: dodaj  E: edytuj  P: włącz/wyłącz  T: test  S: token  L: profile  D: usuń  Esc: stan"
 		}
 		if m.area == 4 {
 			footer = "↑↓: wybór  Enter: szczegóły  R: odśwież  Esc: stan"

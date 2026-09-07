@@ -355,6 +355,9 @@ func (s *Store) SetProfileDestinations(profileID string, destinationIDs []string
 			return fmt.Errorf("link telegram destinations: %w", err)
 		}
 	}
+	if _, err := tx.Exec(`UPDATE profiles SET updated_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339Nano), profileID); err != nil {
+		return fmt.Errorf("link telegram destinations: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("link telegram destinations: %w", err)
 	}
@@ -406,6 +409,165 @@ func (s *Store) ListProfileDestinationIDs(profileID string) ([]string, error) {
 		ids = append(ids, destination.ID)
 	}
 	return ids, nil
+}
+
+// ListDestinationProfileIDs returns the profiles linked to one destination,
+// ordered by profile id. It is the reverse-link seam used by the terminal
+// interface.
+func (s *Store) ListDestinationProfileIDs(destinationID string) ([]string, error) {
+	if !destinationIDPattern.MatchString(destinationID) {
+		return nil, fmt.Errorf("%w: destination id %q", ErrDestinationInvalid, destinationID)
+	}
+	rows, err := s.db.Query(
+		`SELECT p.id FROM profiles p JOIN profile_telegram_destinations l ON l.profile_id = p.id WHERE l.destination_id = ? ORDER BY p.id`,
+		destinationID,
+	)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("list destination profiles: %w", err)
+	}
+	defer rows.Close()
+	profiles := []string{}
+	for rows.Next() {
+		var profileID string
+		if err := rows.Scan(&profileID); err != nil {
+			return nil, fmt.Errorf("list destination profiles: %w", err)
+		}
+		profiles = append(profiles, profileID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list destination profiles: %w", err)
+	}
+	return profiles, nil
+}
+
+// SetDestinationProfiles replaces the profiles linked to one destination.
+// An empty list removes all links while preserving each profile's other
+// destinations. The operation is atomic so a missing profile cannot leave a
+// partial link update.
+func (s *Store) SetDestinationProfiles(destinationID string, profileIDs []string) error {
+	if !destinationIDPattern.MatchString(destinationID) {
+		return fmt.Errorf("%w: destination id %q", ErrDestinationInvalid, destinationID)
+	}
+	normalized, err := normalizeProfileIDs(profileIDs)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("link destination profiles: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("link destination profiles: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+	var destinationCount int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM telegram_destinations WHERE id = ?`, destinationID).Scan(&destinationCount); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return fmt.Errorf("%w: %s", ErrDestinationNotFound, destinationID)
+		}
+		return fmt.Errorf("link destination profiles: %w", err)
+	}
+	if destinationCount == 0 {
+		return fmt.Errorf("%w: %s", ErrDestinationNotFound, destinationID)
+	}
+	for _, profileID := range normalized {
+		var profileCount int
+		if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM profiles WHERE id = ?`, profileID).Scan(&profileCount); err != nil {
+			return fmt.Errorf("link destination profiles: %w", err)
+		}
+		if profileCount == 0 {
+			return fmt.Errorf("%w: %s", ErrProfileNotFound, profileID)
+		}
+	}
+	linkedProfiles, err := destinationProfileIDs(conn, ctx, destinationID)
+	if err != nil {
+		return fmt.Errorf("link destination profiles: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM profile_telegram_destinations WHERE destination_id = ?`, destinationID); err != nil {
+		return fmt.Errorf("link destination profiles: %w", err)
+	}
+	for _, profileID := range normalized {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO profile_telegram_destinations (profile_id, destination_id) VALUES (?, ?)`, profileID, destinationID); err != nil {
+			return fmt.Errorf("link destination profiles: %w", err)
+		}
+		linkedProfiles = append(linkedProfiles, profileID)
+	}
+	linkedProfiles = uniqueStrings(linkedProfiles)
+	bumpedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, profileID := range linkedProfiles {
+		if _, err := conn.ExecContext(ctx, `UPDATE profiles SET updated_at = ? WHERE id = ?`, bumpedAt, profileID); err != nil {
+			return fmt.Errorf("link destination profiles: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("link destination profiles: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func destinationProfileIDs(conn *sql.Conn, ctx context.Context, destinationID string) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT profile_id FROM profile_telegram_destinations WHERE destination_id = ?`, destinationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	profiles := []string{}
+	for rows.Next() {
+		var profileID string
+		if err := rows.Scan(&profileID); err != nil {
+			return nil, err
+		}
+		profiles = append(profiles, profileID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return profiles, nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func normalizeProfileIDs(ids []string) ([]string, error) {
+	seen := map[string]bool{}
+	profiles := []string{}
+	for _, raw := range ids {
+		profileID := strings.TrimSpace(raw)
+		if profileID == "" {
+			return nil, fmt.Errorf("%w: profile id is required", ErrProfileInvalid)
+		}
+		if !profileIDPattern.MatchString(profileID) {
+			return nil, fmt.Errorf("%w: profile id %q", ErrProfileInvalid, raw)
+		}
+		if seen[profileID] {
+			continue
+		}
+		seen[profileID] = true
+		profiles = append(profiles, profileID)
+	}
+	sort.Strings(profiles)
+	return profiles, nil
 }
 
 // NormalizeDestinationIDs trims, validates, deduplicates, and sorts a list of

@@ -501,3 +501,77 @@ func TestMonitoringAndRequiredActionsNavigateToProfileWork(t *testing.T) {
 		t.Fatalf("required action did not select profile: %s", m.View())
 	}
 }
+
+func TestTelegramDestinationKeyboardFlow(t *testing.T) {
+	snapshot := tui.Snapshot{
+		Destinations: []tui.Row{{ID: "phone", Label: "Telefon — OK — włączony", Detail: "Chat: 123"}},
+		DestinationValues: map[string]tui.DestinationValues{
+			"phone": {Name: "Telefon", ChatID: "123", LinkedProfiles: "morning", Enabled: true},
+		},
+	}
+	var requests []tui.Request
+	m := tui.New(context.Background(), func(_ context.Context, request tui.Request, _ tui.Prompt) tui.Result {
+		requests = append(requests, request)
+		return tui.Result{Snapshot: snapshot, Message: "Operacja zakończona."}
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if cmd == nil {
+		t.Fatal("refresh did not start")
+	}
+	m.Update(cmd())
+
+	key(m, "4")
+	key(m, "a")
+	for _, value := range []string{"phone", "Telefon", "123", "/run/secrets/telegram"} {
+		key(m, value)
+		key(m, "tab")
+	}
+	cmd = key(m, "enter")
+	if cmd == nil {
+		t.Fatal("telegram create did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 2 || requests[1].Action != "telegram-create" || requests[1].ID != "phone" || requests[1].Destination.Name != "Telefon" || requests[1].Destination.ChatID != "123" || requests[1].Destination.TokenFile != "/run/secrets/telegram" {
+		t.Fatalf("telegram create request = %+v", requests)
+	}
+
+	cmd = key(m, "p")
+	if cmd == nil {
+		t.Fatal("telegram disable did not start")
+	}
+	m.Update(cmd())
+	cmd = key(m, "t")
+	if cmd == nil {
+		t.Fatal("telegram test did not start")
+	}
+	m.Update(cmd())
+
+	key(m, "l")
+	if !strings.Contains(m.View(), "Profile powiązane") {
+		t.Fatalf("telegram link form missing: %s", m.View())
+	}
+	key(m, "ctrl+a")
+	key(m, "ctrl+k")
+	key(m, "morning,night")
+	key(m, "tab")
+	cmd = key(m, "enter")
+	if cmd == nil {
+		t.Fatal("telegram link did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 5 || requests[4].Action != "telegram-link" || requests[4].Destination.LinkedProfiles != "morning,night" {
+		t.Fatalf("telegram link request = %+v", requests)
+	}
+
+	key(m, "d")
+	key(m, "tab")
+	cmd = key(m, "enter")
+	if cmd == nil {
+		t.Fatal("telegram delete did not start")
+	}
+	m.Update(cmd())
+	if len(requests) != 6 || requests[5].Action != "telegram-delete" || requests[5].ID != "phone" {
+		t.Fatalf("telegram delete request = %+v", requests)
+	}
+}
