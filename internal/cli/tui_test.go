@@ -564,7 +564,7 @@ func TestTerminalSnapshotShowsMonitoringPausesAndProblems(t *testing.T) {
 		"morning — wstrzymane: konto wymaga logowania",
 		"Następny przebieg: wstrzymany",
 		"Konto home — wstrzymane",
-		"! Aktywny problem: profile morning",
+		"! Aktywny problem: profil morning",
 	} {
 		if !strings.Contains(monitoringView, want) {
 			t.Fatalf("monitoring view misses %q: %s", want, monitoringView)

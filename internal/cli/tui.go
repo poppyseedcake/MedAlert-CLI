@@ -8,11 +8,9 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/poppyseedcake/MedAlert/internal/monitoring"
-	"github.com/poppyseedcake/MedAlert/internal/store"
+	"github.com/poppyseedcake/MedAlert/internal/application"
 	"github.com/poppyseedcake/MedAlert/internal/tui"
 	"golang.org/x/term"
 )
@@ -68,15 +66,25 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 	case "login":
 		code = accountLoginWithPrompt(ctx, "account login", settings, nil, &stdout, &stderr, true, prompt)
 	case "profile-create":
-		code = runProfile("profile create", settings, &stdout, &stderr)
+		if err := terminalProfileApplication(ctx, settings, request, "create"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
 	case "profile-edit":
-		code = runProfile("profile edit", settings, &stdout, &stderr)
+		if err := terminalProfileApplication(ctx, settings, request, "edit"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
 	case "profile-enable":
-		code = runProfile("profile enable", settings, &stdout, &stderr)
+		if err := terminalProfileApplication(ctx, settings, request, "enable"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
 	case "profile-disable":
-		code = runProfile("profile disable", settings, &stdout, &stderr)
+		if err := terminalProfileApplication(ctx, settings, request, "disable"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
 	case "profile-delete":
-		code = runProfile("profile delete", settings, &stdout, &stderr)
+		if err := terminalProfileApplication(ctx, settings, request, "delete"); err != nil {
+			return terminalApplicationFailure(ctx, err)
+		}
 	case "profile-dry-check":
 		settings.dry = true
 		code = runCheckWithPrompt(ctx, "check", settings, nil, &stdout, &stderr, prompt)
@@ -101,7 +109,7 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		}
 		return tui.Result{Failed: true, Message: message}
 	}
-	snapshot, err := terminalSnapshotWithPrune(settings, request.Action != "profile-dry-check")
+	snapshot, err := terminalSnapshotWithContext(ctx, settings, request.Action != "profile-dry-check")
 	if err != nil {
 		return tui.Result{Failed: true, Message: "Nie można odczytać stanu. Sprawdź dostęp do bazy. R: ponów."}
 	}
@@ -135,6 +143,34 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		}
 	}
 	return tui.Result{Snapshot: snapshot, Message: message}
+}
+
+func terminalProfileApplication(ctx context.Context, settings options, request tui.Request, action string) error {
+	values := application.ProfileValues{
+		AccountID: request.Profile.AccountID, RegionIDs: request.Profile.RegionIDs,
+		SpecialtyIDs: request.Profile.SpecialtyIDs, ClinicIDs: request.Profile.ClinicIDs,
+		DoctorIDs: request.Profile.DoctorIDs, LanguageIDs: request.Profile.LanguageIDs,
+		VisitType: request.Profile.VisitType, SearchType: request.Profile.SearchType,
+		StartDate: request.Profile.StartDate, EndDate: request.Profile.EndDate,
+		CheckIntervalMinutes: request.Profile.CheckIntervalMinutes,
+		Enabled:              request.Profile.Enabled,
+	}
+	_, err := application.New(application.Config{
+		Database:         settings.database,
+		SessionDir:       settings.sessionDir,
+		MedicoverBaseURL: settings.medicoverBaseURL,
+	}).Profile(ctx, application.ProfileRequest{
+		Action: action, ID: request.ID, Values: values, Clear: request.ProfileClear,
+	})
+	return err
+}
+
+func terminalApplicationFailure(ctx context.Context, err error) tui.Result {
+	if ctx.Err() != nil {
+		return tui.Result{Failed: true, Message: "Anulowano operację. Odśwież stan."}
+	}
+	code, detail := application.ErrorInfo(err)
+	return tui.Result{Failed: true, Message: terminalErrorDetails(code, detail)}
 }
 
 func applyProfileRequest(settings *options, request tui.Request) {
@@ -183,186 +219,54 @@ func dryCheckMessage(profileID string, raw []byte) string {
 }
 
 func terminalSnapshot(settings options) (tui.Snapshot, error) {
-	return terminalSnapshotWithPrune(settings, true)
+	return terminalSnapshotWithContext(context.Background(), settings, true)
 }
 
 func terminalSnapshotWithPrune(settings options, prune bool) (tui.Snapshot, error) {
-	snapshot := tui.Snapshot{ProfileValues: map[string]tui.ProfileValues{}}
-	storage, err := ensureStore(settings.database)
-	if err != nil {
-		return snapshot, err
-	}
-	defer storage.Close()
-	if prune {
-		pruneHistoryBestEffort(storage)
-	}
-	status, err := collectHistoryStatusForIssuer(storage, sessionStoreFor(settings), settings.medicoverBaseURL)
-	if err != nil {
-		return snapshot, err
-	}
-	authRequired := make(map[string]bool, len(status.Accounts))
-	for _, account := range status.Accounts {
-		authRequired[account.ID] = account.AuthRequired
-		state := "? Brak dostępu do magazynu sesji"
-		if account.AuthRequired {
-			state = "! Wymaga logowania"
-		} else if account.Authenticated {
-			state = "OK — sesja zapisana"
-		}
-		snapshot.Accounts = append(snapshot.Accounts, tui.Row{ID: account.ID, Label: account.Username, Detail: state})
-		if !account.AuthRequired && !account.Authenticated {
-			snapshot.Actions = append(snapshot.Actions, tui.Row{ID: account.ID, Label: "! Sprawdź magazyn sesji: " + account.ID, Target: 1})
-		}
-	}
-	for _, action := range status.RequiredActions {
-		label := map[string]string{
-			"authentication_required": "Zaloguj konto", "profile_disabled": "Profil wyłączony", "destination_disabled": "Telegram wyłączony",
-			"active_incident": "Sprawdź aktywny problem", "permanent_failure": "Sprawdź błąd dostarczenia", "invalid_retention": "Sprawdź okres historii",
-		}[action.Code]
-		if label == "" {
-			label = "Sprawdź stan"
-		}
-		snapshot.Actions = append(snapshot.Actions, tui.Row{ID: action.ID, Label: "! " + label + ": " + action.ID, Detail: label, Target: terminalActionTarget(action)})
-		if action.Code == "invalid_retention" {
-			snapshot.History = append(snapshot.History, tui.Row{
-				ID:     action.ID,
-				Label:  "Nieprawidłowy okres historii",
-				Detail: "Ustaw prawidłowy okres w poleceniu history retention.",
-			})
-		}
-	}
-	if len(status.Accounts) == 0 {
-		snapshot.Actions = append(snapshot.Actions, tui.Row{Label: "! Dodaj konto w obszarze Konta (2, A).", Target: 1})
-	}
-	profiles, err := storage.ListProfiles("")
-	if err != nil {
-		return snapshot, err
-	}
-	for _, profile := range profiles {
-		state := "OK — włączony"
-		if !profile.Enabled {
-			state = "— wyłączony"
-		}
-		snapshot.Profiles = append(snapshot.Profiles, tui.Row{ID: profile.ID, Label: profile.ID + " — " + state, Detail: "Konto: " + profile.AccountID})
-		snapshot.ProfileValues[profile.ID] = tui.ProfileValues{
-			AccountID:            profile.AccountID,
-			RegionIDs:            profile.RegionIDs,
-			SpecialtyIDs:         profile.SpecialtyIDs,
-			ClinicIDs:            profile.ClinicIDs,
-			DoctorIDs:            profile.DoctorIDs,
-			LanguageIDs:          profile.LanguageIDs,
-			VisitType:            profile.VisitType,
-			SearchType:           profile.SearchType,
-			StartDate:            profile.StartDate,
-			EndDate:              profile.EndDate,
-			CheckIntervalMinutes: fmt.Sprintf("%d", profile.CheckIntervalMinutes),
-			Enabled:              profile.Enabled,
-		}
-		monitoringState := "aktywna praca"
-		nextRun := profileNextRun(storage, profile, authRequired[profile.AccountID], time.Now().UTC())
-		if !profile.Enabled {
-			monitoringState = "wstrzymane: profil wyłączony"
-		} else if authRequired[profile.AccountID] {
-			monitoringState = "wstrzymane: konto wymaga logowania"
-		}
-		snapshot.Monitoring = append(snapshot.Monitoring, tui.Row{
-			ID:     profile.ID,
-			Label:  profile.ID + " — " + monitoringState,
-			Detail: fmt.Sprintf("Konto: %s · Następny przebieg: %s", profile.AccountID, nextRun),
-		})
-	}
-	for _, account := range status.Accounts {
-		if account.AuthRequired {
-			snapshot.Monitoring = append(snapshot.Monitoring, tui.Row{
-				ID:     "account:" + account.ID,
-				Label:  "Konto " + account.ID + " — wstrzymane",
-				Detail: "Wymaga logowania; profile tego konta czekają.",
-			})
-		}
-	}
-	for _, incident := range status.ActiveIncidents {
-		snapshot.Monitoring = append(snapshot.Monitoring, tui.Row{
-			ID:     "incident:" + incident.ID,
-			Label:  fmt.Sprintf("! Aktywny problem: %s %s", incident.ScopeType, incident.ScopeID),
-			Detail: fmt.Sprintf("%s · Kolejne błędy: %d", incident.FailureCode, incident.ConsecutiveFailures),
-		})
-	}
-	destinations, err := storage.ListDestinations()
-	if err != nil {
-		return snapshot, err
-	}
-	for _, destination := range destinations {
-		state := "OK — włączony"
-		if !destination.Enabled {
-			state = "— wyłączony"
-		}
-		snapshot.Destinations = append(snapshot.Destinations, tui.Row{ID: destination.ID, Label: destination.Name + " — " + state, Detail: "Dane tokenu są ukryte."})
-	}
-	runs, err := storage.ListRecentObservationRuns(100)
-	if err != nil {
-		return snapshot, err
-	}
-	for _, run := range runs {
-		state := map[string]string{"running": "w toku", "complete": "ukończony", "failed": "błąd", "partial": "częściowy", "cancelled": "anulowany", "conflicting": "konflikt", "stale": "nieaktualny"}[run.Status]
-		row := tui.Row{ID: run.ID, Label: run.ProfileID + " — " + state, Detail: run.StartedAt}
-		snapshot.Runs = append(snapshot.Runs, row)
-		snapshot.History = append(snapshot.History, row)
-	}
-	for _, delivery := range status.PermanentFailures {
-		snapshot.History = append(snapshot.History, tui.Row{
-			ID:    delivery.ID,
-			Label: delivery.ProfileID + " — trwały błąd dostarczenia",
-			Detail: fmt.Sprintf("Telegram: %s · Próby: %d · Utworzono: %s",
-				delivery.DestinationID, delivery.Attempts, delivery.CreatedAt),
-		})
-	}
-	for _, delivery := range status.OperationalDeliveries {
-		snapshot.History = append(snapshot.History, tui.Row{
-			ID:    delivery.ID,
-			Label: "Operacyjne dostarczenie — trwały błąd",
-			Detail: fmt.Sprintf("Incydent: %s · Telegram: %s · Typ: %s · Próby: %d · Utworzono: %s",
-				delivery.IncidentID, delivery.DestinationID, delivery.Kind, delivery.Attempts, delivery.CreatedAt),
-		})
-	}
-	paused := len(status.DisabledProfiles)
-	for _, profile := range profiles {
-		if profile.Enabled && authRequired[profile.AccountID] {
-			paused++
-		}
-	}
-	snapshot.Summary = fmt.Sprintf("Konta: %d · Profile: %d · Wstrzymane: %d · Problemy: %d", len(snapshot.Accounts), len(snapshot.Profiles), paused, len(status.ActiveIncidents))
-	return snapshot, nil
+	return terminalSnapshotWithContext(context.Background(), settings, prune)
 }
 
-func terminalActionTarget(action historyAction) int {
-	if action.Code == "active_incident" {
-		switch action.Scope {
-		case "account":
-			return 1
-		case "profile":
-			return 2
-		case "destination":
-			return 3
-		default:
-			return 4
-		}
+func terminalSnapshotWithContext(ctx context.Context, settings options, prune bool) (tui.Snapshot, error) {
+	state, err := application.New(application.Config{
+		Database:         settings.database,
+		SessionDir:       settings.sessionDir,
+		MedicoverBaseURL: settings.medicoverBaseURL,
+	}).Snapshot(ctx, prune)
+	if err != nil {
+		return tui.Snapshot{}, err
 	}
-	return map[string]int{"account": 1, "profile": 2, "destination": 3, "delivery": 5, "operational_delivery": 5, "history": 5}[action.Scope]
+	return tui.Snapshot{
+		Accounts:      tuiRows(state.Accounts),
+		Profiles:      tuiRows(state.Profiles),
+		Destinations:  tuiRows(state.Destinations),
+		Monitoring:    tuiRows(state.Monitoring),
+		Runs:          tuiRows(state.Runs),
+		History:       tuiRows(state.History),
+		Actions:       tuiRows(state.Actions),
+		ProfileValues: tuiProfileValues(state.ProfileValues),
+		Summary:       state.Summary,
+	}, nil
 }
 
-func profileNextRun(storage *store.Store, profile store.Profile, authRequired bool, now time.Time) string {
-	if !profile.Enabled || authRequired {
-		return "wstrzymany"
+func tuiRows(rows []application.Row) []tui.Row {
+	converted := make([]tui.Row, 0, len(rows))
+	for _, row := range rows {
+		converted = append(converted, tui.Row{ID: row.ID, Label: row.Label, Detail: row.Detail, Target: row.Target})
 	}
-	last, ok := latestRunStart(storage, profile.ID)
-	if !ok {
-		return "oczekuje na pierwszy przebieg"
+	return converted
+}
+
+func tuiProfileValues(values map[string]application.ProfileValues) map[string]tui.ProfileValues {
+	converted := make(map[string]tui.ProfileValues, len(values))
+	for id, value := range values {
+		converted[id] = tui.ProfileValues{
+			AccountID: value.AccountID, RegionIDs: value.RegionIDs, SpecialtyIDs: value.SpecialtyIDs,
+			ClinicIDs: value.ClinicIDs, DoctorIDs: value.DoctorIDs, LanguageIDs: value.LanguageIDs,
+			VisitType: value.VisitType, SearchType: value.SearchType, StartDate: value.StartDate,
+			EndDate: value.EndDate, CheckIntervalMinutes: value.CheckIntervalMinutes, Enabled: value.Enabled,
+		}
 	}
-	next := monitoring.NextRunAfter(profile, last)
-	if !next.After(now) {
-		return "teraz"
-	}
-	return next.Format("2006-01-02 15:04")
+	return converted
 }
 
 func terminalError(code string) string {

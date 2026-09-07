@@ -82,11 +82,13 @@ and notifications.
 
 ## Implementation and tests
 
-`internal/tui` owns screen state and keyboard behavior. `internal/cli/tui.go`
-connects its requests to the same account, profile, and check use cases used by the CLI. It maps
-status to Polish text and supplies only display data to the model. It does not
-send command output or raw errors to the terminal. The Medicover module owns
-the MFA challenge and accepts an optional input callback.
+`internal/tui` owns screen state and keyboard behavior. The
+`internal/application` service owns profile actions and the safe monitoring
+query. `internal/cli/tui.go` maps TUI requests to that service and to the
+shared check use case used by the CLI. It supplies only display data to the
+model and does not send command output or raw errors to the terminal. The
+Medicover module owns the MFA challenge and accepts an optional input
+callback.
 
 State tests use real SQLite files and a local Medicover test server. They cover
 account changes, profile creation and editing, dry and durable checks, profile
