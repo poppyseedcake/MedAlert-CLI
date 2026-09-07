@@ -21,6 +21,14 @@ func runCheck(command string, settings options, stdin *os.File, stdout, stderr i
 }
 
 func runCheckWithContext(ctx context.Context, command string, settings options, stdin *os.File, stdout, stderr io.Writer) int {
+	return runCheckWithPrompt(ctx, command, settings, stdin, stdout, stderr, nil)
+}
+
+// runCheckWithPrompt is the shared check use case with an optional prompt
+// callback for an interactive adapter. Command-line checks remain
+// non-interactive; the Polish terminal can provide the same password and MFA
+// flow as account login without exposing secret input to this package.
+func runCheckWithPrompt(ctx context.Context, command string, settings options, stdin *os.File, stdout, stderr io.Writer, prompt func(context.Context, string) (string, error)) int {
 	jsonOutput := settings.output == "json"
 	if len(settings.positionals) > 1 || (settings.profileID != "" && len(settings.positionals) > 0 && settings.positionals[0] != settings.profileID) {
 		writeError(stderr, command, "invalid_arguments", "use either --profile or one positional profile id", jsonOutput)
@@ -79,26 +87,56 @@ func runCheckWithContext(ctx context.Context, command string, settings options, 
 	defer cancel()
 	auth, authErr := client.Authenticate(ctx, medicover.AuthRequest{Session: saved})
 	if authErr != nil && medicover.IsAuthRequired(authErr) {
-		password, resolveErr := secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, stdin, stderr, true)
+		var password string
+		var resolveErr error
+		if prompt != nil && account.PasswordSource == store.PasswordSourcePrompt {
+			password, resolveErr = prompt(ctx, "password")
+		} else {
+			password, resolveErr = secrets.Resolve(account.PasswordSource, account.PasswordRef, account.ID, stdin, stderr, true)
+		}
 		if resolveErr != nil {
+			if errors.Is(resolveErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				writeError(stderr, command, "timeout", "authentication timed out", jsonOutput)
+				return 4
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return reportContextError(stderr, command, ctxErr, jsonOutput)
+			}
 			return reportSecretError(stderr, command, resolveErr, jsonOutput)
 		}
-		auth, authErr = client.Authenticate(ctx, medicover.AuthRequest{Username: medicover.Secret(account.Username), Password: medicover.Secret(password), Session: saved})
+		passwordSecret := medicover.Secret(password)
 		password = ""
+		var requestMFA func(context.Context) (medicover.Secret, error)
+		if prompt != nil {
+			requestMFA = func(promptContext context.Context) (medicover.Secret, error) {
+				value, promptErr := prompt(promptContext, "mfa")
+				return medicover.Secret(value), promptErr
+			}
+		}
+		auth, authErr = client.Authenticate(ctx, medicover.AuthRequest{
+			Username:   medicover.Secret(account.Username),
+			Password:   passwordSecret,
+			RequestMFA: requestMFA,
+			Session:    saved,
+		})
 	}
 	if authErr != nil {
-		now := time.Now().UTC()
-		if recordErr := recordAccountFailure(storage, account, authErr, now); recordErr != nil {
-			return reportStoreError(stderr, command, recordErr, jsonOutput)
-		}
-		if _, processErr := processIncidentDeliveries(ctx, storage, settings, stdin, stderr); processErr != nil {
-			return reportStoreError(stderr, command, processErr, jsonOutput)
+		if !settings.dry {
+			now := time.Now().UTC()
+			if recordErr := recordAccountFailure(storage, account, authErr, now); recordErr != nil {
+				return reportStoreError(stderr, command, recordErr, jsonOutput)
+			}
+			if _, processErr := processIncidentDeliveries(ctx, storage, settings, stdin, stderr); processErr != nil {
+				return reportStoreError(stderr, command, processErr, jsonOutput)
+			}
 		}
 		return reportMedicoverError(stderr, command, authErr, jsonOutput)
 	}
-	if err := backend.Save(account.ID, auth.Session); err != nil {
-		writeError(stderr, command, "temporary_failure", "cannot save session state", jsonOutput)
-		return 4
+	if !settings.dry {
+		if err := backend.Save(account.ID, auth.Session); err != nil {
+			writeError(stderr, command, "temporary_failure", "cannot save session state", jsonOutput)
+			return 4
+		}
 	}
 	if settings.dry {
 		result, err := client.Search(ctx, auth.AccessToken, searchCriteriaForProfile(profile))

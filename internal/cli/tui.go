@@ -11,6 +11,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/poppyseedcake/MedAlert/internal/monitoring"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/poppyseedcake/MedAlert/internal/tui"
 	"golang.org/x/term"
@@ -78,10 +79,10 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		code = runProfile("profile delete", settings, &stdout, &stderr)
 	case "profile-dry-check":
 		settings.dry = true
-		code = runCheckWithContext(ctx, "check", settings, nil, &stdout, &stderr)
+		code = runCheckWithPrompt(ctx, "check", settings, nil, &stdout, &stderr, prompt)
 		checkResultMessage = dryCheckMessage(request.ID, stdout.Bytes())
 	case "profile-check":
-		code = runCheckWithContext(ctx, "check", settings, nil, &stdout, &stderr)
+		code = runCheckWithPrompt(ctx, "check", settings, nil, &stdout, &stderr, prompt)
 		checkResultMessage = "Wykonano trwałą kontrolę profilu."
 	default:
 		return tui.Result{Failed: true, Message: "Nieznana operacja."}
@@ -100,7 +101,7 @@ func terminalAction(ctx context.Context, settings options, request tui.Request, 
 		}
 		return tui.Result{Failed: true, Message: message}
 	}
-	snapshot, err := terminalSnapshot(settings)
+	snapshot, err := terminalSnapshotWithPrune(settings, request.Action != "profile-dry-check")
 	if err != nil {
 		return tui.Result{Failed: true, Message: "Nie można odczytać stanu. Sprawdź dostęp do bazy. R: ponów."}
 	}
@@ -182,13 +183,19 @@ func dryCheckMessage(profileID string, raw []byte) string {
 }
 
 func terminalSnapshot(settings options) (tui.Snapshot, error) {
+	return terminalSnapshotWithPrune(settings, true)
+}
+
+func terminalSnapshotWithPrune(settings options, prune bool) (tui.Snapshot, error) {
 	snapshot := tui.Snapshot{ProfileValues: map[string]tui.ProfileValues{}}
 	storage, err := ensureStore(settings.database)
 	if err != nil {
 		return snapshot, err
 	}
 	defer storage.Close()
-	pruneHistoryBestEffort(storage)
+	if prune {
+		pruneHistoryBestEffort(storage)
+	}
 	status, err := collectHistoryStatusForIssuer(storage, sessionStoreFor(settings), settings.medicoverBaseURL)
 	if err != nil {
 		return snapshot, err
@@ -351,7 +358,7 @@ func profileNextRun(storage *store.Store, profile store.Profile, authRequired bo
 	if !ok {
 		return "oczekuje na pierwszy przebieg"
 	}
-	next := last.Add(time.Duration(profile.CheckIntervalMinutes) * time.Minute)
+	next := monitoring.NextRunAfter(profile, last)
 	if !next.After(now) {
 		return "teraz"
 	}
