@@ -74,6 +74,11 @@ func TestTelegramCreateListShowEditEnableDisableDelete(t *testing.T) {
 	if code := RunWithIO([]string{"telegram", "edit", "--database", database, "--non-interactive", "--telegram", "phone", "--name", "Nowy"}, os.Stdin, &stdout, &stderr, getenv); code != 0 {
 		t.Fatalf("edit = %d %q", code, stderr.String())
 	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := RunWithIO([]string{"telegram", "edit", "--database", database, "--non-interactive", "--telegram", "phone", "--name", "Nowy", "--chat-id", "123"}, os.Stdin, &stdout, &stderr, getenv); code != 0 {
+		t.Fatalf("idempotent edit = %d %q", code, stderr.String())
+	}
 
 	stdout.Reset()
 	stderr.Reset()

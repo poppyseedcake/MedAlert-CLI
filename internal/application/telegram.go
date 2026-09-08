@@ -179,6 +179,9 @@ func editTelegramDestination(ctx context.Context, storage *store.Store, id strin
 		changed = true
 	}
 	if !changed {
+		if strings.TrimSpace(values.Name) != "" || strings.TrimSpace(values.ChatID) != "" || strings.TrimSpace(values.TokenFile) != "" || selection != nil {
+			return current, nil
+		}
 		return store.Destination{}, &OperationError{Code: "invalid_arguments", Message: "no telegram destination changes requested"}
 	}
 	if err := ctx.Err(); err != nil {
