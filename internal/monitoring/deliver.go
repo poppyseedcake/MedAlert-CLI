@@ -18,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/poppyseedcake/MedAlert/internal/telegram"
 )
@@ -26,12 +25,12 @@ import (
 // DeliverySummary describes what one processing pass did. Deliveries holds the
 // final states of attempted and stale-cancelled rows in this pass.
 type DeliverySummary struct {
-	Attempted   int              `json:"attempted"`
-	Delivered   int              `json:"delivered"`
-	StillRetry  int              `json:"retrying"`
-	Failed      int              `json:"failed"`
-	Cancelled   int              `json:"cancelled"`
-	Deliveries  []store.Delivery `json:"deliveries"`
+	Attempted  int              `json:"attempted"`
+	Delivered  int              `json:"delivered"`
+	StillRetry int              `json:"retrying"`
+	Failed     int              `json:"failed"`
+	Cancelled  int              `json:"cancelled"`
+	Deliveries []store.Delivery `json:"deliveries"`
 }
 
 // ProcessAvailabilityDeliveries coordinates Telegram sends after a complete
@@ -144,10 +143,10 @@ func ProcessAvailabilityDeliveries(ctx context.Context, storage *store.Store, pr
 // so summary counts stay honest: skips never consume attempts, stale
 // cancellations stop without sending, and stops leave pending for later.
 type deliveryOutcome struct {
-	final         store.Delivery
-	skipped       bool
+	final          store.Delivery
+	skipped        bool
 	staleCancelled bool
-	stop          bool
+	stop           bool
 }
 
 func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store.Profile, pending store.Delivery, sender *telegram.Client, resolveToken func(store.Destination) (telegram.Secret, error)) (deliveryOutcome, error) {
@@ -210,24 +209,6 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 		}
 		return deliveryOutcome{}, err
 	}
-	token, err := resolveToken(destination)
-	if err != nil {
-		// Transient secret outages (for example Secret Service temporarily
-		// unavailable) stay retryable within the shared five-attempt budget;
-		// missing or invalid configuration is terminal.
-		status := store.DeliveryPermanentFailure
-		if secrets.IsTransient(err) {
-			status = store.DeliveryRetry
-		}
-		final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: status, LastError: shortDeliveryMessage(err)}, time.Now().UTC())
-		if recordErr != nil {
-			if errors.Is(recordErr, store.ErrDeliveryConflict) {
-				return deliveryOutcome{skipped: true}, nil
-			}
-			return deliveryOutcome{}, recordErr
-		}
-		return deliveryOutcome{final: final}, nil
-	}
 	text := telegram.FormatAvailability(telegram.Availability{
 		Profile:   profile.ID,
 		Time:      episode.Time,
@@ -236,65 +217,11 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 		Clinic:    episode.Clinic,
 		VisitType: episode.VisitType,
 	})
-	result, err := sender.SendMessage(ctx, token, destination.ChatID, text)
-	if err != nil {
-		var telegramErr *telegram.Error
-		if ctx != nil && ctx.Err() != nil {
-			return deliveryOutcome{stop: true}, nil
-		}
-		if errors.As(err, &telegramErr) && telegramErr.Code == telegram.CodeCancelled {
-			return deliveryOutcome{stop: true}, nil
-		}
-		// Fresh confirmation timestamp per attempt: retry_after is relative
-		// to the Telegram response, so anchoring it to a stale batch start
-		// after a slow response would store an already-past backoff.
-		recordedAt := time.Now().UTC()
-		if errors.As(err, &telegramErr) {
-			switch {
-			case telegram.IsTemporary(err):
-				next := store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}
-				if telegramErr.Code == telegram.CodeRateLimited && telegramErr.RetryAfter > 0 {
-					next.HasNextRetry = true
-					next.NextAttempt = recordedAt.Add(telegramErr.RetryAfter)
-				}
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, next, recordedAt)
-				if recordErr != nil {
-					if errors.Is(recordErr, store.ErrDeliveryConflict) {
-						return deliveryOutcome{skipped: true}, nil
-					}
-					return deliveryOutcome{}, recordErr
-				}
-				return deliveryOutcome{final: final}, nil
-			case telegram.IsPermanent(err):
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortDeliveryMessage(err)}, recordedAt)
-				if recordErr != nil {
-					if errors.Is(recordErr, store.ErrDeliveryConflict) {
-						return deliveryOutcome{skipped: true}, nil
-					}
-					return deliveryOutcome{}, recordErr
-				}
-				return deliveryOutcome{final: final}, nil
-			default:
-				final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, recordedAt)
-				if recordErr != nil {
-					if errors.Is(recordErr, store.ErrDeliveryConflict) {
-						return deliveryOutcome{skipped: true}, nil
-					}
-					return deliveryOutcome{}, recordErr
-				}
-				return deliveryOutcome{final: final}, nil
-			}
-		}
-		final, recordErr := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortDeliveryMessage(err)}, recordedAt)
-		if recordErr != nil {
-			if errors.Is(recordErr, store.ErrDeliveryConflict) {
-				return deliveryOutcome{skipped: true}, nil
-			}
-			return deliveryOutcome{}, recordErr
-		}
-		return deliveryOutcome{final: final}, nil
+	outcome := sendTelegramDelivery(ctx, sender, destination, text, resolveToken)
+	if outcome.stop {
+		return deliveryOutcome{stop: true}, nil
 	}
-	final, err := storage.RecordDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: result.MessageID}, time.Now().UTC())
+	final, err := storage.RecordDeliveryResult(claimed.ID, claimed, outcome.result, outcome.recordedAt)
 	if err != nil {
 		if errors.Is(err, store.ErrDeliveryConflict) {
 			return deliveryOutcome{skipped: true}, nil
@@ -302,18 +229,4 @@ func attemptOneDelivery(ctx context.Context, storage *store.Store, profile store
 		return deliveryOutcome{}, err
 	}
 	return deliveryOutcome{final: final}, nil
-}
-
-func shortDeliveryMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	message := strings.TrimSpace(err.Error())
-	if len(message) > 500 {
-		return message[:500]
-	}
-	if message == "" {
-		return "telegram send failed"
-	}
-	return message
 }
