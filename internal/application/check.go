@@ -110,7 +110,7 @@ func (a *Application) Check(ctx context.Context, request CheckRequest) (CheckRes
 	}
 	if authErr != nil {
 		if !request.Dry {
-			if recordErr := recordAccountFailure(storage, account, authErr, time.Now().UTC()); recordErr != nil {
+			if _, recordErr := monitoring.HandleAuthenticationFailure(storage, account.ID, authErr, time.Now().UTC()); recordErr != nil {
 				return result, &OperationError{Code: "database_error", Message: recordErr.Error(), Cause: recordErr}
 			}
 			if _, processErr := a.processIncidentDeliveries(checkContext, storage, request.Stdin); processErr != nil {
@@ -135,11 +135,7 @@ func (a *Application) Check(ctx context.Context, request CheckRequest) (CheckRes
 	checked, err := monitoring.Check(checkContext, storage, profile, account, client, auth.AccessToken, time.Now().UTC())
 	if err != nil {
 		now := time.Now().UTC()
-		if medicover.IsAuthRequired(err) {
-			if recordErr := recordAccountFailure(storage, account, err, now); recordErr != nil {
-				return result, &OperationError{Code: "database_error", Message: recordErr.Error(), Cause: recordErr}
-			}
-		} else if recordErr := recordProfileFailure(storage, profile, err, now); recordErr != nil {
+		if _, recordErr := monitoring.HandleCheckFailure(storage, profile, err, now); recordErr != nil {
 			return result, &OperationError{Code: "database_error", Message: recordErr.Error(), Cause: recordErr}
 		}
 		if _, processErr := a.processIncidentDeliveries(checkContext, storage, request.Stdin); processErr != nil {
@@ -147,14 +143,14 @@ func (a *Application) Check(ctx context.Context, request CheckRequest) (CheckRes
 		}
 		return result, err
 	}
-	if err := resolveIncidentsOnSuccess(storage, profile, time.Now().UTC()); err != nil {
+	if _, err := monitoring.ResolveCheckIncidents(storage, profile, time.Now().UTC()); err != nil {
 		return result, &OperationError{Code: "database_error", Message: err.Error(), Cause: err}
 	}
 	deliveries, err := a.deliverAfterCheck(checkContext, storage, profile, checked, request.Stdin)
 	if err != nil {
 		return result, &OperationError{Code: "database_error", Message: err.Error(), Cause: err}
 	}
-	if err := trackDestinationIncidents(storage, profile, deliveries, time.Now().UTC()); err != nil {
+	if _, err := monitoring.ReconcileDestinationIncidents(storage, profile, deliveries, time.Now().UTC()); err != nil {
 		return result, &OperationError{Code: "database_error", Message: err.Error(), Cause: err}
 	}
 	incidents, err := a.processIncidentDeliveries(checkContext, storage, request.Stdin)
@@ -217,113 +213,6 @@ func searchCriteria(profile store.Profile) medicover.SearchCriteria {
 		DoctorIDs: profile.DoctorIDs, LanguageIDs: profile.LanguageIDs, VisitType: profile.VisitType,
 		SearchType: profile.SearchType, StartDate: profile.StartDate, EndDate: profile.EndDate,
 	}
-}
-
-func incidentFailureCode(err error) (string, string) {
-	var medicoverErr *medicover.Error
-	if errors.As(err, &medicoverErr) {
-		code := strings.TrimSpace(medicoverErr.Code)
-		if code == "" {
-			code = "temporary_failure"
-		}
-		return code, strings.TrimSpace(medicoverErr.Message)
-	}
-	switch {
-	case errors.Is(err, store.ErrObservationRunConflicting):
-		return medicover.CodeConflicting, strings.TrimSpace(err.Error())
-	case errors.Is(err, store.ErrObservationRunStale):
-		return medicover.CodeStale, strings.TrimSpace(err.Error())
-	case errors.Is(err, store.ErrObservationRunActive):
-		return "run_active", strings.TrimSpace(err.Error())
-	case errors.Is(err, store.ErrProfileDisabled):
-		return "profile_disabled", strings.TrimSpace(err.Error())
-	default:
-		message := strings.TrimSpace(err.Error())
-		if len(message) > 500 {
-			message = message[:500]
-		}
-		if message == "" {
-			message = "observation failed"
-		}
-		return "temporary_failure", message
-	}
-}
-
-func shouldRecordProfileIncident(err error) bool {
-	if err == nil || errors.Is(err, store.ErrObservationRunActive) || errors.Is(err, store.ErrProfileDisabled) ||
-		errors.Is(err, store.ErrObservationRunInvalid) || errors.Is(err, store.ErrObservationRunNotFound) || errors.Is(err, store.ErrProfileNotFound) {
-		return false
-	}
-	var medicoverErr *medicover.Error
-	if errors.As(err, &medicoverErr) {
-		switch medicoverErr.Code {
-		case medicover.CodeCancelled, medicover.CodeTimeout, medicover.CodeConflicting, medicover.CodeStale:
-			return false
-		default:
-			return true
-		}
-	}
-	if errors.Is(err, store.ErrObservationRunConflicting) || errors.Is(err, store.ErrObservationRunStale) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	return true
-}
-
-func shouldRecordAccountIncident(err error) bool {
-	if err == nil || errors.Is(err, secrets.ErrMissingInput) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	var medicoverErr *medicover.Error
-	return errors.As(err, &medicoverErr) && medicoverErr.Code != medicover.CodeCancelled && medicoverErr.Code != medicover.CodeTimeout
-}
-
-func recordAccountFailure(storage *store.Store, account store.Account, authErr error, now time.Time) error {
-	if !shouldRecordAccountIncident(authErr) {
-		return nil
-	}
-	code, message := incidentFailureCode(authErr)
-	_, _, err := monitoring.RecordAccountFailure(storage, account.ID, code, message, now)
-	return err
-}
-
-func recordProfileFailure(storage *store.Store, profile store.Profile, checkErr error, now time.Time) error {
-	if !shouldRecordProfileIncident(checkErr) {
-		return nil
-	}
-	code, message := incidentFailureCode(checkErr)
-	_, _, err := monitoring.RecordProfileFailure(storage, profile, code, message, now)
-	return err
-}
-
-func resolveIncidentsOnSuccess(storage *store.Store, profile store.Profile, now time.Time) error {
-	if _, err := monitoring.ResolveProfileIncident(storage, profile, now); err != nil {
-		return err
-	}
-	_, err := monitoring.ResolveAccountIncident(storage, profile.AccountID, now)
-	return err
-}
-
-func trackDestinationIncidents(storage *store.Store, profile store.Profile, summary monitoring.DeliverySummary, now time.Time) error {
-	failed := map[string]store.Delivery{}
-	for _, delivery := range summary.Deliveries {
-		if delivery.Status != store.DeliveryPermanentFailure || strings.Contains(strings.ToLower(delivery.LastError), "no longer available") || strings.Contains(strings.ToLower(delivery.LastError), "incident ended before") || strings.Contains(strings.ToLower(delivery.LastError), "5 attempts") {
-			continue
-		}
-		failed[delivery.DestinationID] = delivery
-		if _, _, err := monitoring.RecordDestinationFailure(storage, profile, delivery.DestinationID, "permanent_failure", delivery.LastError, now); err != nil {
-			return err
-		}
-	}
-	for _, delivery := range summary.Deliveries {
-		if delivery.Status == store.DeliveryDelivered {
-			if _, ok := failed[delivery.DestinationID]; !ok {
-				if _, err := monitoring.ResolveDestinationIncident(storage, profile, delivery.DestinationID, now); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
 }
 
 func (a *Application) telegramSender() *telegram.Client {

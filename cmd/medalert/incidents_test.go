@@ -1,11 +1,14 @@
 package main_test
 
 import (
+	"database/sql"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func incidentQuery(t *testing.T, database, query string) string {
@@ -555,5 +558,72 @@ func TestIncidentMixedPassKeepsDestinationFailure(t *testing.T) {
 	}
 	if got := incidentQuery(t, database, "SELECT count(*) FROM operational_deliveries WHERE kind = 'recovery' AND status = 'delivered'"); got != "1" {
 		t.Fatalf("recoveries = %s, want 1", got)
+	}
+}
+
+func TestIncidentWatchKeepsTransitionEvents(t *testing.T) {
+	fake, cleanup := newIncidentMedicoverFake(t)
+	defer cleanup()
+	telegramFake := newIncidentTelegramFake()
+	server := httptest.NewServer(telegramFake.handler())
+	defer server.Close()
+	database, environment, secretDir := createIncidentFixture(t, fake.baseURL, server.URL, t.TempDir(), 1)
+	createIncidentDestinations(t, environment, secretDir)
+	createIncidentProfile(t, environment, "events", "alice", "204", "phone")
+	fake.setMode("protocol")
+	var incidentID string
+	for _, want := range []string{"incident_started", "incident_updated", "incident_resolved"} {
+		// Make the saved profile due without waiting for the wall clock.
+		db, err := sql.Open("sqlite", database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.Exec("UPDATE observation_runs SET started_at = ?", time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano))
+		db.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want == "incident_resolved" {
+			fake.setSlots()
+		}
+		result := run(t, environment, "watch", "--once", "--output", "json", "--non-interactive")
+		if result.exitCode != 0 {
+			t.Fatalf("watch=%+v", result)
+		}
+		found := 0
+		for _, line := range strings.Split(strings.TrimSpace(result.stdout), "\n") {
+			var event struct {
+				Event string         `json:"event"`
+				Data  map[string]any `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(line), &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Event != want {
+				continue
+			}
+			found++
+			if event.Data["scope"] != "profile" || event.Data["account"] != "alice" || event.Data["profile"] != "events" {
+				t.Fatalf("event=%+v", event)
+			}
+			id, ok := event.Data["incident"].(string)
+			if !ok || id == "" {
+				t.Fatalf("missing incident: %+v", event)
+			}
+			if incidentID == "" {
+				incidentID = id
+			} else if id != incidentID {
+				t.Fatalf("incident changed: %+v", event)
+			}
+			if want != "incident_resolved" && event.Data["code"] != "protocol_changed" {
+				t.Fatalf("code changed: %+v", event)
+			}
+			if want == "incident_updated" && event.Data["consecutive_failures"] != float64(2) {
+				t.Fatalf("count changed: %+v", event)
+			}
+		}
+		if found != 1 {
+			t.Fatalf("want one %s, got %d: %s", want, found, result.stdout)
+		}
 	}
 }
