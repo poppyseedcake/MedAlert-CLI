@@ -434,7 +434,7 @@ func collectHistoryStatusForIssuer(storage *store.Store, backend session.Store, 
 	}
 	for _, action := range status.RequiredActions {
 		data.RequiredActions = append(data.RequiredActions, historyAction{
-			Code: action.Code, Scope: action.Scope, ID: action.ID, Message: historyActionMessage(action),
+			Code: action.Code, Scope: action.Scope, ID: action.ID, Message: historyActionMessage(action, status),
 		})
 	}
 	data.Summary = map[string]int{
@@ -446,7 +446,7 @@ func collectHistoryStatusForIssuer(storage *store.Store, backend session.Store, 
 	return data, nil
 }
 
-func historyActionMessage(action operatorstatus.Action) string {
+func historyActionMessage(action operatorstatus.Action, status operatorstatus.Status) string {
 	switch action.Code {
 	case "authentication_required":
 		return fmt.Sprintf("account %s requires authentication", action.ID)
@@ -461,8 +461,31 @@ func historyActionMessage(action operatorstatus.Action) string {
 	case "destination_delivery_failure":
 		return fmt.Sprintf("check delivery to telegram destination %s", action.ID)
 	case "active_incident":
+		for _, incident := range status.ActiveIncidents {
+			id := incident.ScopeID
+			if id == "" {
+				id = incident.ID
+			}
+			if incident.ScopeType == action.Scope && id == action.ID {
+				return fmt.Sprintf("%s incident %s: %s", action.Scope, incident.ID, incident.FailureCode)
+			}
+		}
 		return fmt.Sprintf("check the active incident for %s %s", action.Scope, action.ID)
 	case "permanent_failure":
+		if action.Scope == "delivery" {
+			for _, delivery := range status.PermanentFailures {
+				if delivery.ID == action.ID {
+					return fmt.Sprintf("profile %s destination %s delivery failed permanently", delivery.ProfileID, delivery.DestinationID)
+				}
+			}
+		}
+		if action.Scope == "operational_delivery" {
+			for _, delivery := range status.OperationalDeliveries {
+				if delivery.ID == action.ID {
+					return fmt.Sprintf("incident %s destination %s %s delivery failed permanently", delivery.IncidentID, delivery.DestinationID, delivery.Kind)
+				}
+			}
+		}
 		return fmt.Sprintf("%s %s failed permanently", action.Scope, action.ID)
 	case "invalid_retention":
 		return "set a valid history retention period"

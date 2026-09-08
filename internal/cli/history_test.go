@@ -12,6 +12,7 @@ import (
 
 	"github.com/poppyseedcake/MedAlert/internal/application"
 	"github.com/poppyseedcake/MedAlert/internal/medicover"
+	"github.com/poppyseedcake/MedAlert/internal/operatorstatus"
 	"github.com/poppyseedcake/MedAlert/internal/session"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/zalando/go-keyring"
@@ -286,6 +287,36 @@ func TestHistoryStatusIncludesPermanentOperationalDelivery(t *testing.T) {
 		}
 	}
 	t.Fatalf("required_actions = %#v, want operational permanent failure", actions)
+}
+
+func TestHistoryActionMessagePreservesIncidentAndDeliveryDetails(t *testing.T) {
+	status := operatorstatus.Status{
+		ActiveIncidents: []store.Incident{{
+			ID: "incident-1", ScopeType: "profile", ScopeID: "profile-1", FailureCode: "authentication_required",
+		}},
+		PermanentFailures: []store.Delivery{{
+			ID: "delivery-1", ProfileID: "profile-1", DestinationID: "destination-1",
+		}},
+		OperationalDeliveries: []store.IncidentDelivery{{
+			ID: "operational-1", IncidentID: "incident-1", DestinationID: "destination-1", Kind: "recovery",
+		}},
+	}
+	tests := []struct {
+		name   string
+		action operatorstatus.Action
+		want   string
+	}{
+		{"active incident", operatorstatus.Action{Code: "active_incident", Scope: "profile", ID: "profile-1"}, "profile incident incident-1: authentication_required"},
+		{"delivery", operatorstatus.Action{Code: "permanent_failure", Scope: "delivery", ID: "delivery-1"}, "profile profile-1 destination destination-1 delivery failed permanently"},
+		{"operational delivery", operatorstatus.Action{Code: "permanent_failure", Scope: "operational_delivery", ID: "operational-1"}, "incident incident-1 destination destination-1 recovery delivery failed permanently"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := historyActionMessage(test.action, status); got != test.want {
+				t.Fatalf("historyActionMessage() = %q, want %q", got, test.want)
+			}
+		})
+	}
 }
 
 type historyStatusSessionStore struct {
