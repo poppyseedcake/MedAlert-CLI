@@ -108,13 +108,6 @@ func RecordAccountFailure(storage *store.Store, accountID, failureCode, failureM
 	return incident, newly, err
 }
 
-// ResolveAccountIncident ends the account incident after authentication
-// recovers. Recovery goes only to destinations that delivered the failure.
-func ResolveAccountIncident(storage *store.Store, accountID string, now time.Time) (store.Incident, error) {
-	incident, _, _, err := storage.ResolveIncident(store.IncidentScopeAccount, accountID, "", "", now)
-	return incident, err
-}
-
 // RecordProfileFailure tracks a search-phase failure for a profile.
 func RecordProfileFailure(storage *store.Store, profile store.Profile, failureCode, failureMessage string, now time.Time) (store.Incident, bool, error) {
 	eligible, err := EligibleDestinationsForProfile(storage, profile.ID)
@@ -123,13 +116,6 @@ func RecordProfileFailure(storage *store.Store, profile store.Profile, failureCo
 	}
 	incident, _, newly, err := storage.RecordIncidentFailure(store.IncidentScopeProfile, profile.ID, profile.AccountID, profile.ID, "", failureCode, failureMessage, now, eligible)
 	return incident, newly, err
-}
-
-// ResolveProfileIncident ends the profile incident after one complete
-// successful run.
-func ResolveProfileIncident(storage *store.Store, profile store.Profile, now time.Time) (store.Incident, error) {
-	incident, _, _, err := storage.ResolveIncident(store.IncidentScopeProfile, profile.ID, profile.ID, "", now)
-	return incident, err
 }
 
 // RecordDestinationFailure tracks a permanent Telegram delivery failure for
@@ -141,13 +127,6 @@ func RecordDestinationFailure(storage *store.Store, profile store.Profile, faile
 	}
 	incident, _, newly, err := storage.RecordIncidentFailure(store.IncidentScopeDestination, failedDestinationID, profile.AccountID, profile.ID, failedDestinationID, failureCode, failureMessage, now, notifiers)
 	return incident, newly, err
-}
-
-// ResolveDestinationIncident ends the destination incident after a later
-// delivery to the failed destination succeeds.
-func ResolveDestinationIncident(storage *store.Store, profile store.Profile, destinationID string, now time.Time) (store.Incident, error) {
-	incident, _, _, err := storage.ResolveIncident(store.IncidentScopeDestination, destinationID, profile.ID, destinationID, now)
-	return incident, err
 }
 
 // ProcessIncidentDeliveries sends due operational failure and recovery

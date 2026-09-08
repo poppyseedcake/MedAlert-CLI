@@ -610,124 +610,85 @@ func (w *watchLoop) pauseAccount(account store.Account, code, message string) {
 // queues its failure notification. It never stops other accounts: store
 // failures are logged and the caller continues with backoff.
 func (w *watchLoop) trackWatchAccountFailure(ctx context.Context, account store.Account, authErr error) {
-	if !shouldRecordAccountIncident(authErr) {
-		return
-	}
-	code, message := incidentFailureCode(authErr)
-	now := time.Now().UTC()
-	incident, newly, err := monitoring.RecordAccountFailure(w.storage, account.ID, code, message, now)
+	change, err := monitoring.HandleAuthenticationFailure(w.storage, account.ID, authErr, time.Now().UTC())
 	if err != nil {
 		w.log("account %s cannot record incident: %s", account.ID, shortWatchMessage(err))
 		return
 	}
-	if newly {
-		w.log("account %s operational incident started: %s", account.ID, code)
-		w.emitEvent("incident_started", map[string]any{"scope": store.IncidentScopeAccount, "account": account.ID, "incident": incident.ID, "code": code, "message": shortWatchMessage(authErr)})
-	} else if incident.ConsecutiveFailures > 1 {
-		w.emitEvent("incident_updated", map[string]any{"scope": store.IncidentScopeAccount, "account": account.ID, "incident": incident.ID, "code": code, "consecutive_failures": incident.ConsecutiveFailures})
+	if change.Incident.ID == "" {
+		return
 	}
+	w.emitIncidentFailure(change, authErr)
 	w.processWatchIncidents(ctx)
 }
 
-// trackWatchProfileFailure records a search-phase operational incident for
-// one profile without stopping other profiles. A search-phase authentication
-// failure means the account session is bad, so it records one account-level
-// problem instead of a profile incident.
-func (w *watchLoop) trackWatchProfileFailure(ctx context.Context, profile store.Profile, account store.Account, checkErr error) {
-	if medicover.IsAuthRequired(checkErr) {
-		// Search-phase authentication failure means the account session is
-		// bad: one account-level problem, not one problem per profile.
-		w.trackWatchAccountFailure(ctx, account, checkErr)
-		return
-	}
-	if !shouldRecordProfileIncident(checkErr) {
-		return
-	}
-	code, message := incidentFailureCode(checkErr)
-	now := time.Now().UTC()
-	incident, newly, err := monitoring.RecordProfileFailure(w.storage, profile, code, message, now)
+// trackWatchProfileFailure reports the policy result without choosing the
+// incident scope in the command adapter.
+func (w *watchLoop) trackWatchProfileFailure(ctx context.Context, profile store.Profile, checkErr error) {
+	change, err := monitoring.HandleCheckFailure(w.storage, profile, checkErr, time.Now().UTC())
 	if err != nil {
 		w.log("profile %s cannot record incident: %s", profile.ID, shortWatchMessage(err))
 		return
 	}
-	if newly {
-		w.log("profile %s operational incident started: %s", profile.ID, code)
-		w.emitEvent("incident_started", map[string]any{"scope": store.IncidentScopeProfile, "account": account.ID, "profile": profile.ID, "incident": incident.ID, "code": code, "message": shortWatchMessage(checkErr)})
+	if change.Incident.ID == "" {
+		return
+	}
+	w.emitIncidentFailure(change, checkErr)
+	w.processWatchIncidents(ctx)
+}
+
+func (w *watchLoop) emitIncidentFailure(change monitoring.IncidentChange, failure error) {
+	incident := change.Incident
+	data := map[string]any{"scope": incident.ScopeType, "account": incident.AccountID, "incident": incident.ID, "code": incident.FailureCode}
+	if incident.ScopeType == store.IncidentScopeProfile {
+		data["profile"] = incident.ProfileID
+	}
+	if change.Started {
+		w.log("%s %s operational incident started: %s", incident.ScopeType, incident.ScopeID, incident.FailureCode)
+		data["message"] = shortWatchMessage(failure)
+		w.emitEvent("incident_started", data)
 	} else if incident.ConsecutiveFailures > 1 {
-		w.emitEvent("incident_updated", map[string]any{"scope": store.IncidentScopeProfile, "account": account.ID, "profile": profile.ID, "incident": incident.ID, "code": code, "consecutive_failures": incident.ConsecutiveFailures})
+		data["consecutive_failures"] = incident.ConsecutiveFailures
+		w.emitEvent("incident_updated", data)
 	}
-	w.processWatchIncidents(ctx)
 }
 
-// resolveWatchIncidentsOnSuccess ends profile and account incidents after one
-// complete successful run and emits recovery events for newly created
-// recovery notifications.
+// resolveWatchIncidentsOnSuccess reports recoveries saved by the shared policy.
 func (w *watchLoop) resolveWatchIncidentsOnSuccess(ctx context.Context, profile store.Profile) {
-	now := time.Now().UTC()
-	profileIncident, recoveries, _, err := w.storage.ResolveIncident(store.IncidentScopeProfile, profile.ID, profile.ID, "", now)
-	if err != nil {
-		w.log("profile %s cannot resolve incident: %s", profile.ID, shortWatchMessage(err))
-	} else if profileIncident.ID != "" && len(recoveries) > 0 {
-		w.log("profile %s operational incident resolved", profile.ID)
-		w.emitEvent("incident_resolved", map[string]any{"scope": store.IncidentScopeProfile, "account": profile.AccountID, "profile": profile.ID, "incident": profileIncident.ID})
+	changes, err := monitoring.ResolveCheckIncidents(w.storage, profile, time.Now().UTC())
+	for _, change := range changes {
+		if !change.RecoveryQueued {
+			continue
+		}
+		incident := change.Incident
+		w.log("%s %s operational incident resolved", incident.ScopeType, incident.ScopeID)
+		data := map[string]any{"scope": incident.ScopeType, "account": incident.AccountID, "incident": incident.ID}
+		if incident.ScopeType == store.IncidentScopeProfile {
+			data["profile"] = incident.ProfileID
+		}
+		w.emitEvent("incident_resolved", data)
 	}
-	if accountIncident, accountRecoveries, _, err := w.storage.ResolveIncident(store.IncidentScopeAccount, profile.AccountID, "", "", now); err != nil {
-		w.log("account %s cannot resolve incident: %s", profile.AccountID, shortWatchMessage(err))
-	} else if accountIncident.ID != "" && len(accountRecoveries) > 0 {
-		w.log("account %s operational incident resolved", profile.AccountID)
-		w.emitEvent("incident_resolved", map[string]any{"scope": store.IncidentScopeAccount, "account": profile.AccountID, "incident": accountIncident.ID})
+	if err != nil {
+		w.log("profile %s cannot resolve incidents: %s", profile.ID, shortWatchMessage(err))
 	}
 	w.processWatchIncidents(ctx)
 }
 
-// trackWatchDestinationIncidents creates destination incidents for permanent
-// non-stale availability failures and resolves incidents for destinations
-// that delivered successfully. It never stops other profiles.
-func (w *watchLoop) trackWatchDestinationIncidents(ctx context.Context, profile store.Profile, summary monitoring.DeliverySummary) error {
-	now := time.Now().UTC()
-	failed := map[string]bool{}
-	for _, delivery := range summary.Deliveries {
-		if delivery.Status != store.DeliveryPermanentFailure {
-			continue
-		}
-		if strings.Contains(strings.ToLower(delivery.LastError), "no longer available") {
-			continue
-		}
-		if strings.Contains(strings.ToLower(delivery.LastError), "incident ended before") {
-			continue
-		}
-		if strings.Contains(strings.ToLower(delivery.LastError), "5 attempts") {
-			continue
-		}
-		failed[delivery.DestinationID] = true
-		incident, newly, err := monitoring.RecordDestinationFailure(w.storage, profile, delivery.DestinationID, "permanent_failure", delivery.LastError, now)
-		if err != nil {
-			return err
-		}
-		if newly {
-			w.log("profile %s destination %s delivery failed permanently", profile.ID, delivery.DestinationID)
-			w.emitEvent("incident_started", map[string]any{"scope": store.IncidentScopeDestination, "account": profile.AccountID, "profile": profile.ID, "destination": delivery.DestinationID, "incident": incident.ID, "code": "permanent_failure"})
+func (w *watchLoop) trackWatchDestinationIncidents(profile store.Profile, summary monitoring.DeliverySummary) error {
+	changes, err := monitoring.ReconcileDestinationIncidents(w.storage, profile, summary, time.Now().UTC())
+	for _, change := range changes {
+		incident := change.Incident
+		data := map[string]any{"scope": store.IncidentScopeDestination, "account": profile.AccountID, "profile": profile.ID, "destination": incident.DestinationID, "incident": incident.ID}
+		if change.Started {
+			w.log("profile %s destination %s delivery failed permanently", profile.ID, incident.DestinationID)
+			data["code"] = "permanent_failure"
+			w.emitEvent("incident_started", data)
+		} else if incident.Status == store.IncidentStatusResolved {
+			w.log("profile %s destination %s delivery recovered", profile.ID, incident.DestinationID)
+			w.emitEvent("incident_resolved", data)
 		}
 	}
-	for _, delivery := range summary.Deliveries {
-		if delivery.Status != store.DeliveryDelivered {
-			continue
-		}
-		// Destinations that also failed in this same pass keep their
-		// incident: the route is still broken, and resolving now would
-		// cancel the just-created failure notification before it is
-		// reported.
-		if failed[delivery.DestinationID] {
-			continue
-		}
-		if incident, _, _, err := w.storage.ResolveIncident(store.IncidentScopeDestination, delivery.DestinationID, profile.ID, delivery.DestinationID, now); err != nil {
-			return err
-		} else if incident.ID != "" {
-			w.log("profile %s destination %s delivery recovered", profile.ID, delivery.DestinationID)
-			w.emitEvent("incident_resolved", map[string]any{"scope": store.IncidentScopeDestination, "account": profile.AccountID, "profile": profile.ID, "destination": delivery.DestinationID, "incident": incident.ID})
-		}
-	}
-	return nil
+	return err
 }
 
 // processWatchIncidents sends due operational failure/recovery notifications
@@ -794,7 +755,7 @@ func (w *watchLoop) checkOne(ctx context.Context, profile store.Profile, account
 		}
 		w.log("profile %s check %s: %s", profile.ID, code, message)
 		w.emitEvent("run_failed", map[string]any{"account": account.ID, "profile": profile.ID, "code": code, "message": message})
-		w.trackWatchProfileFailure(ctx, profile, account, err)
+		w.trackWatchProfileFailure(ctx, profile, err)
 		return
 	}
 	// One complete successful run ends operational incidents. Failed runs
@@ -802,7 +763,7 @@ func (w *watchLoop) checkOne(ctx context.Context, profile store.Profile, account
 	// availability episodes.
 	w.resolveWatchIncidentsOnSuccess(ctx, profile)
 	deliveries := w.deliverAfterWatchCheck(ctx, profile, result)
-	if err := w.trackWatchDestinationIncidents(ctx, profile, deliveries); err != nil {
+	if err := w.trackWatchDestinationIncidents(profile, deliveries); err != nil {
 		w.log("profile %s cannot track destination incidents: %s", profile.ID, shortWatchMessage(err))
 	}
 	w.processWatchIncidents(ctx)
