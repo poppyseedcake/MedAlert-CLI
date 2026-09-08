@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/poppyseedcake/MedAlert/internal/application"
 	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/poppyseedcake/MedAlert/internal/telegram"
@@ -37,6 +38,13 @@ func runTelegram(command string, settings options, stdin *os.File, stdout, stder
 		writeError(stderr, command, "invalid_arguments", "a supported telegram command is required", jsonOutput)
 		return 2
 	}
+}
+
+func telegramApplicationFor(settings options) *application.Application {
+	return application.New(application.Config{
+		Database:        settings.database,
+		TelegramBaseURL: settings.telegramBaseURL,
+	})
 }
 
 func resolveTelegramID(settings options) string {
@@ -133,68 +141,14 @@ func telegramCreate(command string, settings options, stdin *os.File, stdout, st
 		writeError(stderr, command, "invalid_arguments", "use only one of --token-file, --token-prompt, --no-stored-token", jsonOutput)
 		return 2
 	}
-	intendedSource, intendedRef := intendedTokenSource(settings)
-	if err := store.ValidateDestination(store.Destination{ID: id, Name: name, ChatID: chatID, TokenSource: intendedSource, TokenRef: intendedRef, Enabled: true}); err != nil {
-		return reportTelegramError(stderr, command, err, jsonOutput)
-	}
-	storage, err := ensureStore(settings.database)
+	source, ref := intendedTokenSource(settings)
+	created, err := telegramApplicationFor(settings).Telegram(context.Background(), application.TelegramRequest{
+		Action: "create", ID: id,
+		Values:         application.DestinationValues{Name: name, ChatID: chatID},
+		TokenSelection: &application.TelegramTokenSelection{Source: source, Ref: ref},
+	}, telegramPromptForCLI(settings, stdin, stderr))
 	if err != nil {
-		return reportStoreError(stderr, command, err, jsonOutput)
-	}
-	defer storage.Close()
-	if _, err := storage.GetDestination(id); err == nil {
-		writeError(stderr, command, "destination_exists", fmt.Sprintf("telegram destination %q already exists", id), jsonOutput)
-		return 2
-	} else if !errors.Is(err, store.ErrDestinationNotFound) {
-		if errors.Is(err, store.ErrDestinationInvalid) {
-			return reportTelegramError(stderr, command, err, jsonOutput)
-		}
-		return reportStoreError(stderr, command, err, jsonOutput)
-	}
-	if intendedSource == store.TokenSourceSecretService {
-		// Prompt before INSERT so two concurrent creates cannot both pass
-		// the duplicate check and overwrite each other's token. Only the
-		// INSERT winner saves its token; the loser returns
-		// destination_exists without touching Secret Service.
-		tokenValue, secretErr := secrets.PromptForPassword("Telegram bot token: ", stdin, stderr, settings.nonInteractive)
-		if secretErr != nil {
-			return reportSecretError(stderr, command, secretErr, jsonOutput)
-		}
-		created, err := storage.CreateDestination(store.Destination{
-			ID:          id,
-			Name:        name,
-			ChatID:      chatID,
-			TokenSource: intendedSource,
-			TokenRef:    intendedRef,
-			Enabled:     true,
-		})
-		if err != nil {
-			tokenValue = ""
-			return reportTelegramError(stderr, command, err, jsonOutput)
-		}
-		if err := secrets.SetTelegramToken(id, tokenValue); err != nil {
-			tokenValue = ""
-			_ = storage.DeleteDestination(id)
-			return reportSecretError(stderr, command, err, jsonOutput)
-		}
-		tokenValue = ""
-		writeDestination(stdout, command, created, fmt.Sprintf("Created telegram destination %s.\n", created.ID), jsonOutput)
-		return 0
-	}
-	source, ref, secretErr := prepareNewTelegramSecret(id, settings, stdin, stderr)
-	if secretErr != nil {
-		return reportSecretError(stderr, command, secretErr, jsonOutput)
-	}
-	created, err := storage.CreateDestination(store.Destination{
-		ID:          id,
-		Name:        name,
-		ChatID:      chatID,
-		TokenSource: source,
-		TokenRef:    ref,
-		Enabled:     true,
-	})
-	if err != nil {
-		return reportTelegramError(stderr, command, err, jsonOutput)
+		return reportApplicationTelegramError(stderr, command, err, jsonOutput)
 	}
 	writeDestination(stdout, command, created, fmt.Sprintf("Created telegram destination %s.\n", created.ID), jsonOutput)
 	return 0
@@ -250,62 +204,21 @@ func telegramEdit(command string, settings options, stdin *os.File, stdout, stde
 		writeError(stderr, command, "invalid_arguments", "no telegram changes requested (use --name, --chat-id, --token-file, --token-prompt, or --no-stored-token)", jsonOutput)
 		return 2
 	}
-	storage, err := ensureStore(settings.database)
-	if err != nil {
-		return reportStoreError(stderr, command, err, jsonOutput)
-	}
-	defer storage.Close()
-	current, err := storage.GetDestination(strings.TrimSpace(id))
-	if err != nil {
-		return reportTelegramError(stderr, command, err, jsonOutput)
-	}
-	update := store.DestinationUpdate{}
-	newName := current.Name
-	newChat := current.ChatID
+	values := application.DestinationValues{}
 	if hasName {
-		trimmed := strings.TrimSpace(settings.telegramName)
-		update.Name = &trimmed
-		newName = trimmed
+		values.Name = strings.TrimSpace(settings.telegramName)
 	}
 	if hasChat {
-		trimmed := strings.TrimSpace(settings.chatID)
-		update.ChatID = &trimmed
-		newChat = trimmed
+		values.ChatID = strings.TrimSpace(settings.chatID)
 	}
-	oldSource := current.TokenSource
-	newSource := ""
-	newRef := ""
-	needsSecretUpdate := false
-	var stashedToken string
-	stashed, stashKnown := false, true
+	request := application.TelegramRequest{Action: "edit", ID: strings.TrimSpace(id), Values: values}
 	if hasTokenChange {
-		intendedSource, intendedRef := intendedTokenSource(settings)
-		if err := store.ValidateDestination(store.Destination{ID: id, Name: newName, ChatID: newChat, TokenSource: intendedSource, TokenRef: intendedRef, Enabled: current.Enabled}); err != nil {
-			return reportTelegramError(stderr, command, err, jsonOutput)
-		}
-		if oldSource == store.TokenSourceSecretService && intendedSource == store.TokenSourceSecretService {
-			if value, err := secrets.GetTelegramToken(id); err == nil {
-				stashedToken, stashed = value, true
-			} else if !errors.Is(err, secrets.ErrSecretNotFound) {
-				stashKnown = false
-			}
-		}
-		source, ref, secretErr := prepareNewTelegramSecret(id, settings, stdin, stderr)
-		if secretErr != nil {
-			return reportSecretError(stderr, command, secretErr, jsonOutput)
-		}
-		newSource, newRef = source, ref
-		update.TokenSource = &newSource
-		update.TokenRef = &newRef
-		needsSecretUpdate = true
+		source, ref := intendedTokenSource(settings)
+		request.TokenSelection = &application.TelegramTokenSelection{Source: source, Ref: ref}
 	}
-	updated, err := storage.UpdateDestination(strings.TrimSpace(id), update)
+	updated, err := telegramApplicationFor(settings).Telegram(context.Background(), request, telegramPromptForCLI(settings, stdin, stderr))
 	if err != nil {
-		restoreTelegramSecretAfterFailedUpdate(id, oldSource, newSource, stashedToken, stashed, stashKnown, hasTokenChange)
-		return reportTelegramError(stderr, command, err, jsonOutput)
-	}
-	if needsSecretUpdate && oldSource == store.TokenSourceSecretService && newSource != store.TokenSourceSecretService {
-		_ = secrets.DeleteTelegramToken(id)
+		return reportApplicationTelegramError(stderr, command, err, jsonOutput)
 	}
 	writeDestination(stdout, command, updated, fmt.Sprintf("Updated telegram destination %s.\n", updated.ID), jsonOutput)
 	return 0
@@ -324,14 +237,13 @@ func telegramSetEnabled(command string, settings options, enabled bool, stdout, 
 		writeError(stderr, command, "invalid_arguments", "telegram id must be a single id, not a list", jsonOutput)
 		return 2
 	}
-	storage, err := ensureStore(settings.database)
-	if err != nil {
-		return reportStoreError(stderr, command, err, jsonOutput)
+	action := "disable"
+	if enabled {
+		action = "enable"
 	}
-	defer storage.Close()
-	updated, err := storage.SetDestinationEnabled(strings.TrimSpace(id), enabled)
+	updated, err := telegramApplicationFor(settings).Telegram(context.Background(), application.TelegramRequest{Action: action, ID: strings.TrimSpace(id)}, nil)
 	if err != nil {
-		return reportTelegramError(stderr, command, err, jsonOutput)
+		return reportApplicationTelegramError(stderr, command, err, jsonOutput)
 	}
 	verb := "Enabled"
 	if !enabled {
@@ -354,26 +266,15 @@ func telegramDelete(command string, settings options, stdout, stderr io.Writer, 
 		writeError(stderr, command, "invalid_arguments", "telegram id must be a single id, not a list", jsonOutput)
 		return 2
 	}
-	storage, err := ensureStore(settings.database)
-	if err != nil {
-		return reportStoreError(stderr, command, err, jsonOutput)
-	}
-	defer storage.Close()
-	current, err := storage.GetDestination(strings.TrimSpace(id))
-	if err != nil {
-		return reportTelegramError(stderr, command, err, jsonOutput)
-	}
-	if err := storage.DeleteDestination(strings.TrimSpace(id)); err != nil {
-		return reportTelegramError(stderr, command, err, jsonOutput)
-	}
-	if current.TokenSource == store.TokenSourceSecretService {
-		_ = secrets.DeleteTelegramToken(strings.TrimSpace(id))
+	id = strings.TrimSpace(id)
+	if _, err := telegramApplicationFor(settings).Telegram(context.Background(), application.TelegramRequest{Action: "delete", ID: id}, nil); err != nil {
+		return reportApplicationTelegramError(stderr, command, err, jsonOutput)
 	}
 	if jsonOutput {
-		writeResult(stdout, command, map[string]any{"deleted": strings.TrimSpace(id)})
+		writeResult(stdout, command, map[string]any{"deleted": id})
 		return 0
 	}
-	fmt.Fprintf(stdout, "Deleted telegram destination %s.\n", strings.TrimSpace(id))
+	fmt.Fprintf(stdout, "Deleted telegram destination %s.\n", id)
 	return 0
 }
 
@@ -468,47 +369,37 @@ func intendedTokenSource(settings options) (string, string) {
 	}
 }
 
-// restoreTelegramSecretAfterFailedUpdate best-effort returns Secret Service to
-// its prior state after UpdateDestination fails.
-func restoreTelegramSecretAfterFailedUpdate(id, oldSource, newSource, stashedToken string, stashed, stashKnown, hadChange bool) {
-	if !hadChange {
-		return
-	}
-	if newSource != store.TokenSourceSecretService {
-		return
-	}
-	if oldSource == store.TokenSourceSecretService && stashed {
-		_ = secrets.SetTelegramToken(id, stashedToken)
-		return
-	}
-	if oldSource != store.TokenSourceSecretService || stashKnown {
-		_ = secrets.DeleteTelegramToken(id)
+func telegramPromptForCLI(settings options, stdin *os.File, stderr io.Writer) func(context.Context, string) (string, error) {
+	return func(ctx context.Context, _ string) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		value, err := secrets.PromptForPassword("Telegram bot token: ", stdin, stderr, isNonInteractive(settings, stdin))
+		if err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			value = ""
+			return "", err
+		}
+		return value, nil
 	}
 }
 
-// prepareNewTelegramSecret resolves the token source without ever returning
-// the secret value to callers. For file sources it validates the file is safe
-// and readable. For Secret Service it prompts once and saves. For prompt-only
-// it stores nothing.
-func prepareNewTelegramSecret(destinationID string, settings options, stdin *os.File, stderr io.Writer) (string, string, error) {
-	source, ref := intendedTokenSource(settings)
-	switch source {
-	case store.TokenSourcePrompt:
-		return source, ref, nil
-	case store.TokenSourceFile:
-		if _, err := secrets.ReadSecretFile(ref); err != nil {
-			return "", "", err
-		}
-		return source, ref, nil
+func reportApplicationTelegramError(stderr io.Writer, command string, err error, jsonOutput bool) int {
+	code, detail := application.ErrorInfo(err)
+	switch code {
+	case "cancelled":
+		writeError(stderr, command, code, detail, jsonOutput)
+		return 6
+	case "timeout":
+		writeError(stderr, command, code, detail, jsonOutput)
+		return 4
+	case "database_error":
+		return reportStoreError(stderr, command, err, jsonOutput)
 	default:
-		value, err := secrets.PromptForPassword("Telegram bot token: ", stdin, stderr, settings.nonInteractive)
-		if err != nil {
-			return "", "", err
-		}
-		if err := secrets.SetTelegramToken(destinationID, value); err != nil {
-			return "", "", err
-		}
-		return source, "", nil
+		writeError(stderr, command, code, detail, jsonOutput)
+		return 2
 	}
 }
 
