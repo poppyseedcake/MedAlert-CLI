@@ -18,12 +18,12 @@ import (
 )
 
 type deliverFixture struct {
-	storage       *store.Store
-	profile       store.Profile
+	storage        *store.Store
+	profile        store.Profile
 	reconciliation store.ObservationReconciliation
-	server        *httptest.Server
-	hits          *int64
-	sender        *telegram.Client
+	server         *httptest.Server
+	hits           *int64
+	sender         *telegram.Client
 }
 
 func setupDeliverFixture(t *testing.T, handler http.Handler) *deliverFixture {
@@ -105,6 +105,41 @@ func deliveryStatus(t *testing.T, storage *store.Store) (string, int) {
 	return deliveries[0].Status, deliveries[0].Attempts
 }
 
+func incidentDeliveryStatus(t *testing.T, storage *store.Store, incidentID string) (string, int) {
+	t.Helper()
+	deliveries, err := storage.ListIncidentDeliveries(incidentID)
+	if err != nil {
+		t.Fatalf("list incident deliveries: %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("incident deliveries = %#v, want one", deliveries)
+	}
+	return deliveries[0].Status, deliveries[0].Attempts
+}
+
+func createIncidentDelivery(t *testing.T, fixture *deliverFixture) store.IncidentDelivery {
+	t.Helper()
+	now := time.Now().UTC()
+	incident, created, newly, err := fixture.storage.RecordIncidentFailure(
+		store.IncidentScopeProfile,
+		fixture.profile.ID,
+		fixture.profile.AccountID,
+		fixture.profile.ID,
+		"",
+		store.IncidentKindProtocol,
+		"protocol changed",
+		now,
+		[]string{"phone"},
+	)
+	if err != nil {
+		t.Fatalf("record incident: %v", err)
+	}
+	if !newly || len(created) != 1 {
+		t.Fatalf("incident=%+v created=%+v newly=%v, want one new delivery", incident, created, newly)
+	}
+	return created[0]
+}
+
 func TestProcessTransientSecretErrorRetriesThenDelivers(t *testing.T) {
 	fixture := setupDeliverFixture(t, telegramSuccess())
 	transient := errors.New(`read telegram secret for "phone": secret service is unavailable`)
@@ -139,6 +174,122 @@ func TestProcessTransientSecretErrorRetriesThenDelivers(t *testing.T) {
 	}
 	if status, attempts := deliveryStatus(t, fixture.storage); status != store.DeliveryDelivered || attempts != 2 {
 		t.Fatalf("after recovery: status=%q attempts=%d, want delivered/2", status, attempts)
+	}
+}
+
+func TestProcessIncidentTransientSecretErrorRetriesThenDelivers(t *testing.T) {
+	fixture := setupDeliverFixture(t, telegramSuccess())
+	incidentDelivery := createIncidentDelivery(t, fixture)
+	transient := errors.New(`read telegram secret for "phone": secret service is unavailable`)
+	calls := 0
+	resolve := func(store.Destination) (telegram.Secret, error) {
+		calls++
+		if calls == 1 {
+			return "", transient
+		}
+		return telegram.Secret("token"), nil
+	}
+	ctx := context.Background()
+	summary, err := ProcessIncidentDeliveries(ctx, fixture.storage, fixture.sender, resolve, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("first process: %v", err)
+	}
+	if summary.Attempted != 1 || summary.StillRetry != 1 {
+		t.Fatalf("first summary = %#v, want one attempted retrying", summary)
+	}
+	if status, attempts := incidentDeliveryStatus(t, fixture.storage, incidentDelivery.IncidentID); status != store.DeliveryRetry || attempts != 1 {
+		t.Fatalf("after transient: status=%q attempts=%d, want retry/1", status, attempts)
+	}
+	if got := atomic.LoadInt64(fixture.hits); got != 0 {
+		t.Fatalf("telegram hits after token failure = %d, want 0", got)
+	}
+	summary, err = ProcessIncidentDeliveries(ctx, fixture.storage, fixture.sender, resolve, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("second process: %v", err)
+	}
+	if summary.Delivered != 1 {
+		t.Fatalf("second summary = %#v, want one delivered", summary)
+	}
+	if status, attempts := incidentDeliveryStatus(t, fixture.storage, incidentDelivery.IncidentID); status != store.DeliveryDelivered || attempts != 2 {
+		t.Fatalf("after recovery: status=%q attempts=%d, want delivered/2", status, attempts)
+	}
+}
+
+func TestProcessIncidentAnchorsBackoffToResponse(t *testing.T) {
+	slowRateLimited := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":120}}`))
+	})
+	fixture := setupDeliverFixture(t, slowRateLimited)
+	incidentDelivery := createIncidentDelivery(t, fixture)
+	before := time.Now().UTC()
+	// A stale batch timestamp must not make the response-relative backoff
+	// immediately due for an incident delivery.
+	summary, err := ProcessIncidentDeliveries(context.Background(), fixture.storage, fixture.sender, okResolver("token"), before.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if summary.StillRetry != 1 {
+		t.Fatalf("summary = %#v, want one retrying", summary)
+	}
+	deliveries, err := fixture.storage.ListIncidentDeliveries(incidentDelivery.IncidentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("incident deliveries = %#v, want one", deliveries)
+	}
+	next, err := time.Parse(time.RFC3339Nano, deliveries[0].NextAttemptAt)
+	if err != nil {
+		t.Fatalf("next_attempt_at = %q: %v", deliveries[0].NextAttemptAt, err)
+	}
+	if !next.After(before.Add(115*time.Second)) || !next.Before(time.Now().UTC().Add(180*time.Second)) {
+		t.Fatalf("next_attempt_at = %v, want response time + ~120s", next)
+	}
+}
+
+func TestProcessIncidentCancellationLeavesDeliveryRetryable(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	waiting := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	})
+	fixture := setupDeliverFixture(t, waiting)
+	incidentDelivery := createIncidentDelivery(t, fixture)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type processResult struct {
+		summary IncidentSummary
+		err     error
+	}
+	done := make(chan processResult, 1)
+	go func() {
+		summary, err := ProcessIncidentDeliveries(ctx, fixture.storage, fixture.sender, okResolver("token"), time.Now().UTC())
+		done <- processResult{summary: summary, err: err}
+	}()
+	select {
+	case <-started:
+		cancel()
+		close(release)
+	case <-time.After(2 * time.Second):
+		t.Fatal("telegram request did not start")
+	}
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("process: %v", result.err)
+		}
+		if result.summary.Attempted != 0 || len(result.summary.Deliveries) != 0 {
+			t.Fatalf("summary = %#v, want no recorded result after cancellation", result.summary)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("process did not stop after cancellation")
+	}
+	if status, attempts := incidentDeliveryStatus(t, fixture.storage, incidentDelivery.IncidentID); status != store.DeliveryPending || attempts != 1 {
+		t.Fatalf("after cancellation: status=%q attempts=%d, want pending/1", status, attempts)
 	}
 }
 
@@ -199,7 +350,7 @@ func TestProcessAnchorsBackoffToResponseNotBatchStart(t *testing.T) {
 		t.Fatalf("next_attempt_at = %q: %v", deliveries[0].NextAttemptAt, err)
 	}
 	// Old code stored staleBatch+120s, already ~58 minutes in the past.
-	if !next.After(before.Add(115 * time.Second)) || !next.Before(time.Now().UTC().Add(180*time.Second)) {
+	if !next.After(before.Add(115*time.Second)) || !next.Before(time.Now().UTC().Add(180*time.Second)) {
 		t.Fatalf("next_attempt_at = %v, want response time + ~120s", next)
 	}
 }

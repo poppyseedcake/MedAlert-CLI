@@ -16,10 +16,8 @@ package monitoring
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 
-	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/poppyseedcake/MedAlert/internal/telegram"
 )
@@ -216,21 +214,6 @@ func attemptOneIncidentDelivery(ctx context.Context, storage *store.Store, pendi
 		}
 		return incidentOutcome{}, err
 	}
-	token, err := resolveToken(destination)
-	if err != nil {
-		status := store.DeliveryPermanentFailure
-		if secrets.IsTransient(err) {
-			status = store.DeliveryRetry
-		}
-		final, recordErr := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: status, LastError: shortIncidentMessage(err)}, time.Now().UTC())
-		if recordErr != nil {
-			if errors.Is(recordErr, store.ErrDeliveryConflict) {
-				return incidentOutcome{skipped: true}, nil
-			}
-			return incidentOutcome{}, recordErr
-		}
-		return incidentOutcome{final: final}, nil
-	}
 	var text string
 	if pending.Kind == store.IncidentDeliveryRecovery {
 		text = telegram.FormatOperationalRecovery(telegram.OperationalProblem{
@@ -251,62 +234,11 @@ func attemptOneIncidentDelivery(ctx context.Context, storage *store.Store, pendi
 			Message:     incident.FailureMessage,
 		})
 	}
-	result, err := sender.SendMessage(ctx, token, destination.ChatID, text)
-	if err != nil {
-		var telegramErr *telegram.Error
-		if ctx != nil && ctx.Err() != nil {
-			return incidentOutcome{stop: true}, nil
-		}
-		if errors.As(err, &telegramErr) && telegramErr.Code == telegram.CodeCancelled {
-			return incidentOutcome{stop: true}, nil
-		}
-		recordedAt := time.Now().UTC()
-		if errors.As(err, &telegramErr) {
-			switch {
-			case telegram.IsTemporary(err):
-				next := store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortIncidentMessage(err)}
-				if telegramErr.Code == telegram.CodeRateLimited && telegramErr.RetryAfter > 0 {
-					next.HasNextRetry = true
-					next.NextAttempt = recordedAt.Add(telegramErr.RetryAfter)
-				}
-				final, recordErr := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, next, recordedAt)
-				if recordErr != nil {
-					if errors.Is(recordErr, store.ErrDeliveryConflict) {
-						return incidentOutcome{skipped: true}, nil
-					}
-					return incidentOutcome{}, recordErr
-				}
-				return incidentOutcome{final: final}, nil
-			case telegram.IsPermanent(err):
-				final, recordErr := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryPermanentFailure, LastError: shortIncidentMessage(err)}, recordedAt)
-				if recordErr != nil {
-					if errors.Is(recordErr, store.ErrDeliveryConflict) {
-						return incidentOutcome{skipped: true}, nil
-					}
-					return incidentOutcome{}, recordErr
-				}
-				return incidentOutcome{final: final}, nil
-			default:
-				final, recordErr := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortIncidentMessage(err)}, recordedAt)
-				if recordErr != nil {
-					if errors.Is(recordErr, store.ErrDeliveryConflict) {
-						return incidentOutcome{skipped: true}, nil
-					}
-					return incidentOutcome{}, recordErr
-				}
-				return incidentOutcome{final: final}, nil
-			}
-		}
-		final, recordErr := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryRetry, LastError: shortIncidentMessage(err)}, recordedAt)
-		if recordErr != nil {
-			if errors.Is(recordErr, store.ErrDeliveryConflict) {
-				return incidentOutcome{skipped: true}, nil
-			}
-			return incidentOutcome{}, recordErr
-		}
-		return incidentOutcome{final: final}, nil
+	outcome := sendTelegramDelivery(ctx, sender, destination, text, resolveToken)
+	if outcome.stop {
+		return incidentOutcome{stop: true}, nil
 	}
-	final, err := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, store.DeliveryResult{Status: store.DeliveryDelivered, MessageID: result.MessageID}, time.Now().UTC())
+	final, err := storage.RecordIncidentDeliveryResult(claimed.ID, claimed, outcome.result, outcome.recordedAt)
 	if err != nil {
 		if errors.Is(err, store.ErrDeliveryConflict) {
 			return incidentOutcome{skipped: true}, nil
@@ -314,18 +246,4 @@ func attemptOneIncidentDelivery(ctx context.Context, storage *store.Store, pendi
 		return incidentOutcome{}, err
 	}
 	return incidentOutcome{final: final}, nil
-}
-
-func shortIncidentMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	message := strings.TrimSpace(err.Error())
-	if len(message) > 500 {
-		return message[:500]
-	}
-	if message == "" {
-		return "telegram send failed"
-	}
-	return message
 }
