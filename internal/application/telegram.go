@@ -17,10 +17,18 @@ import (
 // Values contain configuration and secret references only; a bot token is
 // requested through Prompt when the action needs one.
 type TelegramRequest struct {
-	Action     string
-	ID         string
-	Values     DestinationValues
-	ProfileIDs []string
+	Action         string
+	ID             string
+	Values         DestinationValues
+	TokenSelection *TelegramTokenSelection
+	ProfileIDs     []string
+}
+
+// TelegramTokenSelection selects how a destination obtains its bot token.
+// Ref is used only for file sources and never contains the token itself.
+type TelegramTokenSelection struct {
+	Source string
+	Ref    string
 }
 
 // Telegram applies Telegram Destination configuration, linking, testing,
@@ -44,9 +52,9 @@ func (a *Application) Telegram(ctx context.Context, request TelegramRequest, pro
 
 	switch strings.TrimSpace(request.Action) {
 	case "create":
-		return a.createTelegramDestination(ctx, storage, id, request.Values, prompt)
+		return a.createTelegramDestination(ctx, storage, id, request.Values, request.TokenSelection, prompt)
 	case "edit":
-		return editTelegramDestination(storage, id, request.Values)
+		return editTelegramDestination(ctx, storage, id, request.Values, request.TokenSelection, prompt)
 	case "enable", "disable":
 		return storage.SetDestinationEnabled(id, request.Action == "enable")
 	case "delete":
@@ -65,11 +73,9 @@ func (a *Application) Telegram(ctx context.Context, request TelegramRequest, pro
 	}
 }
 
-func (a *Application) createTelegramDestination(ctx context.Context, storage *store.Store, id string, values DestinationValues, prompt func(context.Context, string) (string, error)) (store.Destination, error) {
-	source, ref, err := telegramTokenReference(values.TokenFile)
-	if err != nil {
-		return store.Destination{}, err
-	}
+func (a *Application) createTelegramDestination(ctx context.Context, storage *store.Store, id string, values DestinationValues, selection *TelegramTokenSelection, prompt func(context.Context, string) (string, error)) (store.Destination, error) {
+	source, ref := telegramTokenReference(values.TokenFile, selection)
+	var err error
 	destination := store.Destination{
 		ID: id, Name: strings.TrimSpace(values.Name), ChatID: strings.TrimSpace(values.ChatID),
 		TokenSource: source, TokenRef: ref, Enabled: true,
@@ -82,12 +88,22 @@ func (a *Application) createTelegramDestination(ctx context.Context, storage *st
 	} else if !errors.Is(err, store.ErrDestinationNotFound) {
 		return store.Destination{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return store.Destination{}, &OperationError{Code: "cancelled", Message: "operation was cancelled", Cause: err}
+	}
+	if err := validateTelegramTokenReference(source, ref); err != nil {
+		return store.Destination{}, err
+	}
 	token := ""
 	if source == store.TokenSourceSecretService {
 		token, err = promptTelegramToken(ctx, prompt)
 		if err != nil {
 			return store.Destination{}, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		token = ""
+		return store.Destination{}, &OperationError{Code: "cancelled", Message: "operation was cancelled", Cause: err}
 	}
 	created, err := storage.CreateDestination(destination)
 	if err != nil {
@@ -110,7 +126,11 @@ func (a *Application) createTelegramDestination(ctx context.Context, storage *st
 	return created, nil
 }
 
-func editTelegramDestination(storage *store.Store, id string, values DestinationValues) (store.Destination, error) {
+func editTelegramDestination(ctx context.Context, storage *store.Store, id string, values DestinationValues, selection *TelegramTokenSelection, prompt func(context.Context, string) (string, error)) (store.Destination, error) {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return store.Destination{}, &OperationError{Code: "cancelled", Message: "operation was cancelled", Cause: err}
+	}
 	current, err := storage.GetDestination(id)
 	if err != nil {
 		return store.Destination{}, err
@@ -125,13 +145,35 @@ func editTelegramDestination(storage *store.Store, id string, values Destination
 		update.ChatID = &chatID
 		changed = true
 	}
-	tokenFile := strings.TrimSpace(values.TokenFile)
-	tokenFileChanged := tokenFile != "" && (current.TokenSource != store.TokenSourceFile || tokenFile != strings.TrimSpace(current.TokenRef))
-	if tokenFileChanged {
-		if _, err := secrets.ReadSecretFile(tokenFile); err != nil {
-			return store.Destination{}, safeTelegramSecretError(err)
+	tokenChanged := false
+	newSource, newRef := "", ""
+	if selection != nil {
+		tokenChanged = true
+		newSource, newRef = telegramTokenReference(values.TokenFile, selection)
+	} else {
+		tokenFile := strings.TrimSpace(values.TokenFile)
+		tokenChanged = tokenFile != "" && (current.TokenSource != store.TokenSourceFile || tokenFile != strings.TrimSpace(current.TokenRef))
+		if tokenChanged {
+			newSource, newRef = store.TokenSourceFile, tokenFile
 		}
-		source, ref := store.TokenSourceFile, tokenFile
+	}
+	if tokenChanged {
+		candidate := current
+		if update.Name != nil {
+			candidate.Name = *update.Name
+		}
+		if update.ChatID != nil {
+			candidate.ChatID = *update.ChatID
+		}
+		candidate.TokenSource = newSource
+		candidate.TokenRef = newRef
+		if err := store.ValidateDestination(candidate); err != nil {
+			return store.Destination{}, err
+		}
+		if err := validateTelegramTokenReference(newSource, newRef); err != nil {
+			return store.Destination{}, err
+		}
+		source, ref := newSource, newRef
 		update.TokenSource = &source
 		update.TokenRef = &ref
 		changed = true
@@ -139,35 +181,100 @@ func editTelegramDestination(storage *store.Store, id string, values Destination
 	if !changed {
 		return store.Destination{}, &OperationError{Code: "invalid_arguments", Message: "no telegram destination changes requested"}
 	}
-	oldToken, oldKnown, tokenRemoved := "", false, false
-	if tokenFileChanged && current.TokenSource == store.TokenSourceSecretService {
-		if oldToken, err = secrets.GetTelegramToken(id); err != nil {
-			if !errors.Is(err, secrets.ErrSecretNotFound) {
-				return store.Destination{}, safeTelegramSecretError(err)
-			}
-			oldToken = ""
-		} else {
-			oldKnown = true
-			if err := secrets.DeleteTelegramToken(id); err != nil {
-				oldToken = ""
-				return store.Destination{}, safeTelegramSecretError(err)
-			}
-			tokenRemoved = true
+	if err := ctx.Err(); err != nil {
+		return store.Destination{}, &OperationError{Code: "cancelled", Message: "operation was cancelled", Cause: err}
+	}
+	return updateTelegramDestination(ctx, storage, id, current, update, tokenChanged, prompt)
+}
+
+// updateTelegramDestination applies a destination update and keeps the
+// Secret Service entry consistent when the token source changes. Secret
+// values are staged before the database update only when the new source needs
+// one; every failure path restores the previous state where possible.
+func updateTelegramDestination(ctx context.Context, storage *store.Store, id string, current store.Destination, update store.DestinationUpdate, tokenChanged bool, prompt func(context.Context, string) (string, error)) (store.Destination, error) {
+	if !tokenChanged {
+		return storage.UpdateDestination(id, update)
+	}
+	if err := ctx.Err(); err != nil {
+		return store.Destination{}, &OperationError{Code: "cancelled", Message: "operation was cancelled", Cause: err}
+	}
+
+	newSource := current.TokenSource
+	if update.TokenSource != nil {
+		newSource = *update.TokenSource
+	}
+	oldToken, oldKnown := "", false
+	if current.TokenSource == store.TokenSourceSecretService {
+		value, err := secrets.GetTelegramToken(id)
+		if err == nil {
+			oldToken, oldKnown = value, true
+		} else if !errors.Is(err, secrets.ErrSecretNotFound) {
+			return store.Destination{}, safeTelegramSecretError(err)
 		}
+	}
+	defer func() { oldToken = "" }()
+
+	if newSource == store.TokenSourceSecretService {
+		newToken, err := promptTelegramToken(ctx, prompt)
+		if err != nil {
+			return store.Destination{}, err
+		}
+		if err := secrets.SetTelegramToken(id, newToken); err != nil {
+			newToken = ""
+			return store.Destination{}, safeTelegramSecretError(err)
+		}
+		newToken = ""
+		if err := ctx.Err(); err != nil {
+			return rollbackTelegramDestinationUpdate(id, current.TokenSource, oldToken, oldKnown, err)
+		}
+		updated, err := storage.UpdateDestination(id, update)
+		if err != nil {
+			return rollbackTelegramDestinationUpdate(id, current.TokenSource, oldToken, oldKnown, err)
+		}
+		return updated, nil
+	}
+
+	tokenRemoved := false
+	if current.TokenSource == store.TokenSourceSecretService && oldKnown {
+		if err := secrets.DeleteTelegramToken(id); err != nil {
+			return store.Destination{}, safeTelegramSecretError(err)
+		}
+		tokenRemoved = true
+	}
+	if err := ctx.Err(); err != nil {
+		if tokenRemoved {
+			return restoreTelegramDestinationSecret(id, oldToken, err)
+		}
+		return store.Destination{}, &OperationError{Code: "cancelled", Message: "operation was cancelled", Cause: err}
 	}
 	updated, err := storage.UpdateDestination(id, update)
 	if err != nil {
-		if tokenRemoved && oldKnown {
-			if restoreErr := secrets.SetTelegramToken(id, oldToken); restoreErr != nil {
-				oldToken = ""
-				return store.Destination{}, errors.Join(err, safeTelegramSecretError(restoreErr))
-			}
+		if tokenRemoved {
+			return restoreTelegramDestinationSecret(id, oldToken, err)
 		}
-		oldToken = ""
 		return store.Destination{}, err
 	}
-	oldToken = ""
 	return updated, nil
+}
+
+func rollbackTelegramDestinationUpdate(id, oldSource, oldToken string, oldKnown bool, cause error) (store.Destination, error) {
+	var restoreErr error
+	if oldSource == store.TokenSourceSecretService && oldKnown {
+		restoreErr = secrets.SetTelegramToken(id, oldToken)
+	} else {
+		restoreErr = secrets.DeleteTelegramToken(id)
+	}
+	if restoreErr != nil {
+		return store.Destination{}, errors.Join(cause, safeTelegramSecretError(restoreErr))
+	}
+	return store.Destination{}, cause
+}
+
+func restoreTelegramDestinationSecret(id, token string, cause error) (store.Destination, error) {
+	if err := secrets.SetTelegramToken(id, token); err != nil {
+		return store.Destination{}, errors.Join(cause, safeTelegramSecretError(err))
+	}
+	return store.Destination{}, cause
 }
 
 func deleteTelegramDestination(storage *store.Store, id string) (store.Destination, error) {
@@ -207,42 +314,8 @@ func setTelegramDestinationToken(ctx context.Context, storage *store.Store, id s
 	if err != nil {
 		return store.Destination{}, err
 	}
-	token, err := promptTelegramToken(ctx, prompt)
-	if err != nil {
-		return store.Destination{}, err
-	}
-	oldToken, oldKnown := "", false
-	if current.TokenSource == store.TokenSourceSecretService {
-		if value, getErr := secrets.GetTelegramToken(id); getErr == nil {
-			oldToken, oldKnown = value, true
-		} else if !errors.Is(getErr, secrets.ErrSecretNotFound) {
-			token = ""
-			return store.Destination{}, safeTelegramSecretError(getErr)
-		}
-	}
-	if err := secrets.SetTelegramToken(id, token); err != nil {
-		token = ""
-		oldToken = ""
-		return store.Destination{}, safeTelegramSecretError(err)
-	}
-	token = ""
 	source, ref := store.TokenSourceSecretService, ""
-	updated, err := storage.UpdateDestination(id, store.DestinationUpdate{TokenSource: &source, TokenRef: &ref})
-	if err != nil {
-		var restoreErr error
-		if oldKnown {
-			restoreErr = secrets.SetTelegramToken(id, oldToken)
-		} else {
-			restoreErr = secrets.DeleteTelegramToken(id)
-		}
-		oldToken = ""
-		if restoreErr != nil {
-			return store.Destination{}, errors.Join(err, safeTelegramSecretError(restoreErr))
-		}
-		return store.Destination{}, err
-	}
-	oldToken = ""
-	return updated, nil
+	return updateTelegramDestination(ctx, storage, id, current, store.DestinationUpdate{TokenSource: &source, TokenRef: &ref}, true, prompt)
 }
 
 func (a *Application) testTelegramDestination(ctx context.Context, storage *store.Store, id string, prompt func(context.Context, string) (string, error)) (store.Destination, error) {
@@ -280,14 +353,29 @@ func (a *Application) testTelegramDestination(ctx context.Context, storage *stor
 	return updated, nil
 }
 
-func telegramTokenReference(tokenFile string) (string, string, error) {
-	if tokenFile = strings.TrimSpace(tokenFile); tokenFile != "" {
-		if _, err := secrets.ReadSecretFile(tokenFile); err != nil {
-			return "", "", safeTelegramSecretError(err)
+func telegramTokenReference(tokenFile string, selection *TelegramTokenSelection) (string, string) {
+	if selection != nil {
+		source := strings.TrimSpace(selection.Source)
+		ref := strings.TrimSpace(selection.Ref)
+		if source == store.TokenSourceFile && ref == "" {
+			ref = strings.TrimSpace(tokenFile)
 		}
-		return store.TokenSourceFile, tokenFile, nil
+		return source, ref
 	}
-	return store.TokenSourceSecretService, "", nil
+	if tokenFile = strings.TrimSpace(tokenFile); tokenFile != "" {
+		return store.TokenSourceFile, tokenFile
+	}
+	return store.TokenSourceSecretService, ""
+}
+
+func validateTelegramTokenReference(source, ref string) error {
+	if source != store.TokenSourceFile {
+		return nil
+	}
+	if _, err := secrets.ReadSecretFile(ref); err != nil {
+		return safeTelegramSecretError(err)
+	}
+	return nil
 }
 
 func promptTelegramToken(ctx context.Context, prompt func(context.Context, string) (string, error)) (string, error) {

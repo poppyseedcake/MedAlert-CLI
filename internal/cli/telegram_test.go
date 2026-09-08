@@ -2,11 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/store"
 	"github.com/zalando/go-keyring"
 )
@@ -114,6 +116,35 @@ func TestTelegramCreateRejectsMissingOrInvalid(t *testing.T) {
 		if code := RunWithIO(args, os.Stdin, &stdout, &stderr, getenv); code != 2 || stderr.String() == "" {
 			t.Fatalf("args %v: code=%d stderr=%q, want rejection", args, code, stderr.String())
 		}
+	}
+}
+
+func TestTelegramNoStoredTokenUsesTheSharedApplicationFlow(t *testing.T) {
+	keyring.MockInit()
+	root := t.TempDir()
+	database := filepath.Join(root, "medalert.db")
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	getenv := telegramGetenv(root)
+	var stdout, stderr bytes.Buffer
+	if code := RunWithIO([]string{"telegram", "create", "--database", database, "--non-interactive", "--telegram", "prompted", "--name", "Prompted", "--chat-id", "123", "--no-stored-token"}, os.Stdin, &stdout, &stderr, getenv); code != 0 {
+		t.Fatalf("create prompt destination: code=%d stderr=%q", code, stderr.String())
+	}
+	storage, err := store.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	destination, err := storage.GetDestination("prompted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if destination.TokenSource != store.TokenSourcePrompt || destination.TokenRef != "" {
+		t.Fatalf("created destination = %#v", destination)
+	}
+	if _, err := secrets.GetTelegramToken("prompted"); !errors.Is(err, secrets.ErrSecretNotFound) {
+		t.Fatalf("prompt destination secret lookup = %v, want not found", err)
 	}
 }
 

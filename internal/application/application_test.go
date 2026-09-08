@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/poppyseedcake/MedAlert/internal/application"
+	"github.com/poppyseedcake/MedAlert/internal/secrets"
 	"github.com/poppyseedcake/MedAlert/internal/store"
+	"github.com/zalando/go-keyring"
 	_ "modernc.org/sqlite"
 )
 
@@ -186,6 +188,120 @@ func TestTelegramMetadataEditKeepsAnUnchangedFileReference(t *testing.T) {
 	}
 	if updated.Name != "Home phone" || updated.ChatID != "456" || updated.TokenSource != store.TokenSourceFile || updated.TokenRef != tokenFile {
 		t.Fatalf("updated destination = %#v", updated)
+	}
+}
+
+func TestTelegramCreateAcceptsAnExplicitTokenSelection(t *testing.T) {
+	keyring.MockInit()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(databasePath); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := application.New(application.Config{Database: databasePath}).Telegram(context.Background(), application.TelegramRequest{
+		Action: "create", ID: "phone",
+		Values:         application.DestinationValues{Name: "Phone", ChatID: "123"},
+		TokenSelection: &application.TelegramTokenSelection{Source: store.TokenSourcePrompt},
+	}, nil)
+	if err != nil {
+		t.Fatalf("create with explicit prompt source: %v", err)
+	}
+	if created.TokenSource != store.TokenSourcePrompt || created.TokenRef != "" {
+		t.Fatalf("created destination = %#v", created)
+	}
+	if _, err := secrets.GetTelegramToken("phone"); !errors.Is(err, secrets.ErrSecretNotFound) {
+		t.Fatalf("prompt source secret lookup = %v, want not found", err)
+	}
+}
+
+func TestTelegramEditMovesSecretServiceTokenToPromptSource(t *testing.T) {
+	keyring.MockInit()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(store.Destination{
+		ID: "phone", Name: "Phone", ChatID: "123", TokenSource: store.TokenSourceSecretService, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := secrets.SetTelegramToken("phone", "old-token"); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := application.New(application.Config{Database: databasePath}).Telegram(context.Background(), application.TelegramRequest{
+		Action: "edit", ID: "phone",
+		TokenSelection: &application.TelegramTokenSelection{Source: store.TokenSourcePrompt},
+	}, nil)
+	if err != nil {
+		t.Fatalf("edit to prompt source: %v", err)
+	}
+	if updated.TokenSource != store.TokenSourcePrompt || updated.TokenRef != "" {
+		t.Fatalf("updated destination = %#v", updated)
+	}
+	if _, err := secrets.GetTelegramToken("phone"); !errors.Is(err, secrets.ErrSecretNotFound) {
+		t.Fatalf("old secret after source change = %v, want not found", err)
+	}
+}
+
+func TestTelegramEditStoresASelectedSecretServiceToken(t *testing.T) {
+	keyring.MockInit()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "medalert.db")
+	if _, err := store.Initialize(databasePath); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateDestination(store.Destination{
+		ID: "phone", Name: "Phone", ChatID: "123", TokenSource: store.TokenSourcePrompt, Enabled: true,
+	}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := application.New(application.Config{Database: databasePath}).Telegram(context.Background(), application.TelegramRequest{
+		Action: "edit", ID: "phone",
+		TokenSelection: &application.TelegramTokenSelection{Source: store.TokenSourceSecretService},
+	}, func(context.Context, string) (string, error) {
+		return "new-token", nil
+	})
+	if err != nil {
+		t.Fatalf("edit to secret service: %v", err)
+	}
+	if updated.TokenSource != store.TokenSourceSecretService || updated.TokenRef != "" {
+		t.Fatalf("updated destination = %#v", updated)
+	}
+	stored, err := secrets.GetTelegramToken("phone")
+	if err != nil {
+		t.Fatalf("stored token: %v", err)
+	}
+	if stored != "new-token" {
+		t.Fatalf("stored token = %q, want new token", stored)
 	}
 }
 
